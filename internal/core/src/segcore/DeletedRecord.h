@@ -65,10 +65,13 @@ class DeletedRecord {
           deleted_lists_(SortedDeleteList::createInstance()) {
     }
 
-    ~DeletedRecord() {
+    ~DeletedRecord() noexcept {
         if constexpr (is_sealed) {
-            cachinglayer::Manager::GetInstance().RefundLoadedResource(
-                {estimated_memory_size_, 0});
+            if (estimated_memory_size_ != 0) {
+                cachinglayer::Manager::GetInstance().RefundLoadedResource(
+                    {estimated_memory_size_, 0},
+                    fmt::format("DeletedRecord {}", segment_id_));
+            }
         }
     }
 
@@ -158,12 +161,14 @@ class DeletedRecord {
             if (std::abs(new_estimated_size - estimated_memory_size_) >
                 MIN_DELTA_SIZE) {
                 auto delta_size = new_estimated_size - estimated_memory_size_;
-                if (delta_size >= 0) {
+                if (delta_size > 0) {
                     cachinglayer::Manager::GetInstance().ChargeLoadedResource(
-                        {delta_size, 0});
-                } else {
+                        {delta_size, 0},
+                        fmt::format("DeletedRecord {}", segment_id_));
+                } else if (delta_size < 0) {
                     cachinglayer::Manager::GetInstance().RefundLoadedResource(
-                        {-delta_size, 0});
+                        {-delta_size, 0},
+                        fmt::format("DeletedRecord {}", segment_id_));
                 }
                 estimated_memory_size_ = new_estimated_size;
             }

@@ -76,6 +76,9 @@ class OffsetMap {
 
     virtual size_t
     size() const = 0;
+
+    virtual size_t
+    rows() const = 0;
 };
 
 template <typename T>
@@ -206,6 +209,12 @@ class OffsetOrderedMap : public OffsetMap {
     size() const override {
         std::shared_lock<std::shared_mutex> lck(mtx_);
         return map_.get_allocator().total_allocated();
+    }
+
+    size_t
+    rows() const override {
+        std::shared_lock<std::shared_mutex> lck(mtx_);
+        return map_.size();
     }
 
  private:
@@ -387,6 +396,11 @@ class OffsetOrderedArray : public OffsetMap {
         return sizeof(std::pair<T, int32_t>) * array_.capacity();
     }
 
+    size_t
+    rows() const override {
+        return array_.size();
+    }
+
  private:
     std::pair<std::vector<OffsetMap::OffsetType>, bool>
     find_first_by_index(int64_t limit, const BitsetType& bitset) const {
@@ -458,6 +472,14 @@ class InsertRecordSealed {
                     }
                 }
             }
+        }
+    }
+
+    ~InsertRecordSealed() noexcept {
+        if (estimated_memory_size_ != 0) {
+            cachinglayer::Manager::GetInstance().RefundLoadedResource(
+                {estimated_memory_size_, 0},
+                fmt::format("InsertRecordSealed"));
         }
     }
 
@@ -557,7 +579,8 @@ class InsertRecordSealed {
         pk2offset_->seal();
         // update estimated memory size to caching layer
         cachinglayer::Manager::GetInstance().ChargeLoadedResource(
-            {static_cast<int64_t>(pk2offset_->size()), 0});
+            {static_cast<int64_t>(pk2offset_->size()), 0},
+            fmt::format("InsertRecord seal_pks() {}", pk2offset_->rows()));
         estimated_memory_size_ += pk2offset_->size();
     }
 
@@ -572,7 +595,11 @@ class InsertRecordSealed {
         size_t size =
             timestamps.size() * sizeof(Timestamp) + timestamp_index_.size();
         cachinglayer::Manager::GetInstance().ChargeLoadedResource(
-            {static_cast<int64_t>(size), 0});
+            {static_cast<int64_t>(size), 0},
+            fmt::format("InsertRecord init_timestamps() timestamps.size(): {}, "
+                        "timestamp_index_.size(): {}",
+                        timestamps.size(),
+                        timestamp_index_.size()));
         estimated_memory_size_ += size;
     }
 
@@ -588,7 +615,8 @@ class InsertRecordSealed {
         pk2offset_->clear();
         reserved = 0;
         cachinglayer::Manager::GetInstance().RefundLoadedResource(
-            {static_cast<int64_t>(estimated_memory_size_), 0});
+            {static_cast<int64_t>(estimated_memory_size_), 0},
+            fmt::format("InsertRecord clear()"));
         estimated_memory_size_ = 0;
     }
 
