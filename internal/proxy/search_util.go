@@ -79,10 +79,11 @@ func (r *rankParams) String() string {
 }
 
 type SearchInfo struct {
-	planInfo     *planpb.QueryInfo
-	offset       int64
-	isIterator   bool
-	collectionID int64
+	planInfo        *planpb.QueryInfo
+	offset          int64
+	isIterator      bool
+	collectionID    int64
+	iterativeFilter bool
 }
 
 func parseSearchIteratorV2Info(searchParamsPair []*commonpb.KeyValuePair, groupByFieldId int64, isIterator bool, offset int64, queryTopK *int64, largeTopKEnabled bool) (*planpb.SearchIteratorV2Info, error) {
@@ -264,6 +265,8 @@ func parseSearchInfo(searchParamsPair []*commonpb.KeyValuePair, schema *schemapb
 	var jsonPath string
 	var jsonType schemapb.DataType
 	var strictCast bool
+	var isRangeSearch bool
+	var isIterativeFilter bool
 	if isAdvanced {
 		groupByFieldId, groupSize, strictGroupSize = rankParams.GetGroupByFieldId(), rankParams.GetGroupSize(), rankParams.GetStrictGroupSize()
 	} else {
@@ -286,7 +289,10 @@ func parseSearchInfo(searchParamsPair []*commonpb.KeyValuePair, schema *schemapb
 		return nil, merr.WrapErrParameterInvalid("", "",
 			"Not allowed to do groupBy when doing iteration")
 	}
-	if strings.Contains(searchParamStr, radiusKey) && groupByFieldId > 0 {
+
+	isRangeSearch = strings.Contains(searchParamStr, radiusKey)
+	isIterativeFilter = (hints == iterativeFilterKey) || strings.Contains(searchParamStr, iterativeFilterKey)
+	if isRangeSearch && groupByFieldId > 0 {
 		return nil, merr.WrapErrParameterInvalid("", "",
 			"Not allowed to do range-search when doing search-group-by")
 	}
@@ -301,7 +307,7 @@ func parseSearchInfo(searchParamsPair []*commonpb.KeyValuePair, schema *schemapb
 	if annsFieldName != "" {
 		annField := typeutil.GetFieldByName(schema, annsFieldName)
 		if annField != nil && annField.GetDataType() == schemapb.DataType_ArrayOfVector {
-			if strings.Contains(searchParamStr, radiusKey) {
+			if isRangeSearch {
 				return nil, merr.WrapErrParameterInvalid("", "",
 					"range search is not supported for vector array (embedding list) fields, fieldName:", annsFieldName)
 			}
@@ -333,9 +339,10 @@ func parseSearchInfo(searchParamsPair []*commonpb.KeyValuePair, schema *schemapb
 			JsonType:             jsonType,
 			StrictCast:           strictCast,
 		},
-		offset:       offset,
-		isIterator:   isIterator,
-		collectionID: collectionId,
+		offset:          offset,
+		isIterator:      isIterator,
+		collectionID:    collectionId,
+		iterativeFilter: isIterativeFilter,
 	}, nil
 }
 
