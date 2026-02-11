@@ -42,8 +42,9 @@ constexpr int64_t BruteForceSelectivity = 10;
 using Condition = std::function<bool(int64_t)>;
 
 // Compressed storage for offset -> int64 PK reverse lookup.
-// Uses global base + varint-encoded deltas with block indexing.
+// Uses global base + block base + varint-encoded deltas.
 // Block size = 128, lookup is O(128) worst case.
+// Each block has its own base (min value in block - global base) for better compression.
 class CompressedInt64PkArray {
  public:
     static constexpr int64_t kBlockSize = 128;
@@ -65,20 +66,36 @@ class CompressedInt64PkArray {
             }
         }
 
-        // Reserve space for block offsets
+        // Calculate number of blocks
         int64_t num_blocks = (num_rows + kBlockSize - 1) / kBlockSize;
         block_offsets_.reserve(num_blocks + 1);
+        block_bases_.reserve(num_blocks);
 
-        // Encode deltas with varint
-        // Estimate: assume average 2 bytes per delta for self-incrementing PKs
+        // Estimate: assume average 1-2 bytes per delta with block base
         data_.reserve(num_rows * 2);
 
-        for (int64_t i = 0; i < num_rows; ++i) {
-            if (i % kBlockSize == 0) {
-                block_offsets_.push_back(static_cast<uint32_t>(data_.size()));
+        for (int64_t block_id = 0; block_id < num_blocks; ++block_id) {
+            int64_t block_start = block_id * kBlockSize;
+            int64_t block_end = std::min(block_start + kBlockSize, num_rows);
+
+            // Find block minimum
+            int64_t block_min = pks[block_start];
+            for (int64_t i = block_start + 1; i < block_end; ++i) {
+                if (pks[i] < block_min) {
+                    block_min = pks[i];
+                }
             }
-            uint64_t delta = static_cast<uint64_t>(pks[i] - base_);
-            encode_varint(delta);
+
+            // Store block base (relative to global base)
+            block_bases_.push_back(
+                static_cast<uint64_t>(block_min - base_));
+            block_offsets_.push_back(static_cast<uint32_t>(data_.size()));
+
+            // Encode deltas relative to block minimum
+            for (int64_t i = block_start; i < block_end; ++i) {
+                uint64_t delta = static_cast<uint64_t>(pks[i] - block_min);
+                encode_varint(delta);
+            }
         }
         // Add sentinel for easier boundary handling
         block_offsets_.push_back(static_cast<uint32_t>(data_.size()));
@@ -86,6 +103,7 @@ class CompressedInt64PkArray {
         // Shrink to fit
         data_.shrink_to_fit();
         block_offsets_.shrink_to_fit();
+        block_bases_.shrink_to_fit();
     }
 
     int64_t
@@ -101,13 +119,15 @@ class CompressedInt64PkArray {
         const uint8_t* ptr = data_.data() + block_offsets_[block_id];
         const uint8_t* end = data_.data() + block_offsets_[block_id + 1];
 
-        // Decode idx_in_block varints to reach the target
+        // Decode idx_in_block + 1 varints to reach the target
         uint64_t delta = 0;
         for (int64_t i = 0; i <= idx_in_block; ++i) {
             delta = decode_varint(ptr, end);
         }
 
-        return base_ + static_cast<int64_t>(delta);
+        // pk = global_base + block_base + delta
+        return base_ + static_cast<int64_t>(block_bases_[block_id]) +
+               static_cast<int64_t>(delta);
     }
 
     void
@@ -122,7 +142,8 @@ class CompressedInt64PkArray {
     size_t
     memory_size() const {
         return sizeof(*this) + data_.capacity() +
-               block_offsets_.capacity() * sizeof(uint32_t);
+               block_offsets_.capacity() * sizeof(uint32_t) +
+               block_bases_.capacity() * sizeof(uint64_t);
     }
 
     int64_t
@@ -162,10 +183,11 @@ class CompressedInt64PkArray {
     }
 
  private:
-    int64_t base_ = 0;
+    int64_t base_ = 0;      // Global minimum PK
     int64_t num_rows_ = 0;
-    std::vector<uint32_t> block_offsets_;
-    std::vector<uint8_t> data_;
+    std::vector<uint32_t> block_offsets_;  // Start offset of each block in data_
+    std::vector<uint64_t> block_bases_;    // Block base relative to global base
+    std::vector<uint8_t> data_;            // Varint-encoded deltas
 };
 
 class OffsetMap {
