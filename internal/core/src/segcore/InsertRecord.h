@@ -41,6 +41,133 @@ constexpr int64_t BruteForceSelectivity = 10;
 
 using Condition = std::function<bool(int64_t)>;
 
+// Compressed storage for offset -> int64 PK reverse lookup.
+// Uses global base + varint-encoded deltas with block indexing.
+// Block size = 128, lookup is O(128) worst case.
+class CompressedInt64PkArray {
+ public:
+    static constexpr int64_t kBlockSize = 128;
+
+    CompressedInt64PkArray() = default;
+
+    void
+    build(const int64_t* pks, int64_t num_rows) {
+        if (num_rows == 0) {
+            return;
+        }
+        num_rows_ = num_rows;
+
+        // Find global minimum as base
+        base_ = pks[0];
+        for (int64_t i = 1; i < num_rows; ++i) {
+            if (pks[i] < base_) {
+                base_ = pks[i];
+            }
+        }
+
+        // Reserve space for block offsets
+        int64_t num_blocks = (num_rows + kBlockSize - 1) / kBlockSize;
+        block_offsets_.reserve(num_blocks + 1);
+
+        // Encode deltas with varint
+        // Estimate: assume average 2 bytes per delta for self-incrementing PKs
+        data_.reserve(num_rows * 2);
+
+        for (int64_t i = 0; i < num_rows; ++i) {
+            if (i % kBlockSize == 0) {
+                block_offsets_.push_back(static_cast<uint32_t>(data_.size()));
+            }
+            uint64_t delta = static_cast<uint64_t>(pks[i] - base_);
+            encode_varint(delta);
+        }
+        // Add sentinel for easier boundary handling
+        block_offsets_.push_back(static_cast<uint32_t>(data_.size()));
+
+        // Shrink to fit
+        data_.shrink_to_fit();
+        block_offsets_.shrink_to_fit();
+    }
+
+    int64_t
+    at(int64_t offset) const {
+        AssertInfo(offset >= 0 && offset < num_rows_,
+                   "offset out of range: {} not in [0, {})",
+                   offset,
+                   num_rows_);
+
+        int64_t block_id = offset / kBlockSize;
+        int64_t idx_in_block = offset % kBlockSize;
+
+        const uint8_t* ptr = data_.data() + block_offsets_[block_id];
+        const uint8_t* end = data_.data() + block_offsets_[block_id + 1];
+
+        // Decode idx_in_block varints to reach the target
+        uint64_t delta = 0;
+        for (int64_t i = 0; i <= idx_in_block; ++i) {
+            delta = decode_varint(ptr, end);
+        }
+
+        return base_ + static_cast<int64_t>(delta);
+    }
+
+    void
+    bulk_at(const int64_t* offsets,
+            int64_t count,
+            int64_t* output) const {
+        for (int64_t i = 0; i < count; ++i) {
+            output[i] = at(offsets[i]);
+        }
+    }
+
+    size_t
+    memory_size() const {
+        return sizeof(*this) + data_.capacity() +
+               block_offsets_.capacity() * sizeof(uint32_t);
+    }
+
+    int64_t
+    num_rows() const {
+        return num_rows_;
+    }
+
+    bool
+    empty() const {
+        return num_rows_ == 0;
+    }
+
+ private:
+    void
+    encode_varint(uint64_t value) {
+        while (value >= 0x80) {
+            data_.push_back(static_cast<uint8_t>(value | 0x80));
+            value >>= 7;
+        }
+        data_.push_back(static_cast<uint8_t>(value));
+    }
+
+    static uint64_t
+    decode_varint(const uint8_t*& ptr, const uint8_t* end) {
+        uint64_t result = 0;
+        int shift = 0;
+        while (ptr < end) {
+            uint8_t byte = *ptr++;
+            result |= static_cast<uint64_t>(byte & 0x7F) << shift;
+            if ((byte & 0x80) == 0) {
+                return result;
+            }
+            shift += 7;
+        }
+        // Should not reach here if data is valid
+        return result;
+    }
+
+ private:
+    int64_t base_ = 0;
+    int64_t num_rows_ = 0;
+    std::vector<uint32_t> block_offsets_;
+    std::vector<uint8_t> data_;
+};
+
 class OffsetMap {
  public:
     virtual ~OffsetMap() = default;
@@ -444,11 +571,13 @@ class InsertRecordSealed {
                     case DataType::INT64: {
                         pk2offset_ =
                             std::make_unique<OffsetOrderedArray<int64_t>>();
+                        is_int64_pk_ = true;
                         break;
                     }
                     case DataType::VARCHAR: {
                         pk2offset_ =
                             std::make_unique<OffsetOrderedArray<std::string>>();
+                        is_int64_pk_ = false;
                         break;
                     }
                     default: {
@@ -547,6 +676,11 @@ class InsertRecordSealed {
         int64_t offset = 0;
         switch (data_type) {
             case DataType::INT64: {
+                // Collect all PKs for building compressed offset2pk
+                int64_t total_rows = data->NumRows();
+                std::vector<int64_t> all_pks;
+                all_pks.reserve(total_rows);
+
                 auto num_chunk = data->num_chunks();
                 for (int i = 0; i < num_chunk; ++i) {
                     auto pw = data->DataOfChunk(nullptr, i);
@@ -554,8 +688,13 @@ class InsertRecordSealed {
                     auto chunk_num_rows = data->chunk_row_nums(i);
                     for (int j = 0; j < chunk_num_rows; ++j) {
                         pk2offset_->insert(pks[j], offset++);
+                        all_pks.push_back(pks[j]);
                     }
                 }
+
+                // Build compressed offset -> pk mapping
+                offset2pk_ = std::make_unique<CompressedInt64PkArray>();
+                offset2pk_->build(all_pks.data(), all_pks.size());
                 break;
             }
             case DataType::VARCHAR: {
@@ -591,9 +730,13 @@ class InsertRecordSealed {
         std::lock_guard lck(shared_mutex_);
         pk2offset_->seal();
         // update estimated memory size to caching layer
+        size_t total_size = pk2offset_->size();
+        if (offset2pk_) {
+            total_size += offset2pk_->memory_size();
+        }
         cachinglayer::Manager::GetInstance().ChargeLoadedResource(
-            {static_cast<int64_t>(pk2offset_->memory_size()), 0});
-        estimated_memory_size_ += pk2offset_->memory_size();
+            {static_cast<int64_t>(total_size), 0});
+        estimated_memory_size_ += total_size;
     }
 
     void
@@ -623,6 +766,7 @@ class InsertRecordSealed {
         if (pk2offset_) {
             pk2offset_->clear();
         }
+        offset2pk_.reset();
 
         reserved = 0;
         if (estimated_memory_size_ > 0) {
@@ -632,6 +776,30 @@ class InsertRecordSealed {
         }
     }
 
+    // Returns true if PK type is int64 and offset2pk is available
+    bool
+    has_int64_pk_index() const {
+        return is_int64_pk_ && offset2pk_ != nullptr;
+    }
+
+    // Get PK by offset. Only valid when has_int64_pk_index() returns true.
+    int64_t
+    get_int64_pk_by_offset(int64_t offset) const {
+        AssertInfo(has_int64_pk_index(),
+                   "get_int64_pk_by_offset requires int64 PK with offset2pk index");
+        return offset2pk_->at(offset);
+    }
+
+    // Bulk get PKs by offsets. Only valid when has_int64_pk_index() returns true.
+    void
+    bulk_get_int64_pks_by_offsets(const int64_t* offsets,
+                                  int64_t count,
+                                  int64_t* output) const {
+        AssertInfo(has_int64_pk_index(),
+                   "bulk_get_int64_pks_by_offsets requires int64 PK with offset2pk index");
+        offset2pk_->bulk_at(offsets, count, output);
+    }
+
  public:
     ConcurrentVector<Timestamp> timestamps_;
     std::atomic<int64_t> reserved = 0;
@@ -639,6 +807,10 @@ class InsertRecordSealed {
     TimestampIndex timestamp_index_;
     // pks to row offset
     std::unique_ptr<OffsetMap> pk2offset_;
+    // offset to pk (compressed), only available for int64 PK
+    std::unique_ptr<CompressedInt64PkArray> offset2pk_;
+    // whether PK type is int64
+    bool is_int64_pk_ = false;
     // estimated memory size of InsertRecord, only used for sealed segment
     int64_t estimated_memory_size_{0};
 

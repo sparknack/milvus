@@ -2089,6 +2089,21 @@ ChunkedSegmentSealedImpl::bulk_subscript(milvus::OpContext* op_ctx,
         return fill_with_empty(field_id, count);
     }
 
+    // Fast path for int64 PK field: use compressed offset2pk index
+    auto pk_field_id = schema_->get_primary_field_id();
+    if (pk_field_id.has_value() && pk_field_id.value() == field_id &&
+        field_meta.get_data_type() == DataType::INT64 &&
+        insert_record_.has_int64_pk_index()) {
+        auto ret = fill_with_empty(field_id, count);
+        auto* output = ret->mutable_scalars()
+                           ->mutable_long_data()
+                           ->mutable_data()
+                           ->mutable_data();
+        insert_record_.bulk_get_int64_pks_by_offsets(
+            seg_offsets, count, output);
+        return ret;
+    }
+
     // hold field shared_ptr here, preventing field got destroyed
     auto [field, exist] = GetFieldDataIfExist(field_id);
     if (exist) {
