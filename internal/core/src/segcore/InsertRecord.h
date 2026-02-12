@@ -42,9 +42,9 @@ constexpr int64_t BruteForceSelectivity = 10;
 using Condition = std::function<bool(int64_t)>;
 
 // Compressed storage for offset -> int64 PK reverse lookup.
-// Uses global base + block base + varint-encoded deltas.
-// Block size = 128, lookup is O(128) worst case.
-// Each block has its own base (min value in block - global base) for better compression.
+// Uses global base + per-block base + bitpacked deltas.
+// Block size = 128, O(1) random access within each block.
+// Each block stores deltas with a uniform bit width (max bits needed in that block).
 class CompressedInt64PkArray {
  public:
     static constexpr int64_t kBlockSize = 128;
@@ -68,15 +68,15 @@ class CompressedInt64PkArray {
 
         // Calculate number of blocks
         int64_t num_blocks = (num_rows + kBlockSize - 1) / kBlockSize;
-        block_offsets_.reserve(num_blocks + 1);
+        block_bit_widths_.reserve(num_blocks);
+        block_offsets_.reserve(num_blocks);
         block_bases_.reserve(num_blocks);
-
-        // Estimate: assume average 1-2 bytes per delta with block base
-        data_.reserve(num_rows * 2);
 
         for (int64_t block_id = 0; block_id < num_blocks; ++block_id) {
             int64_t block_start = block_id * kBlockSize;
-            int64_t block_end = std::min(block_start + kBlockSize, num_rows);
+            int64_t block_end =
+                std::min(block_start + kBlockSize, num_rows);
+            int64_t block_count = block_end - block_start;
 
             // Find block minimum
             int64_t block_min = pks[block_start];
@@ -86,24 +86,46 @@ class CompressedInt64PkArray {
                 }
             }
 
-            // Store block base (relative to global base)
+            // Find max delta to determine bit width
+            uint64_t max_delta = 0;
+            for (int64_t i = block_start; i < block_end; ++i) {
+                uint64_t delta =
+                    static_cast<uint64_t>(pks[i] - block_min);
+                if (delta > max_delta) {
+                    max_delta = delta;
+                }
+            }
+
+            uint8_t bits = bit_width(max_delta);
             block_bases_.push_back(
                 static_cast<uint64_t>(block_min - base_));
-            block_offsets_.push_back(static_cast<uint32_t>(data_.size()));
+            block_bit_widths_.push_back(bits);
+            block_offsets_.push_back(
+                static_cast<uint32_t>(data_.size()));
 
-            // Encode deltas relative to block minimum
-            for (int64_t i = block_start; i < block_end; ++i) {
-                uint64_t delta = static_cast<uint64_t>(pks[i] - block_min);
-                encode_varint(delta);
+            // Pack deltas with uniform bit width
+            if (bits == 0) {
+                // All values identical in this block, no data needed
+            } else {
+                // Number of bytes needed: ceil(block_count * bits / 8)
+                size_t num_bytes =
+                    (static_cast<size_t>(block_count) * bits + 7) / 8;
+                size_t data_start = data_.size();
+                data_.resize(data_start + num_bytes, 0);
+
+                for (int64_t i = 0; i < block_count; ++i) {
+                    uint64_t delta = static_cast<uint64_t>(
+                        pks[block_start + i] - block_min);
+                    pack_value(data_start, i, bits, delta);
+                }
             }
         }
-        // Add sentinel for easier boundary handling
-        block_offsets_.push_back(static_cast<uint32_t>(data_.size()));
 
         // Shrink to fit
         data_.shrink_to_fit();
         block_offsets_.shrink_to_fit();
         block_bases_.shrink_to_fit();
+        block_bit_widths_.shrink_to_fit();
     }
 
     int64_t
@@ -115,17 +137,15 @@ class CompressedInt64PkArray {
 
         int64_t block_id = offset / kBlockSize;
         int64_t idx_in_block = offset % kBlockSize;
+        uint8_t bits = block_bit_widths_[block_id];
 
-        const uint8_t* ptr = data_.data() + block_offsets_[block_id];
-        const uint8_t* end = data_.data() + block_offsets_[block_id + 1];
-
-        // Decode idx_in_block + 1 varints to reach the target
         uint64_t delta = 0;
-        for (int64_t i = 0; i <= idx_in_block; ++i) {
-            delta = decode_varint(ptr, end);
+        if (bits > 0) {
+            delta = unpack_value(block_offsets_[block_id],
+                                 idx_in_block,
+                                 bits);
         }
 
-        // pk = global_base + block_base + delta
         return base_ + static_cast<int64_t>(block_bases_[block_id]) +
                static_cast<int64_t>(delta);
     }
@@ -143,7 +163,8 @@ class CompressedInt64PkArray {
     memory_size() const {
         return sizeof(*this) + data_.capacity() +
                block_offsets_.capacity() * sizeof(uint32_t) +
-               block_bases_.capacity() * sizeof(uint64_t);
+               block_bases_.capacity() * sizeof(uint64_t) +
+               block_bit_widths_.capacity() * sizeof(uint8_t);
     }
 
     int64_t
@@ -157,37 +178,86 @@ class CompressedInt64PkArray {
     }
 
  private:
-    void
-    encode_varint(uint64_t value) {
-        while (value >= 0x80) {
-            data_.push_back(static_cast<uint8_t>(value | 0x80));
-            value >>= 7;
+    static uint8_t
+    bit_width(uint64_t max_val) {
+        if (max_val == 0) {
+            return 0;
         }
-        data_.push_back(static_cast<uint8_t>(value));
+        return static_cast<uint8_t>(64 - __builtin_clzll(max_val));
     }
 
-    static uint64_t
-    decode_varint(const uint8_t*& ptr, const uint8_t* end) {
-        uint64_t result = 0;
-        int shift = 0;
-        while (ptr < end) {
-            uint8_t byte = *ptr++;
-            result |= static_cast<uint64_t>(byte & 0x7F) << shift;
-            if ((byte & 0x80) == 0) {
-                return result;
-            }
-            shift += 7;
+    void
+    pack_value(size_t data_start,
+               int64_t idx,
+               uint8_t bits,
+               uint64_t value) {
+        uint64_t bit_offset =
+            static_cast<uint64_t>(idx) * bits;
+        size_t byte_offset = data_start + bit_offset / 8;
+        unsigned bit_shift = bit_offset % 8;
+
+        // Low 64 bits of (value << bit_shift)
+        uint64_t lo = value << bit_shift;
+        for (unsigned b = 0; b < 8 && byte_offset + b < data_.size();
+             ++b) {
+            data_[byte_offset + b] |=
+                static_cast<uint8_t>(lo >> (b * 8));
         }
-        // Should not reach here if data is valid
-        return result;
+        // High bits that overflowed past 64-bit boundary
+        if (bit_shift > 0 && bit_shift + bits > 64) {
+            uint64_t hi = value >> (64 - bit_shift);
+            for (unsigned b = 0;
+                 byte_offset + 8 + b < data_.size() && b < 8;
+                 ++b) {
+                data_[byte_offset + 8 + b] |=
+                    static_cast<uint8_t>(hi >> (b * 8));
+            }
+        }
+    }
+
+    uint64_t
+    unpack_value(uint32_t block_data_offset,
+                 int64_t idx,
+                 uint8_t bits) const {
+        uint64_t bit_offset =
+            static_cast<uint64_t>(idx) * bits;
+        size_t byte_offset = block_data_offset + bit_offset / 8;
+        unsigned bit_shift = bit_offset % 8;
+
+        // Read low 8 bytes
+        uint64_t lo = 0;
+        for (unsigned b = 0; b < 8 && byte_offset + b < data_.size();
+             ++b) {
+            lo |= static_cast<uint64_t>(data_[byte_offset + b])
+                  << (b * 8);
+        }
+        uint64_t result = lo >> bit_shift;
+
+        // Read high bytes if crossing 64-bit boundary
+        if (bit_shift > 0 && bit_shift + bits > 64) {
+            uint64_t hi = 0;
+            for (unsigned b = 0;
+                 byte_offset + 8 + b < data_.size() && b < 8;
+                 ++b) {
+                hi |= static_cast<uint64_t>(
+                          data_[byte_offset + 8 + b])
+                      << (b * 8);
+            }
+            result |= hi << (64 - bit_shift);
+        }
+
+        uint64_t mask = (bits == 64) ? ~uint64_t(0)
+                                     : (uint64_t(1) << bits) - 1;
+        return result & mask;
     }
 
  private:
     int64_t base_ = 0;      // Global minimum PK
     int64_t num_rows_ = 0;
-    std::vector<uint32_t> block_offsets_;  // Start offset of each block in data_
-    std::vector<uint64_t> block_bases_;    // Block base relative to global base
-    std::vector<uint8_t> data_;            // Varint-encoded deltas
+    std::vector<uint32_t> block_offsets_;   // Byte offset of each block in data_
+    std::vector<uint64_t> block_bases_;     // Block base relative to global base
+    std::vector<uint8_t> block_bit_widths_; // Bit width per block
+    std::vector<uint8_t> data_;             // Bitpacked deltas
 };
 
 class OffsetMap {
@@ -752,7 +822,7 @@ class InsertRecordSealed {
         std::lock_guard lck(shared_mutex_);
         pk2offset_->seal();
         // update estimated memory size to caching layer
-        size_t total_size = pk2offset_->size();
+        size_t total_size = pk2offset_->memory_size();
         if (offset2pk_) {
             total_size += offset2pk_->memory_size();
         }
