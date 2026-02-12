@@ -768,11 +768,6 @@ class InsertRecordSealed {
         int64_t offset = 0;
         switch (data_type) {
             case DataType::INT64: {
-                // Collect all PKs for building compressed offset2pk
-                int64_t total_rows = data->NumRows();
-                std::vector<int64_t> all_pks;
-                all_pks.reserve(total_rows);
-
                 auto num_chunk = data->num_chunks();
                 for (int i = 0; i < num_chunk; ++i) {
                     auto pw = data->DataOfChunk(nullptr, i);
@@ -780,13 +775,8 @@ class InsertRecordSealed {
                     auto chunk_num_rows = data->chunk_row_nums(i);
                     for (int j = 0; j < chunk_num_rows; ++j) {
                         pk2offset_->insert(pks[j], offset++);
-                        all_pks.push_back(pks[j]);
                     }
                 }
-
-                // Build compressed offset -> pk mapping
-                offset2pk_ = std::make_unique<CompressedInt64PkArray>();
-                offset2pk_->build(all_pks.data(), all_pks.size());
                 break;
             }
             case DataType::VARCHAR: {
@@ -811,6 +801,37 @@ class InsertRecordSealed {
         }
     }
 
+    // Build only the compressed offset->pk mapping (no pk2offset_ index).
+    // Used by sorted segments where pk2offset_ is not needed.
+    void
+    build_offset2pk(milvus::DataType data_type, ChunkedColumnInterface* data) {
+        if (data_type != DataType::INT64 || !is_int64_pk_) {
+            return;
+        }
+        std::lock_guard lck(shared_mutex_);
+        int64_t total_rows = data->NumRows();
+        std::vector<int64_t> all_pks;
+        all_pks.reserve(total_rows);
+
+        auto num_chunk = data->num_chunks();
+        for (int i = 0; i < num_chunk; ++i) {
+            auto pw = data->DataOfChunk(nullptr, i);
+            auto pks = reinterpret_cast<const int64_t*>(pw.get());
+            auto chunk_num_rows = data->chunk_row_nums(i);
+            for (int j = 0; j < chunk_num_rows; ++j) {
+                all_pks.push_back(pks[j]);
+            }
+        }
+
+        offset2pk_ = std::make_unique<CompressedInt64PkArray>();
+        offset2pk_->build(all_pks.data(), all_pks.size());
+
+        size_t mem = offset2pk_->memory_size();
+        cachinglayer::Manager::GetInstance().ChargeLoadedResource(
+            {static_cast<int64_t>(mem), 0});
+        estimated_memory_size_ += mem;
+    }
+
     bool
     empty_pks() const {
         std::shared_lock lck(shared_mutex_);
@@ -822,10 +843,8 @@ class InsertRecordSealed {
         std::lock_guard lck(shared_mutex_);
         pk2offset_->seal();
         // update estimated memory size to caching layer
+        // offset2pk_ memory is charged separately in build_offset2pk()
         size_t total_size = pk2offset_->memory_size();
-        if (offset2pk_) {
-            total_size += offset2pk_->memory_size();
-        }
         cachinglayer::Manager::GetInstance().ChargeLoadedResource(
             {static_cast<int64_t>(total_size), 0});
         estimated_memory_size_ += total_size;

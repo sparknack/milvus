@@ -2586,13 +2586,18 @@ ChunkedSegmentSealedImpl::load_field_data_common(
     LoadSkipIndex(field_id, data_type, column);
 
     // set pks to offset
-    if (schema_->get_primary_field_id() == field_id && !is_sorted_by_pk_) {
-        AssertInfo(field_id.get() != -1, "Primary key is -1");
-        AssertInfo(insert_record_.empty_pks(),
-                   "primary key records already exists, current field id {}",
-                   field_id.get());
-        insert_record_.insert_pks(data_type, column.get());
-        insert_record_.seal_pks();
+    if (schema_->get_primary_field_id() == field_id) {
+        // Always build compressed offset->pk for FillPrimaryKeys fast path
+        insert_record_.build_offset2pk(data_type, column.get());
+
+        if (!is_sorted_by_pk_) {
+            AssertInfo(field_id.get() != -1, "Primary key is -1");
+            AssertInfo(insert_record_.empty_pks(),
+                       "primary key records already exists, current field id {}",
+                       field_id.get());
+            insert_record_.insert_pks(data_type, column.get());
+            insert_record_.seal_pks();
+        }
     }
 
     bool generated_interim_index = generate_interim_index(field_id, num_rows);

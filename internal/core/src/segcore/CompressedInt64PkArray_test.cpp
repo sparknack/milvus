@@ -214,3 +214,72 @@ TEST(CompressedInt64PkArrayTest, PowerOfTwoBitWidths) {
     test_max_delta(65535);      // 16 bits
     test_max_delta(0xFFFFFFFF); // 32 bits
 }
+
+// Simulate what build_offset2pk does: build from unsorted PK data
+// (as would happen in a non-sorted segment)
+TEST(CompressedInt64PkArrayTest, UnsortedPks) {
+    // Typical auto-id pattern: IDs assigned out of order due to concurrent inserts
+    std::vector<int64_t> pks = {
+        449595445547098119, 449595445547098120, 449595445547098121,
+        449595445547098115, 449595445547098116, 449595445547098117,
+        449595445547098112, 449595445547098113, 449595445547098114,
+        449595445547098118};
+
+    CompressedInt64PkArray arr;
+    arr.build(pks.data(), pks.size());
+
+    for (int64_t i = 0; i < static_cast<int64_t>(pks.size()); ++i) {
+        EXPECT_EQ(arr.at(i), pks[i]) << "mismatch at offset " << i;
+    }
+}
+
+// Simulate sorted segment: PKs are in ascending order
+TEST(CompressedInt64PkArrayTest, SortedPks) {
+    constexpr int64_t N = 500;
+    std::mt19937_64 rng(99);
+    std::uniform_int_distribution<int64_t> dist(1, 1'000'000'000LL);
+
+    std::vector<int64_t> pks(N);
+    for (auto& pk : pks) {
+        pk = dist(rng);
+    }
+    std::sort(pks.begin(), pks.end());
+
+    CompressedInt64PkArray arr;
+    arr.build(pks.data(), N);
+
+    EXPECT_EQ(arr.num_rows(), N);
+    for (int64_t i = 0; i < N; ++i) {
+        EXPECT_EQ(arr.at(i), pks[i]) << "mismatch at offset " << i;
+    }
+
+    // Verify bulk_at with random offsets
+    std::vector<int64_t> offsets(50);
+    std::uniform_int_distribution<int64_t> offset_dist(0, N - 1);
+    for (auto& o : offsets) {
+        o = offset_dist(rng);
+    }
+    std::vector<int64_t> output(50);
+    arr.bulk_at(offsets.data(), offsets.size(), output.data());
+    for (size_t i = 0; i < offsets.size(); ++i) {
+        EXPECT_EQ(output[i], pks[offsets[i]]);
+    }
+}
+
+// Simulate sorted segment with duplicates (possible with non-unique PK)
+TEST(CompressedInt64PkArrayTest, SortedWithDuplicates) {
+    std::vector<int64_t> pks;
+    for (int64_t v = 100; v < 200; ++v) {
+        // Each value appears 3 times
+        pks.push_back(v);
+        pks.push_back(v);
+        pks.push_back(v);
+    }
+
+    CompressedInt64PkArray arr;
+    arr.build(pks.data(), pks.size());
+
+    for (int64_t i = 0; i < static_cast<int64_t>(pks.size()); ++i) {
+        EXPECT_EQ(arr.at(i), pks[i]) << "mismatch at offset " << i;
+    }
+}
