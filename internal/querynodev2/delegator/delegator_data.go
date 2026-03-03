@@ -541,17 +541,24 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 		return err
 	}
 
+	refundCandidatesOnErr := func(err error) error {
+		for _, c := range candidates {
+			c.Refund()
+		}
+		return err
+	}
+
 	log.Debug("load delete...")
 	err = sd.loadStreamDelete(ctx, candidates, infos, req, targetNodeID, worker)
 	if err != nil {
 		log.Warn("load stream delete failed", zap.Error(err))
-		return err
+		return refundCandidatesOnErr(err)
 	}
 
 	err = sd.loadBM25Stats(ctx, infos, req)
 	if err != nil {
 		log.Warn("failed to load BM25 stats", zap.Error(err))
-		return err
+		return refundCandidatesOnErr(err)
 	}
 
 	// Build a map from segmentID to BloomFilterSet
@@ -578,7 +585,11 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 		entries = append(entries, entry)
 	}
 
-	return sd.addDistributionIfVersionOK(req.GetLoadMeta().GetSchemaVersion(), entries...)
+	err = sd.addDistributionIfVersionOK(req.GetLoadMeta().GetSchemaVersion(), entries...)
+	if err != nil {
+		return refundCandidatesOnErr(err)
+	}
+	return nil
 }
 
 func (sd *shardDelegator) addDistributionIfVersionOK(version uint64, entries ...SegmentEntry) error {
