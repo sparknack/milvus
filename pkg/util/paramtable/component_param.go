@@ -308,6 +308,7 @@ type commonConfig struct {
 	BloomFilterType           ParamItem `refreshable:"true"`
 	MaxBloomFalsePositive     ParamItem `refreshable:"true"`
 	BloomFilterApplyBatchSize ParamItem `refreshable:"true"`
+	BloomFilterMmapEnabled   ParamItem `refreshable:"false"`
 	PanicWhenPluginFail       ParamItem `refreshable:"false"`
 	CollectionReplicateEnable ParamItem `refreshable:"true"`
 
@@ -1171,6 +1172,15 @@ This helps Milvus-CDC synchronize incremental data`,
 		},
 	}
 	p.BloomFilterApplyBatchSize.Init(base.mgr)
+
+	p.BloomFilterMmapEnabled = ParamItem{
+		Key:          "common.bloomFilterMmapEnabled",
+		Version:      "2.5.6",
+		DefaultValue: "false",
+		Doc:          "if true, mmap bloom filter data to local file to reduce Go heap pressure",
+		Export:       true,
+	}
+	p.BloomFilterMmapEnabled.Init(base.mgr)
 
 	p.PanicWhenPluginFail = ParamItem{
 		Key:          "common.panicWhenPluginFail",
