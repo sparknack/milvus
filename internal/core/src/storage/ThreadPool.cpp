@@ -113,11 +113,23 @@ ThreadPool::Worker() {
     while (!shutdown_) {
         std::unique_lock<std::mutex> lock(mutex_);
         idle_threads_size_++;
+        if (metric_idle_) {
+            metric_idle_->Set(idle_threads_size_);
+        }
+        if (metric_active_) {
+            metric_active_->Set(current_threads_size_ - idle_threads_size_);
+        }
         auto is_timeout = !condition_lock_.wait_for(
             lock, std::chrono::seconds(WAIT_SECONDS), [this]() {
                 return shutdown_ || !work_queue_.empty();
             });
         idle_threads_size_--;
+        if (metric_idle_) {
+            metric_idle_->Set(idle_threads_size_);
+        }
+        if (metric_active_) {
+            metric_active_->Set(current_threads_size_ - idle_threads_size_);
+        }
         if (work_queue_.empty()) {
             // Dynamic reduce thread number
             if (shutdown_) {
@@ -135,9 +147,15 @@ ThreadPool::Worker() {
             }
         }
         dequeue = work_queue_.dequeue(func);
+        if (metric_queue_depth_) {
+            metric_queue_depth_->Set(work_queue_.size());
+        }
         lock.unlock();
         if (dequeue) {
             func();
+            if (metric_completed_) {
+                metric_completed_->Increment();
+            }
         }
     }
 }
