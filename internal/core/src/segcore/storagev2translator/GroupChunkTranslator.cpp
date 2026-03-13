@@ -118,28 +118,38 @@ GroupChunkTranslator::GroupChunkTranslator(
     auto fs = milvus_storage::ArrowFileSystemSingleton::GetInstance()
                   .GetArrowFileSystem();
 
-    // Get row group metadata from files
-    row_group_meta_list_.reserve(insert_files_.size());
+    // Get row group metadata from files in parallel using HIGH POOL
+    // to avoid blocking the MIDDLE POOL thread with serial S3 I/O
+    auto& pool = ThreadPools::GetThreadPool(ThreadPoolPriority::HIGH);
+    std::vector<std::future<milvus_storage::RowGroupMetadataVector>> futures;
+    futures.reserve(insert_files_.size());
     for (const auto& file : insert_files_) {
-        auto result = milvus_storage::FileRowGroupReader::Make(
-            fs,
-            file,
-            milvus_storage::DEFAULT_READ_BUFFER_SIZE,
-            storage::GetReaderProperties());
-        AssertInfo(result.ok(),
-                   "[StorageV2] Failed to create file row group reader: " +
-                       result.status().ToString());
-        auto reader = result.ValueOrDie();
-
-        row_group_meta_list_.push_back(
-            reader->file_metadata()->GetRowGroupMetadataVector());
-        auto status = reader->Close();
-        AssertInfo(status.ok(),
-                   "[StorageV2] translator {} failed to close file reader when "
-                   "get row group "
-                   "metadata from file {} with error {}",
-                   key_,
-                   file + " with error: " + status.ToString());
+        futures.push_back(pool.Submit([&fs, &file, this]() {
+            auto result = milvus_storage::FileRowGroupReader::Make(
+                fs,
+                file,
+                milvus_storage::DEFAULT_READ_BUFFER_SIZE,
+                storage::GetReaderProperties());
+            AssertInfo(
+                result.ok(),
+                "[StorageV2] Failed to create file row group reader: " +
+                    result.status().ToString());
+            auto reader = result.ValueOrDie();
+            auto meta = reader->file_metadata()->GetRowGroupMetadataVector();
+            auto status = reader->Close();
+            AssertInfo(
+                status.ok(),
+                "[StorageV2] translator {} failed to close file reader when "
+                "get row group "
+                "metadata from file {} with error {}",
+                key_,
+                file + " with error: " + status.ToString());
+            return meta;
+        }));
+    }
+    row_group_meta_list_.reserve(insert_files_.size());
+    for (auto& f : futures) {
+        row_group_meta_list_.push_back(f.get());
     }
 
     // Build prefix sum for O(1) lookup in get_cid_from_file_and_row_group_index

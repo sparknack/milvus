@@ -34,6 +34,7 @@
 #include "segcore/storagev1translator/DefaultValueChunkTranslator.h"
 #include "segcore/storagev2translator/GroupChunkTranslator.h"
 #include "segcore/Utils.h"
+#include "storage/ThreadPools.h"
 
 namespace milvus::index {
 
@@ -964,15 +965,28 @@ JsonKeyStats::LoadColumnGroup(int64_t column_group_id,
         milvus_field_ids.push_back(FieldId(field_id_list.Get(i)));
     }
 
+    // Fetch row group metadata from all files in parallel using HIGH POOL
+    // to avoid blocking the caller thread with serial S3 I/O
+    auto& pool =
+        ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::HIGH);
+    std::vector<std::future<int64_t>> futures;
+    futures.reserve(files.size());
     for (const auto& file : files) {
-        auto result = milvus_storage::FileRowGroupReader::Make(fs, file);
-        AssertInfo(result.ok(),
-                   "[StorageV2] Failed to create file row group reader: " +
-                       result.status().ToString());
-        auto reader = result.ValueOrDie();
-        auto row_group_meta_vector =
-            reader->file_metadata()->GetRowGroupMetadataVector();
-        num_rows += row_group_meta_vector.row_num();
+        futures.push_back(pool.Submit([&fs, &file]() {
+            auto result =
+                milvus_storage::FileRowGroupReader::Make(fs, file);
+            AssertInfo(
+                result.ok(),
+                "[StorageV2] Failed to create file row group reader: " +
+                    result.status().ToString());
+            auto reader = result.ValueOrDie();
+            auto row_group_meta_vector =
+                reader->file_metadata()->GetRowGroupMetadataVector();
+            return static_cast<int64_t>(row_group_meta_vector.row_num());
+        }));
+    }
+    for (auto& f : futures) {
+        num_rows += f.get();
     }
 
     if (num_rows_ == 0) {
