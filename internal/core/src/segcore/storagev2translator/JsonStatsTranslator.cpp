@@ -63,9 +63,9 @@ JsonStatsTranslator::estimated_byte_size_of_cell(
     milvus::cachinglayer::cid_t) const {
     if (load_info_.enable_mmap) {
         return {{0, load_info_.stats_size},
-                {load_info_.stats_size, load_info_.stats_size}};
+                {load_info_.stats_size, 0}};
     } else {
-        return {{load_info_.stats_size, 0}, {load_info_.stats_size, 0}};
+        return {{load_info_.stats_size, 0}, {0, 0}};
     }
 }
 
