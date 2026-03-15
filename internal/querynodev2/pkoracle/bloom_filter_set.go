@@ -186,15 +186,25 @@ func (s *BloomFilterSet) Charge() {
 
 	size := s.memSizeLocked()
 	if size > 0 {
-		C.ChargeLoadedResource(C.CResourceUsage{
-			memory_bytes: C.int64_t(size),
-			disk_bytes:   0,
-		})
+		var usage C.CResourceUsage
+		if s.isMmapped {
+			usage = C.CResourceUsage{
+				memory_bytes: 0,
+				disk_bytes:   C.int64_t(size),
+			}
+		} else {
+			usage = C.CResourceUsage{
+				memory_bytes: C.int64_t(size),
+				disk_bytes:   0,
+			}
+		}
+		C.ChargeLoadedResource(usage)
 		s.trackedSize = size
 		s.resourceCharged = true
 		log.Debug("charged bloom filter resource",
 			zap.Int64("segmentID", s.segmentID),
-			zap.Int64("size", size))
+			zap.Int64("size", size),
+			zap.Bool("isMmapped", s.isMmapped))
 	}
 }
 
@@ -205,13 +215,23 @@ func (s *BloomFilterSet) Refund() {
 	defer s.statsMutex.Unlock()
 
 	if s.resourceCharged && s.trackedSize > 0 {
-		C.RefundLoadedResource(C.CResourceUsage{
-			memory_bytes: C.int64_t(s.trackedSize),
-			disk_bytes:   0,
-		})
+		var usage C.CResourceUsage
+		if s.isMmapped {
+			usage = C.CResourceUsage{
+				memory_bytes: 0,
+				disk_bytes:   C.int64_t(s.trackedSize),
+			}
+		} else {
+			usage = C.CResourceUsage{
+				memory_bytes: C.int64_t(s.trackedSize),
+				disk_bytes:   0,
+			}
+		}
+		C.RefundLoadedResource(usage)
 		log.Debug("refunded bloom filter resource",
 			zap.Int64("segmentID", s.segmentID),
-			zap.Int64("size", s.trackedSize))
+			zap.Int64("size", s.trackedSize),
+			zap.Bool("isMmapped", s.isMmapped))
 	}
 	s.trackedSize = 0
 	s.resourceCharged = false
