@@ -1109,6 +1109,7 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     LoadFieldDataInfo field_data_info_;
 
     SegmentLoadInfo segment_load_info_;
+    Timestamp segment_max_timestamp_{0};
 
     SchemaPtr schema_;
     int64_t id_;

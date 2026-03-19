@@ -308,6 +308,11 @@ class SegmentLoadInfo {
         return info_.flush_time();
     }
 
+    [[nodiscard]] uint64_t
+    GetMaxTimestamp() const {
+        return info_.max_timestamp();
+    }
+
     [[nodiscard]] int64_t
     GetReadableVersion() const {
         return info_.readableversion();

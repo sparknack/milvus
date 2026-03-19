@@ -2484,6 +2484,14 @@ void
 ChunkedSegmentSealedImpl::mask_with_timestamps(BitsetTypeView& bitset_chunk,
                                                Timestamp timestamp,
                                                Timestamp collection_ttl) const {
+    // Fast path: if no TTL concern and query timestamp covers all data
+    // in this sealed segment, skip entirely — avoids triggering lazy
+    // TimestampIndex construction and S3 I/O.
+    if (collection_ttl == 0 && segment_max_timestamp_ > 0 &&
+        timestamp >= segment_max_timestamp_) {
+        return;
+    }
+
     auto ts_index = PinTimestampIndex(nullptr);
     auto* ts_cell = ts_index.get();
     AssertInfo(ts_cell != nullptr || !insert_record_.timestamps_.empty(),
@@ -3034,13 +3042,15 @@ ChunkedSegmentSealedImpl::SetLoadInfo(
     const proto::segcore::SegmentLoadInfo& load_info) {
     std::unique_lock lck(mutex_);
     segment_load_info_ = SegmentLoadInfo(load_info, schema_);
+    segment_max_timestamp_ = segment_load_info_.GetMaxTimestamp();
     LOG_INFO(
         "SetLoadInfo for segment {}, num_rows: {}, index count: {}, "
-        "storage_version: {}",
+        "storage_version: {}, max_timestamp: {}",
         id_,
         segment_load_info_.GetNumOfRows(),
         segment_load_info_.GetIndexInfoCount(),
-        segment_load_info_.GetStorageVersion());
+        segment_load_info_.GetStorageVersion(),
+        segment_max_timestamp_);
 }
 
 void
