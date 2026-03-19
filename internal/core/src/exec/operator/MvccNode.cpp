@@ -38,6 +38,7 @@ PhyMvccNode::PhyMvccNode(int32_t operator_id,
     query_timestamp_ = query_context->get_query_timestamp();
     active_count_ = query_context->get_active_count();
     is_source_node_ = mvcc_node->sources().size() == 0;
+    consistency_level_ = query_context->get_consistency_level();
     collection_ttl_timestamp_ = query_context->get_collection_ttl();
 }
 
@@ -98,9 +99,14 @@ PhyMvccNode::GetOutput() {
                                      : GetColumnVector(input_);
 
     TargetBitmapView data(col_input->GetRawData(), col_input->size());
-    segment_->mask_with_timestamps(
-        data, query_timestamp_, collection_ttl_timestamp_);
-    segment_->mask_with_delete(data, active_count_, query_timestamp_);
+    // consistency_level_ == -1 signals that MVCC filtering is disabled
+    // (common.mvccEnabled=false). Skip both timestamp visibility and
+    // delete masking — all rows are treated as visible.
+    if (consistency_level_ != -1) {
+        segment_->mask_with_timestamps(
+            data, query_timestamp_, collection_ttl_timestamp_);
+        segment_->mask_with_delete(data, active_count_, query_timestamp_);
+    }
     is_finished_ = true;
 
     return std::make_shared<RowVector>(std::vector<VectorPtr>{col_input});

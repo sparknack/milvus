@@ -304,6 +304,7 @@ type commonConfig struct {
 
 	TTMsgEnabled              ParamItem `refreshable:"true"`
 	TraceLogMode              ParamItem `refreshable:"true"`
+	MvccEnabled               ParamItem `refreshable:"false"`
 	BloomFilterEnabled        ParamItem `refreshable:"false"`
 	BloomFilterSize           ParamItem `refreshable:"true"`
 	BloomFilterType           ParamItem `refreshable:"true"`
@@ -1130,6 +1131,15 @@ This helps Milvus-CDC synchronize incremental data`,
 		Export:       true,
 	}
 	p.TraceLogMode.Init(base.mgr)
+
+	p.MvccEnabled = ParamItem{
+		Key:          "common.mvccEnabled",
+		Version:      "2.6.8",
+		DefaultValue: "true",
+		Doc:          "whether to apply MVCC timestamp, delete, and collection TTL filtering on querynode. When disabled, mask_with_timestamps (which includes TTL expiry) and mask_with_delete are skipped entirely, making all rows visible including TTL-expired data.",
+		Export:       true,
+	}
+	p.MvccEnabled.Init(base.mgr)
 
 	p.BloomFilterEnabled = ParamItem{
 		Key:          "common.bloomFilterEnabled",
