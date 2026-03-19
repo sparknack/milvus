@@ -304,11 +304,12 @@ type commonConfig struct {
 
 	TTMsgEnabled              ParamItem `refreshable:"true"`
 	TraceLogMode              ParamItem `refreshable:"true"`
+	BloomFilterEnabled        ParamItem `refreshable:"false"`
 	BloomFilterSize           ParamItem `refreshable:"true"`
 	BloomFilterType           ParamItem `refreshable:"true"`
 	MaxBloomFalsePositive     ParamItem `refreshable:"true"`
 	BloomFilterApplyBatchSize ParamItem `refreshable:"true"`
-	BloomFilterMmapEnabled   ParamItem `refreshable:"false"`
+	BloomFilterMmapEnabled    ParamItem `refreshable:"false"`
 	PanicWhenPluginFail       ParamItem `refreshable:"false"`
 	CollectionReplicateEnable ParamItem `refreshable:"true"`
 
@@ -1129,6 +1130,15 @@ This helps Milvus-CDC synchronize incremental data`,
 		Export:       true,
 	}
 	p.TraceLogMode.Init(base.mgr)
+
+	p.BloomFilterEnabled = ParamItem{
+		Key:          "common.bloomFilterEnabled",
+		Version:      "2.6.8",
+		DefaultValue: "true",
+		Doc:          "whether to load and apply bloom filter/pk stats on querynode",
+		Export:       true,
+	}
+	p.BloomFilterEnabled.Init(base.mgr)
 
 	p.BloomFilterSize = ParamItem{
 		Key:          "common.bloomFilterSize",

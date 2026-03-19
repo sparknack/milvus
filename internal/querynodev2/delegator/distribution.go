@@ -667,14 +667,23 @@ func (d *distribution) GrowingSegmentExists(segmentID int64) bool {
 func BatchGetFromSegments(pks []storage.PrimaryKey, partitionID int64, sealed []SnapshotItem, growing []SegmentEntry) map[int64][]bool {
 	result := make(map[int64][]bool)
 	lc := storage.NewBatchLocationsCache(pks)
+	allPositive := lo.RepeatBy(lc.Size(), func(_ int) bool { return true })
 
 	// Check sealed segments from pinned snapshot
 	for _, item := range sealed {
 		for _, entry := range item.Segments {
-			if entry.Offline || entry.Candidate == nil {
+			if entry.Offline {
 				continue
 			}
-			if partitionID != common.AllPartitionsID && entry.Candidate.Partition() != partitionID {
+			entryPartition := entry.PartitionID
+			if entry.Candidate != nil {
+				entryPartition = entry.Candidate.Partition()
+			}
+			if partitionID != common.AllPartitionsID && entryPartition != partitionID {
+				continue
+			}
+			if entry.Candidate == nil {
+				result[entry.SegmentID] = allPositive
 				continue
 			}
 			result[entry.SegmentID] = entry.Candidate.BatchPkExist(lc)
@@ -683,10 +692,18 @@ func BatchGetFromSegments(pks []storage.PrimaryKey, partitionID int64, sealed []
 
 	// Check growing segments from pinned snapshot
 	for _, entry := range growing {
-		if entry.Candidate == nil {
+		if entry.Offline {
 			continue
 		}
-		if partitionID != common.AllPartitionsID && entry.Candidate.Partition() != partitionID {
+		entryPartition := entry.PartitionID
+		if entry.Candidate != nil {
+			entryPartition = entry.Candidate.Partition()
+		}
+		if partitionID != common.AllPartitionsID && entryPartition != partitionID {
+			continue
+		}
+		if entry.Candidate == nil {
+			result[entry.SegmentID] = allPositive
 			continue
 		}
 		result[entry.SegmentID] = entry.Candidate.BatchPkExist(lc)
