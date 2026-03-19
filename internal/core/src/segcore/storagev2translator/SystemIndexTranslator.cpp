@@ -65,16 +65,25 @@ create_offset_map(DataType data_type) {
 
 int64_t
 estimate_pk_index_bytes(DataType data_type,
-                        int64_t num_rows) {
+                        int64_t num_rows,
+                        bool is_sorted_by_pk) {
     int64_t base = 0;
     switch (data_type) {
         case DataType::INT64:
-            // int64 PK keeps both pk->offset and compressed offset->pk.
-            base = num_rows * static_cast<int64_t>(sizeof(int64_t) * 2);
+            if (is_sorted_by_pk) {
+                // sorted: only compressed offset->pk, no pk->offset
+                base = num_rows * static_cast<int64_t>(sizeof(int64_t));
+            } else {
+                // unsorted: both pk->offset and compressed offset->pk
+                base = num_rows * static_cast<int64_t>(sizeof(int64_t) * 2);
+            }
             break;
         case DataType::VARCHAR:
-            // Approximate pk->offset storage by a small fixed string header plus offsets.
-            base = num_rows * static_cast<int64_t>(sizeof(std::string) + 16);
+            if (is_sorted_by_pk) {
+                base = 0;  // sorted varchar: no index built
+            } else {
+                base = num_rows * static_cast<int64_t>(sizeof(std::string) + 16);
+            }
             break;
         default:
             ThrowInfo(DataTypeInvalid,
@@ -100,9 +109,9 @@ PkIndexCell::PkIndexCell(std::unique_ptr<OffsetMap> pk2offset,
     : pk2offset_(std::move(pk2offset)),
       offset2pk_(std::move(offset2pk)),
       is_int64_pk_(is_int64_pk),
-      byte_size_{static_cast<int64_t>(pk2offset_->memory_size() +
-                                      (offset2pk_ ? offset2pk_->memory_size()
-                                                  : 0)),
+      byte_size_{static_cast<int64_t>(
+                     (pk2offset_ ? pk2offset_->memory_size() : 0) +
+                     (offset2pk_ ? offset2pk_->memory_size() : 0)),
                  0} {
 }
 
@@ -238,7 +247,7 @@ std::pair<milvus::cachinglayer::ResourceUsage,
           milvus::cachinglayer::ResourceUsage>
 PkIndexTranslator::estimated_byte_size_of_cell(
     milvus::cachinglayer::cid_t) const {
-    return {{estimate_pk_index_bytes(data_type_, column_->NumRows()),
+    return {{estimate_pk_index_bytes(data_type_, column_->NumRows(), is_sorted_by_pk_),
              0},
             {0, 0}};
 }
@@ -253,7 +262,7 @@ PkIndexTranslator::get_cells(milvus::OpContext* ctx,
                              const std::vector<milvus::cachinglayer::cid_t>&) {
     CheckCancellation(ctx, segment_id_, "PkIndexTranslator::get_cells()");
 
-    auto pk2offset = create_offset_map(data_type_);
+    std::unique_ptr<OffsetMap> pk2offset;
     std::unique_ptr<CompressedInt64PkArray> offset2pk;
 
     auto num_chunks = column_->num_chunks();
@@ -266,6 +275,9 @@ PkIndexTranslator::get_cells(milvus::OpContext* ctx,
         case DataType::INT64: {
             std::vector<int64_t> all_pks;
             all_pks.reserve(column_->NumRows());
+            if (!is_sorted_by_pk_) {
+                pk2offset = create_offset_map(data_type_);
+            }
             for (int64_t i = 0; i < num_chunks; ++i) {
                 auto pw = column_->DataOfChunk(ctx, i);
                 auto pks = reinterpret_cast<const int64_t*>(pw.get());
@@ -273,7 +285,9 @@ PkIndexTranslator::get_cells(milvus::OpContext* ctx,
                 for (int64_t j = 0; j < chunk_num_rows; ++j) {
                     auto pk = pks[j];
                     all_pks.push_back(pk);
-                    pk2offset->insert(pk, offset);
+                    if (pk2offset) {
+                        pk2offset->insert(pk, offset);
+                    }
                     ++offset;
                 }
             }
@@ -282,11 +296,16 @@ PkIndexTranslator::get_cells(milvus::OpContext* ctx,
             break;
         }
         case DataType::VARCHAR: {
+            if (!is_sorted_by_pk_) {
+                pk2offset = create_offset_map(data_type_);
+            }
             for (int64_t i = 0; i < num_chunks; ++i) {
                 auto pw = column_->StringViews(ctx, i);
                 auto& pks = pw.get().first;
                 for (auto pk : pks) {
-                    pk2offset->insert(std::string(pk), offset);
+                    if (pk2offset) {
+                        pk2offset->insert(std::string(pk), offset);
+                    }
                     ++offset;
                 }
             }
@@ -297,7 +316,9 @@ PkIndexTranslator::get_cells(milvus::OpContext* ctx,
                       "unsupported primary key data type {}", data_type_);
     }
 
-    pk2offset->seal();
+    if (pk2offset) {
+        pk2offset->seal();
+    }
 
     std::vector<std::pair<milvus::cachinglayer::cid_t, std::unique_ptr<PkIndexCell>>>
         result;
