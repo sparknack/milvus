@@ -119,13 +119,18 @@ func NewSearchRequest(collection *CCollection, req *querypb.SearchRequest, place
 		return nil, errors.Wrap(err, "get fieldID from plan failed")
 	}
 
+	cl := req.GetReq().GetConsistencyLevel()
+	if !paramtable.Get().CommonCfg.MvccEnabled.GetAsBool() {
+		cl = -1 // signal C++ PhyMvccNode to skip all MVCC filtering
+	}
+
 	return &SearchRequest{
 		plan:              plan,
 		cPlaceholderGroup: cPlaceholderGroup,
 		msgID:             req.GetReq().GetBase().GetMsgID(),
 		searchFieldID:     int64(fieldID),
 		mvccTimestamp:     req.GetReq().GetMvccTimestamp(),
-		consistencyLevel:  req.GetReq().GetConsistencyLevel(),
+		consistencyLevel:  cl,
 		collectionTTL:     req.GetReq().GetCollectionTtlTimestamps(),
 	}, nil
 }
@@ -175,6 +180,9 @@ func NewRetrievePlan(col *CCollection, expr []byte, timestamp typeutil.Timestamp
 		return nil, errors.Wrap(err, "Create retrieve plan by expr failed")
 	}
 	maxLimitSize := paramtable.Get().QuotaConfig.MaxOutputSize.GetAsInt64()
+	if !paramtable.Get().CommonCfg.MvccEnabled.GetAsBool() {
+		consistencylevel = -1 // signal C++ PhyMvccNode to skip all MVCC filtering
+	}
 	return &RetrievePlan{
 		cRetrievePlan:    cPlan,
 		Timestamp:        timestamp,
