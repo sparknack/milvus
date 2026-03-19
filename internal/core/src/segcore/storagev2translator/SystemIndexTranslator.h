@@ -60,17 +60,27 @@ class PkIndexCell {
                 bool is_int64_pk);
 
     bool
+    has_pk2offset() const {
+        return pk2offset_ != nullptr;
+    }
+
+    bool
     empty_pks() const {
-        return pk2offset_->empty();
+        return pk2offset_ == nullptr || pk2offset_->empty();
     }
 
     bool
     contain(const PkType& pk) const {
+        if (pk2offset_ == nullptr) {
+            return false;
+        }
         return pk2offset_->contain(pk);
     }
 
     const OffsetMap&
     pk2offset() const {
+        AssertInfo(pk2offset_ != nullptr,
+                   "pk2offset not built (sorted-by-pk segment)");
         return *pk2offset_;
     }
 
