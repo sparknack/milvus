@@ -63,6 +63,7 @@
 #include "segcore/storagev1translator/ChunkTranslator.h"
 #include "segcore/storagev1translator/DefaultValueChunkTranslator.h"
 #include "segcore/storagev2translator/GroupChunkTranslator.h"
+#include "segcore/storagev2translator/SystemIndexTranslator.h"
 #include "mmap/ChunkedColumnInterface.h"
 #include "mmap/ChunkedColumnGroup.h"
 #include "segcore/storagev1translator/InterimSealedIndexTranslator.h"
@@ -95,6 +96,76 @@ get_bit(const BitsetType& bitset, FieldId field_id) {
     AssertInfo(pos >= 0, "invalid field id");
 
     return bitset[pos];
+}
+
+PinWrapper<const storagev2translator::TimestampIndexCell*>
+ChunkedSegmentSealedImpl::PinTimestampIndex(milvus::OpContext* op_ctx) const {
+    auto slot = *timestamp_index_slot_.rlock();
+    if (!slot) {
+        return PinWrapper<const storagev2translator::TimestampIndexCell*>(
+            nullptr);
+    }
+    auto ca = SemiInlineGet(slot->PinCells(op_ctx, {0}));
+    auto* cell = ca->get_cell_of(0);
+    AssertInfo(cell != nullptr,
+               "timestamp index cache is corrupted, segment {}",
+               id_);
+    return PinWrapper<const storagev2translator::TimestampIndexCell*>(ca, cell);
+}
+
+PinWrapper<const storagev2translator::PkIndexCell*>
+ChunkedSegmentSealedImpl::PinPkIndex(milvus::OpContext* op_ctx) const {
+    auto slot = *pk_index_slot_.rlock();
+    if (!slot) {
+        return PinWrapper<const storagev2translator::PkIndexCell*>(nullptr);
+    }
+    auto ca = SemiInlineGet(slot->PinCells(op_ctx, {0}));
+    auto* cell = ca->get_cell_of(0);
+    AssertInfo(cell != nullptr, "pk index cache is corrupted, segment {}", id_);
+    return PinWrapper<const storagev2translator::PkIndexCell*>(ca, cell);
+}
+
+bool
+ChunkedSegmentSealedImpl::Contain(const PkType& pk) const {
+    auto pk_index = PinPkIndex(nullptr);
+    if (pk_index.get() != nullptr) {
+        return pk_index.get()->contain(pk);
+    }
+    return insert_record_.contain(pk);
+}
+
+bool
+ChunkedSegmentSealedImpl::is_system_field_ready() const {
+    if (!insert_record_.timestamps_.empty()) {
+        return true;
+    }
+    return get_column(TimestampFieldID) != nullptr;
+}
+
+void
+ChunkedSegmentSealedImpl::init_storage_v2_timestamp_index(
+    const std::shared_ptr<ChunkedColumnInterface>& column, size_t num_rows) {
+    std::unique_ptr<Translator<storagev2translator::TimestampIndexCell>>
+        translator =
+        std::make_unique<storagev2translator::TimestampIndexTranslator>(
+            id_, column, num_rows);
+    *timestamp_index_slot_.wlock() =
+        Manager::GetInstance().CreateCacheSlot(std::move(translator));
+}
+
+void
+ChunkedSegmentSealedImpl::init_storage_v2_pk_index(
+    FieldId field_id,
+    const std::shared_ptr<ChunkedColumnInterface>& column,
+    DataType data_type) {
+    if (schema_->get_primary_field_id() != field_id) {
+        return;
+    }
+    std::unique_ptr<Translator<storagev2translator::PkIndexCell>> translator =
+        std::make_unique<storagev2translator::PkIndexTranslator>(
+            id_, column, data_type, is_sorted_by_pk_);
+    *pk_index_slot_.wlock() =
+        Manager::GetInstance().CreateCacheSlot(std::move(translator));
 }
 
 void
@@ -385,36 +456,7 @@ ChunkedSegmentSealedImpl::load_column_group_data_internal(
                                    true,
                                    op_ctx);
             if (field_id == TimestampFieldID) {
-                auto timestamp_proxy_column = get_column(TimestampFieldID);
-                AssertInfo(timestamp_proxy_column != nullptr,
-                           "timestamp proxy column is nullptr");
-                // TODO check timestamp_index ready instead of check system_ready_count_
-                int64_t num_rows;
-                for (auto& [_, info] : load_info.field_infos) {
-                    num_rows = info.row_count;
-                }
-                auto all_ts_chunks =
-                    timestamp_proxy_column->GetAllChunks(nullptr);
-                std::vector<Timestamp> timestamps(num_rows);
-                int64_t offset = 0;
-                for (int i = 0; i < all_ts_chunks.size(); i++) {
-                    auto chunk_data = all_ts_chunks[i].get();
-                    auto fixed_chunk =
-                        static_cast<FixedWidthChunk*>(chunk_data);
-                    auto span = fixed_chunk->Span();
-                    for (size_t j = 0; j < span.row_count(); j++) {
-                        auto ts = *(int64_t*)((char*)span.data() +
-                                              j * span.element_sizeof());
-                        timestamps[offset++] = ts;
-                    }
-                }
-                init_timestamp_index(timestamps, num_rows);
-                system_ready_count_++;
-                AssertInfo(offset == num_rows,
-                           "[StorageV2] timestamp total row count {} not equal "
-                           "to expected {}",
-                           offset,
-                           num_rows);
+                init_storage_v2_timestamp_index(column, num_rows);
             }
         }
 
@@ -545,8 +587,7 @@ ChunkedSegmentSealedImpl::load_system_field_internal(
             offset += chunk_ptr->Span().row_count();
         }
 
-        init_timestamp_index(timestamps, num_rows);
-        ++system_ready_count_;
+        init_timestamp_index_owned(std::move(timestamps), num_rows);
     } else {
         AssertInfo(system_field_type == SystemFieldType::RowId,
                    "System field type of id column is not RowId");
@@ -1200,9 +1241,21 @@ ChunkedSegmentSealedImpl::search_pks(BitsetType& bitset,
     }
     BitsetTypeView bitset_view(bitset);
     if (!is_sorted_by_pk_) {
+        auto pk_index = PinPkIndex(nullptr);
+        auto* pk_cell = pk_index.get();
+        AssertInfo(pk_cell != nullptr || !insert_record_.empty_pks(),
+                   "primary key index is not ready");
         for (auto& pk : pks) {
-            insert_record_.search_pk_range(
-                pk, proto::plan::OpType::Equal, bitset_view);
+            if (pk_cell != nullptr) {
+                pk_cell->pk2offset().find_range(
+                    pk,
+                    proto::plan::OpType::Equal,
+                    bitset_view,
+                    [](int64_t offset) { return true; });
+            } else {
+                insert_record_.search_pk_range(
+                    pk, proto::plan::OpType::Equal, bitset_view);
+            }
         }
         return;
     }
@@ -1239,12 +1292,31 @@ ChunkedSegmentSealedImpl::search_batch_pks(
         callback) const {
     // handle unsorted case
     if (!is_sorted_by_pk_) {
+        auto pk_index = PinPkIndex(nullptr);
+        auto ts_index = PinTimestampIndex(nullptr);
+        auto* pk_cell = pk_index.get();
+        auto* ts_cell = ts_index.get();
+        AssertInfo(ts_cell != nullptr || !insert_record_.timestamps_.empty(),
+                   "timestamp index is not ready");
+        auto timestamp_hit = include_same_ts
+                                 ? [](Timestamp lhs, Timestamp rhs) {
+                                       return lhs <= rhs;
+                                   }
+                                 : [](Timestamp lhs, Timestamp rhs) {
+                                       return lhs < rhs;
+                                   };
         for (size_t i = 0; i < pks.size(); i++) {
             auto timestamp = get_timestamp(i);
-            auto offsets =
-                insert_record_.search_pk(pks[i], timestamp, include_same_ts);
+            auto offsets = pk_cell != nullptr
+                               ? pk_cell->pk2offset().find(pks[i])
+                               : insert_record_.pk2offset_->find(pks[i]);
             for (auto offset : offsets) {
-                callback(offset, timestamp);
+                auto insert_ts = ts_cell != nullptr
+                                     ? ts_cell->timestamps()[offset]
+                                     : insert_record_.timestamps_[offset];
+                if (timestamp_hit(insert_ts, timestamp)) {
+                    callback(SegOffset(offset), timestamp);
+                }
             }
         }
         return;
@@ -1256,6 +1328,10 @@ ChunkedSegmentSealedImpl::search_batch_pks(
     AssertInfo(pk_column != nullptr, "primary key column not loaded");
 
     auto all_chunk_pins = pk_column->GetAllChunks(nullptr);
+    auto ts_index = PinTimestampIndex(nullptr);
+    auto* ts_cell = ts_index.get();
+    AssertInfo(ts_cell != nullptr || !insert_record_.timestamps_.empty(),
+               "timestamp index is not ready");
 
     auto timestamp_hit = include_same_ts
                              ? [](const Timestamp& ts1,
@@ -1287,8 +1363,10 @@ ChunkedSegmentSealedImpl::search_batch_pks(
                         pk_column->GetNumRowsUntilChunk(i);
                     for (; it != src + chunk_row_num && *it == target; ++it) {
                         auto offset = it - src + num_rows_until_chunk;
-                        if (timestamp_hit(insert_record_.timestamps_[offset],
-                                          timestamp)) {
+                        auto insert_ts = ts_cell != nullptr
+                                             ? ts_cell->timestamps()[offset]
+                                             : insert_record_.timestamps_[offset];
+                        if (timestamp_hit(insert_ts, timestamp)) {
                             callback(SegOffset(offset), timestamp);
                         }
                     }
@@ -1313,9 +1391,10 @@ ChunkedSegmentSealedImpl::search_batch_pks(
                            string_chunk->operator[](offset) == target;
                          ++offset) {
                         auto segment_offset = offset + num_rows_until_chunk;
-                        if (timestamp_hit(
-                                insert_record_.timestamps_[segment_offset],
-                                timestamp)) {
+                        auto insert_ts = ts_cell != nullptr
+                                             ? ts_cell->timestamps()[segment_offset]
+                                             : insert_record_.timestamps_[segment_offset];
+                        if (timestamp_hit(insert_ts, timestamp)) {
                             callback(SegOffset(segment_offset), timestamp);
                         }
                     }
@@ -1339,7 +1418,16 @@ ChunkedSegmentSealedImpl::pk_range(milvus::OpContext* op_ctx,
                                    const PkType& pk,
                                    BitsetTypeView& bitset) const {
     if (!is_sorted_by_pk_) {
-        insert_record_.search_pk_range(pk, op, bitset);
+        auto pk_index = PinPkIndex(op_ctx);
+        auto* pk_cell = pk_index.get();
+        AssertInfo(pk_cell != nullptr || !insert_record_.empty_pks(),
+                   "primary key index is not ready");
+        if (pk_cell != nullptr) {
+            pk_cell->pk2offset().find_range(
+                pk, op, bitset, [](int64_t offset) { return true; });
+        } else {
+            insert_record_.search_pk_range(pk, op, bitset);
+        }
         return;
     }
 
@@ -1382,9 +1470,32 @@ ChunkedSegmentSealedImpl::pk_binary_range(milvus::OpContext* op_ctx,
                                           bool upper_inclusive,
                                           BitsetTypeView& bitset) const {
     if (!is_sorted_by_pk_) {
-        // For unsorted segments, use the InsertRecord's binary range search
-        insert_record_.search_pk_binary_range(
-            lower_pk, lower_inclusive, upper_pk, upper_inclusive, bitset);
+        auto pk_index = PinPkIndex(op_ctx);
+        auto* pk_cell = pk_index.get();
+        AssertInfo(pk_cell != nullptr || !insert_record_.empty_pks(),
+                   "primary key index is not ready");
+        if (pk_cell != nullptr) {
+            auto lower_op = lower_inclusive ? proto::plan::OpType::GreaterEqual
+                                            : proto::plan::OpType::GreaterThan;
+            auto upper_op = upper_inclusive ? proto::plan::OpType::LessEqual
+                                            : proto::plan::OpType::LessThan;
+            BitsetType upper_result(bitset.size());
+            auto upper_view = upper_result.view();
+            pk_cell->pk2offset().find_range(
+                lower_pk,
+                lower_op,
+                bitset,
+                [](int64_t offset) { return true; });
+            pk_cell->pk2offset().find_range(
+                upper_pk,
+                upper_op,
+                upper_view,
+                [](int64_t offset) { return true; });
+            bitset &= upper_result;
+        } else {
+            insert_record_.search_pk_binary_range(
+                lower_pk, lower_inclusive, upper_pk, upper_inclusive, bitset);
+        }
         return;
     }
 
@@ -1426,6 +1537,13 @@ std::pair<std::vector<OffsetMap::OffsetType>, bool>
 ChunkedSegmentSealedImpl::find_first(int64_t limit,
                                      const BitsetType& bitset) const {
     if (!is_sorted_by_pk_) {
+        auto pk_index = PinPkIndex(nullptr);
+        auto* pk_cell = pk_index.get();
+        AssertInfo(pk_cell != nullptr || !insert_record_.empty_pks(),
+                   "primary key index is not ready");
+        if (pk_cell != nullptr) {
+            return pk_cell->pk2offset().find_first(limit, bitset);
+        }
         return insert_record_.pk2offset_->find_first(limit, bitset);
     }
     if (limit == Unlimited || limit == NoLimit) {
@@ -1517,16 +1635,17 @@ ChunkedSegmentSealedImpl::bulk_subscript(milvus::OpContext* op_ctx,
                "System field isn't ready when do bulk_insert, segID:{}",
                id_);
     switch (system_type) {
-        case SystemFieldType::Timestamp:
-            AssertInfo(insert_record_.timestamps_.num_chunk() == 1,
-                       "num chunk of timestamp not equal to 1 for "
-                       "sealed segment");
-            bulk_subscript_impl<Timestamp>(
-                op_ctx,
-                this->insert_record_.timestamps_.get_chunk_data(0),
-                seg_offsets,
-                count,
-                static_cast<Timestamp*>(output));
+        case SystemFieldType::Timestamp: {
+            auto* dst = static_cast<Timestamp*>(output);
+            auto ts_index = PinTimestampIndex(op_ctx);
+            auto* ts_cell = ts_index.get();
+            AssertInfo(ts_cell != nullptr || !insert_record_.timestamps_.empty(),
+                       "timestamp index is not ready");
+            auto& ts = ts_cell != nullptr ? ts_cell->timestamps()
+                                          : insert_record_.timestamps_;
+            for (int64_t i = 0; i < count; ++i) {
+                dst[i] = ts[seg_offsets[i]];
+            }
             break;
         case SystemFieldType::RowId:
             ThrowInfo(ErrorCode::Unsupported, "RowId retrieve not supported");
@@ -1647,13 +1766,14 @@ ChunkedSegmentSealedImpl::ClearData() {
         index_ready_bitset_.reset();
         binlog_index_bitset_.reset();
         index_has_raw_data_.clear();
-        system_ready_count_ = 0;
         num_rows_ = std::nullopt;
         ngram_fields_.wlock()->clear();
         scalar_indexings_.wlock()->clear();
         vector_indexings_.clear();
         ngram_indexings_.wlock()->clear();
         insert_record_.clear();
+        timestamp_index_slot_.wlock()->reset();
+        pk_index_slot_.wlock()->reset();
         fields_.wlock()->clear();
         variable_fields_avg_size_.clear();
         stats_.mem_size = 0;
@@ -2091,16 +2211,23 @@ ChunkedSegmentSealedImpl::bulk_subscript(milvus::OpContext* op_ctx,
 
     // Fast path for int64 PK field: use compressed offset2pk index
     auto pk_field_id = schema_->get_primary_field_id();
+    auto pk_index = PinPkIndex(op_ctx);
     if (pk_field_id.has_value() && pk_field_id.value() == field_id &&
         field_meta.get_data_type() == DataType::INT64 &&
-        insert_record_.has_int64_pk_index()) {
+        (pk_index.get() != nullptr ? pk_index.get()->has_int64_pk_index()
+                                   : insert_record_.has_int64_pk_index())) {
         auto ret = fill_with_empty(field_id, count);
         auto* output = ret->mutable_scalars()
                            ->mutable_long_data()
                            ->mutable_data()
                            ->mutable_data();
-        insert_record_.bulk_get_int64_pks_by_offsets(
-            seg_offsets, count, output);
+        if (pk_index.get() != nullptr) {
+            pk_index.get()->bulk_get_int64_pks_by_offsets(
+                seg_offsets, count, output);
+        } else {
+            insert_record_.bulk_get_int64_pks_by_offsets(
+                seg_offsets, count, output);
+        }
         return ret;
     }
 
@@ -2300,11 +2427,17 @@ ChunkedSegmentSealedImpl::Delete(int64_t size,
     }
     // if insert record is empty (may be only-load meta but not data for lru-cache at go side),
     // filtering may cause the deletion lost, skip the filtering to avoid it.
-    if (!insert_record_.empty_pks()) {
+    auto pk_index = PinPkIndex(nullptr);
+    auto has_pk_index = pk_index.get() != nullptr ? !pk_index.get()->empty_pks()
+                                                  : !insert_record_.empty_pks();
+    if (has_pk_index) {
         auto end = std::remove_if(
             ordering.begin(),
             ordering.end(),
             [&](const std::tuple<Timestamp, PkType>& record) {
+                if (pk_index.get() != nullptr) {
+                    return !pk_index.get()->contain(std::get<1>(record));
+                }
                 return !insert_record_.contain(std::get<1>(record));
             });
         size = end - ordering.begin();
@@ -2351,17 +2484,19 @@ void
 ChunkedSegmentSealedImpl::mask_with_timestamps(BitsetTypeView& bitset_chunk,
                                                Timestamp timestamp,
                                                Timestamp collection_ttl) const {
-    // TODO change the
-    AssertInfo(insert_record_.timestamps_.num_chunk() == 1,
-               "num chunk not equal to 1 for sealed segment");
-    auto timestamps_data =
-        (const milvus::Timestamp*)insert_record_.timestamps_.get_chunk_data(0);
-    auto timestamps_data_size = insert_record_.timestamps_.get_chunk_size(0);
+    auto ts_index = PinTimestampIndex(nullptr);
+    auto* ts_cell = ts_index.get();
+    AssertInfo(ts_cell != nullptr || !insert_record_.timestamps_.empty(),
+               "timestamp index is not ready");
+    auto& ts = ts_cell != nullptr ? ts_cell->timestamps()
+                                  : insert_record_.timestamps_;
+    auto& ts_index_data = ts_cell != nullptr ? ts_cell->timestamp_index()
+                                             : insert_record_.timestamp_index_;
+    auto total_size = static_cast<int64_t>(ts.size());
+
     if (collection_ttl > 0) {
-        auto range =
-            insert_record_.timestamp_index_.get_active_range(collection_ttl);
-        if (range.first == range.second &&
-            range.first == timestamps_data_size) {
+        auto range = ts_index_data.get_active_range(collection_ttl);
+        if (range.first == range.second && range.first == total_size) {
             bitset_chunk.set();
             return;
         } else {
@@ -2375,7 +2510,7 @@ ChunkedSegmentSealedImpl::mask_with_timestamps(BitsetTypeView& bitset_chunk,
                fmt::format("Timestamp size not equal to row count: {}, {}",
                            timestamps_data_size,
                            get_row_count()));
-    auto range = insert_record_.timestamp_index_.get_active_range(timestamp);
+    auto range = ts_index_data.get_active_range(timestamp);
 
     // range == (size_, size_) and size_ is this->timestamps_.size().
     // it means these data are all useful, we don't need to update bitset_chunk.
@@ -2587,16 +2722,21 @@ ChunkedSegmentSealedImpl::load_field_data_common(
 
     // set pks to offset
     if (schema_->get_primary_field_id() == field_id) {
-        // Always build compressed offset->pk for FillPrimaryKeys fast path
-        insert_record_.build_offset2pk(data_type, column.get());
+        if (is_proxy_column) {
+            init_storage_v2_pk_index(field_id, column, data_type);
+        } else {
+            // Always build compressed offset->pk for FillPrimaryKeys fast path
+            insert_record_.build_offset2pk(data_type, column.get());
 
-        if (!is_sorted_by_pk_) {
-            AssertInfo(field_id.get() != -1, "Primary key is -1");
-            AssertInfo(insert_record_.empty_pks(),
-                       "primary key records already exists, current field id {}",
-                       field_id.get());
-            insert_record_.insert_pks(data_type, column.get());
-            insert_record_.seal_pks();
+            if (!is_sorted_by_pk_) {
+                AssertInfo(field_id.get() != -1, "Primary key is -1");
+                AssertInfo(
+                    insert_record_.empty_pks(),
+                    "primary key records already exists, current field id {}",
+                    field_id.get());
+                insert_record_.insert_pks(data_type, column.get());
+                insert_record_.seal_pks();
+            }
         }
     }
 
@@ -3036,32 +3176,8 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
             true,
             op_ctx);  // manifest cannot provide parquet skip index directly
         if (field_id == TimestampFieldID) {
-            auto timestamp_proxy_column = get_column(TimestampFieldID);
-            AssertInfo(timestamp_proxy_column != nullptr,
-                       "timestamp proxy column is nullptr");
-            // TODO check timestamp_index ready instead of check system_ready_count_
-            int64_t num_rows = segment_load_info_.GetNumOfRows();
-            auto all_ts_chunks = timestamp_proxy_column->GetAllChunks(nullptr);
-            std::vector<Timestamp> timestamps(num_rows);
-            int64_t offset = 0;
-            for (auto& all_ts_chunk : all_ts_chunks) {
-                auto chunk_data = all_ts_chunk.get();
-                auto fixed_chunk = dynamic_cast<FixedWidthChunk*>(chunk_data);
-                auto span = fixed_chunk->Span();
-
-                for (size_t j = 0; j < span.row_count(); j++) {
-                    auto ts = *(int64_t*)((char*)span.data() +
-                                          j * span.element_sizeof());
-                    timestamps[offset++] = ts;
-                }
-            }
-            init_timestamp_index(timestamps, num_rows);
-            system_ready_count_++;
-            AssertInfo(offset == num_rows,
-                       "[StorageV2] timestamp total row count {} not equal "
-                       "to expected {}",
-                       offset,
-                       num_rows);
+            init_storage_v2_timestamp_index(
+                column, segment_load_info_.GetNumOfRows());
         }
     }
 }
