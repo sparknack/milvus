@@ -20,6 +20,7 @@ package delegator
 import (
 	"context"
 	"fmt"
+	"math"
 	"path"
 	"slices"
 	"strconv"
@@ -277,6 +278,7 @@ func (sd *shardDelegator) shallowCopySearchRequest(req *internalpb.SearchRequest
 		GroupSize:               req.GroupSize,
 		FieldId:                 req.FieldId,
 		IsTopkReduce:            req.IsTopkReduce,
+		IsIterator:              req.IsIterator,
 		IsRecallEvaluation:      req.IsRecallEvaluation,
 		CollectionTtlTimestamps: req.CollectionTtlTimestamps,
 	}
@@ -292,6 +294,16 @@ func (sd *shardDelegator) modifySearchRequest(req *querypb.SearchRequest, scope 
 		Req:             sd.shallowCopySearchRequest(req.GetReq(), targetID),
 		FromShardLeader: req.FromShardLeader,
 		TotalChannelNum: req.TotalChannelNum,
+	}
+	// For sealed segments with eventual consistency (non-iterator), use MaxUint64
+	// to completely skip timestamp masking in segcore, avoiding lazy TimestampIndex
+	// construction. Iterator is excluded because MvccTimestamp flows back as
+	// SessionTs/ChannelsMvcc; MaxUint64 would cause the next page to waitTSafe
+	// on an unreachable timestamp and hang.
+	if scope == querypb.DataScope_Historical &&
+		nodeReq.Req.ConsistencyLevel == commonpb.ConsistencyLevel_Eventually &&
+		!nodeReq.Req.GetIsIterator() {
+		nodeReq.Req.MvccTimestamp = math.MaxUint64
 	}
 	return nodeReq
 }
@@ -325,13 +337,19 @@ func (sd *shardDelegator) shallowCopyRetrieveRequest(req *internalpb.RetrieveReq
 }
 
 func (sd *shardDelegator) modifyQueryRequest(req *querypb.QueryRequest, scope querypb.DataScope, segmentIDs []int64, targetID int64) *querypb.QueryRequest {
-	return &querypb.QueryRequest{
-		Req:             sd.shallowCopyRetrieveRequest(req.GetReq(), targetID),
-		DmlChannels:     []string{sd.vchannelName},
-		SegmentIDs:      segmentIDs,
-		FromShardLeader: req.FromShardLeader,
-		Scope:           scope,
+	nodeReq := proto.Clone(req).(*querypb.QueryRequest)
+	nodeReq.Scope = scope
+	nodeReq.Req.Base.TargetID = targetID
+	nodeReq.SegmentIDs = segmentIDs
+	nodeReq.DmlChannels = []string{sd.vchannelName}
+	// Same as modifySearchRequest: skip timestamp masking for sealed + eventually,
+	// but exclude iterators to avoid polluting SessionTs with MaxUint64.
+	if scope == querypb.DataScope_Historical &&
+		nodeReq.Req.ConsistencyLevel == commonpb.ConsistencyLevel_Eventually &&
+		!nodeReq.Req.GetIsIterator() {
+		nodeReq.Req.MvccTimestamp = math.MaxUint64
 	}
+	return nodeReq
 }
 
 // Search preforms search operation on shard.
