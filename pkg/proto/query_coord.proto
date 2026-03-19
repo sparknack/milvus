@@ -385,6 +385,7 @@ message SegmentLoadInfo {
     map<int64, data.JsonKeyStats> jsonKeyStatsLogs = 22;
     common.LoadPriority priority = 23;
     string manifest_path = 24;
+    uint64 max_timestamp = 25; // max insert timestamp in this segment, used to skip MVCC filtering
 }
 
 message FieldIndexInfo {
