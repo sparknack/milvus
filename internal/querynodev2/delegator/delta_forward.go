@@ -131,18 +131,24 @@ func (sd *shardDelegator) forwardL0ByBF(ctx context.Context,
 ) error {
 	// after L0 segment feature
 	// growing segemnts should have load stream delete as well
-	deleteScope := querypb.DataScope_All
-	switch candidate.Type() {
-	case commonpb.SegmentState_Sealed:
-		deleteScope = querypb.DataScope_Historical
-	case commonpb.SegmentState_Growing:
-		deleteScope = querypb.DataScope_Streaming
+	deleteScope := querypb.DataScope_Historical
+	if candidate != nil {
+		switch candidate.Type() {
+		case commonpb.SegmentState_Sealed:
+			deleteScope = querypb.DataScope_Historical
+		case commonpb.SegmentState_Growing:
+			deleteScope = querypb.DataScope_Streaming
+		}
 	}
 
 	bufferedForwarder := NewBufferedForwarder(paramtable.Get().QueryNodeCfg.ForwardBatchSize.GetAsInt64(),
 		deleteViaWorker(ctx, worker, targetNodeID, info, deleteScope))
 
-	return sd.StreamForwardLevel0Deletions(bufferedForwarder, candidate.Partition(), candidate)
+	partitionID := info.GetPartitionID()
+	if candidate != nil {
+		partitionID = candidate.Partition()
+	}
+	return sd.StreamForwardLevel0Deletions(bufferedForwarder, partitionID, candidate)
 }
 
 func (sd *shardDelegator) forwardL0RemoteLoad(ctx context.Context,

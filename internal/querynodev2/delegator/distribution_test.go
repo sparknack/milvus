@@ -1746,7 +1746,7 @@ func TestBatchGetFromSegments(t *testing.T) {
 		assert.NotContains(t, result, int64(2))
 	})
 
-	t.Run("skip_offline_and_nil_candidates", func(t *testing.T) {
+	t.Run("skip_offline_candidates_but_broadcast_nil_candidates", func(t *testing.T) {
 		candidate1 := &mockCandidate{id: 1, partition: 1, hits: []bool{true}}
 
 		sealed := []SnapshotItem{
@@ -1766,8 +1766,39 @@ func TestBatchGetFromSegments(t *testing.T) {
 
 		result := BatchGetFromSegments(pks, common.AllPartitionsID, sealed, growing)
 
-		// All should be skipped
-		assert.Empty(t, result)
+		assert.Len(t, result, 2)
+		assert.Equal(t, []bool{true}, result[2])
+		assert.Equal(t, []bool{true}, result[10])
+		assert.NotContains(t, result, int64(1))
+	})
+
+	t.Run("broadcast_nil_candidates_respects_partition", func(t *testing.T) {
+		sealed := []SnapshotItem{
+			{
+				NodeID: 1,
+				Segments: []SegmentEntry{
+					{SegmentID: 1, PartitionID: 1, Candidate: nil},
+					{SegmentID: 2, PartitionID: 2, Candidate: nil},
+				},
+			},
+		}
+		growing := []SegmentEntry{
+			{SegmentID: 10, PartitionID: 1, Candidate: nil},
+			{SegmentID: 11, PartitionID: 2, Candidate: nil},
+		}
+
+		pks := []storage.PrimaryKey{
+			storage.NewInt64PrimaryKey(100),
+			storage.NewInt64PrimaryKey(200),
+		}
+
+		result := BatchGetFromSegments(pks, 1, sealed, growing)
+
+		assert.Len(t, result, 2)
+		assert.Equal(t, []bool{true, true}, result[1])
+		assert.Equal(t, []bool{true, true}, result[10])
+		assert.NotContains(t, result, int64(2))
+		assert.NotContains(t, result, int64(11))
 	})
 
 	t.Run("growing_segments", func(t *testing.T) {

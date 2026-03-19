@@ -523,10 +523,15 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 		return !sd.distribution.SealedSegmentExistsOnNode(info.GetSegmentID(), targetNodeID)
 	})
 
-	candidates, err := sd.loader.LoadBloomFilterSet(ctx, req.GetCollectionID(), infos...)
-	if err != nil {
-		log.Warn("failed to load bloom filter set for segment", zap.Error(err))
-		return err
+	var candidates []*pkoracle.BloomFilterSet
+	if paramtable.Get().CommonCfg.BloomFilterEnabled.GetAsBool() {
+		candidates, err = sd.loader.LoadBloomFilterSet(ctx, req.GetCollectionID(), infos...)
+		if err != nil {
+			log.Warn("failed to load bloom filter set for segment", zap.Error(err))
+			return err
+		}
+	} else {
+		log.Info("skip loading bloom filter set for sealed segments because bloom filter is disabled")
 	}
 
 	refundCandidatesOnErr := func(err error) error {
@@ -636,7 +641,7 @@ func (sd *shardDelegator) rangeHitL0Deletions(partitionID int64, candidate pkora
 	log := sd.getLogger(context.Background())
 	start := time.Now()
 	totalL0Rows := 0
-	totalBfHitRows := int64(0)
+	totalForwardRows := int64(0)
 	processedL0Count := 0
 
 	for _, segment := range level0Segments {
@@ -653,26 +658,42 @@ func (sd *shardDelegator) rangeHitL0Deletions(partitionID int64, candidate pkora
 					endIdx = len(segmentPks)
 				}
 
+				if candidate == nil {
+					for i := idx; i < endIdx; i++ {
+						totalForwardRows += 1
+						if err := fn(segmentPks[i], segmentTss[i]); err != nil {
+							return err
+						}
+					}
+					continue
+				}
+
 				lc := storage.NewBatchLocationsCache(segmentPks[idx:endIdx])
 				hits := candidate.BatchPkExist(lc)
 				for i, hit := range hits {
-					if hit {
-						totalBfHitRows += 1
-						if err := fn(segmentPks[idx+i], segmentTss[idx+i]); err != nil {
-							return err
-						}
+					if !hit {
+						continue
+					}
+					totalForwardRows += 1
+					if err := fn(segmentPks[idx+i], segmentTss[idx+i]); err != nil {
+						return err
 					}
 				}
 			}
 		}
 	}
 
+	targetSegmentID := int64(-1)
+	if candidate != nil {
+		targetSegmentID = candidate.ID()
+	}
 	log.Info("forward delete from L0 segments to worker",
-		zap.Int64("targetSegmentID", candidate.ID()),
+		zap.Int64("targetSegmentID", targetSegmentID),
 		zap.String("channel", sd.vchannelName),
+		zap.Bool("broadcast", candidate == nil),
 		zap.Int("l0SegmentCount", processedL0Count),
 		zap.Int("totalDeleteRowsInL0", totalL0Rows),
-		zap.Int64("totalBfHitRows", totalBfHitRows),
+		zap.Int64("totalForwardRows", totalForwardRows),
 		zap.Int64("totalCost", time.Since(start).Milliseconds()),
 	)
 
@@ -752,12 +773,14 @@ func (sd *shardDelegator) loadStreamDelete(ctx context.Context,
 		candidate := idCandidates[info.GetSegmentID()]
 		// after L0 segment feature
 		// growing segemnts should have load stream delete as well
-		deleteScope := querypb.DataScope_All
-		switch candidate.Type() {
-		case commonpb.SegmentState_Sealed:
-			deleteScope = querypb.DataScope_Historical
-		case commonpb.SegmentState_Growing:
-			deleteScope = querypb.DataScope_Streaming
+		deleteScope := querypb.DataScope_Historical
+		if candidate != nil {
+			switch candidate.Type() {
+			case commonpb.SegmentState_Sealed:
+				deleteScope = querypb.DataScope_Historical
+			case commonpb.SegmentState_Growing:
+				deleteScope = querypb.DataScope_Streaming
+			}
 		}
 
 		bufferedForwarder := NewBufferedForwarder(paramtable.Get().QueryNodeCfg.ForwardBatchSize.GetAsInt64(),
@@ -771,7 +794,7 @@ func (sd *shardDelegator) loadStreamDelete(ctx context.Context,
 		for _, entry := range deleteRecords {
 			for _, record := range entry.Data {
 				tsHitDeleteRows += int64(len(record.DeleteData.Pks))
-				if record.PartitionID != common.AllPartitionsID && candidate.Partition() != record.PartitionID {
+				if candidate != nil && record.PartitionID != common.AllPartitionsID && candidate.Partition() != record.PartitionID {
 					continue
 				}
 				pks := record.DeleteData.Pks
@@ -782,15 +805,27 @@ func (sd *shardDelegator) loadStreamDelete(ctx context.Context,
 						endIdx = len(pks)
 					}
 
-					lc := storage.NewBatchLocationsCache(pks[idx:endIdx])
-					hits := candidate.BatchPkExist(lc)
-					for i, hit := range hits {
-						if hit {
+					if candidate == nil {
+						for i := idx; i < endIdx; i++ {
 							bfHitDeleteRows += 1
-							err := bufferedForwarder.Buffer(pks[idx+i], record.DeleteData.Tss[idx+i])
+							err := bufferedForwarder.Buffer(pks[i], record.DeleteData.Tss[i])
 							if err != nil {
 								return err
 							}
+						}
+						continue
+					}
+
+					lc := storage.NewBatchLocationsCache(pks[idx:endIdx])
+					hits := candidate.BatchPkExist(lc)
+					for i, hit := range hits {
+						if !hit {
+							continue
+						}
+						bfHitDeleteRows += 1
+						err := bufferedForwarder.Buffer(pks[idx+i], record.DeleteData.Tss[idx+i])
+						if err != nil {
+							return err
 						}
 					}
 				}
@@ -799,6 +834,7 @@ func (sd *shardDelegator) loadStreamDelete(ctx context.Context,
 		log.Info("forward delete to worker...",
 			zap.String("channel", info.InsertChannel),
 			zap.Int64("segmentID", info.GetSegmentID()),
+			zap.Bool("broadcast", candidate == nil),
 			zap.Time("startPosition", tsoutil.PhysicalTime(info.GetStartPosition().GetTimestamp())),
 			zap.Int64("tsHitDeleteRowNum", tsHitDeleteRows),
 			zap.Int64("bfHitDeleteRowNum", bfHitDeleteRows),
