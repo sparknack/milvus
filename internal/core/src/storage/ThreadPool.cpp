@@ -20,6 +20,7 @@
 namespace milvus {
 
 int CPU_NUM = DEFAULT_CPU_NUM;
+std::atomic<int> THREAD_POOL_MAX_SIZE(0);
 
 std::atomic<float> HIGH_PRIORITY_THREAD_CORE_COEFFICIENT(
     DEFAULT_HIGH_PRIORITY_THREAD_CORE_COEFFICIENT);
@@ -52,6 +53,12 @@ SetLowPriorityThreadCoreCoefficient(const float coefficient) {
 void
 InitCpuNum(const int num) {
     CPU_NUM = num;
+}
+
+void
+SetThreadPoolMaxSize(const int size) {
+    THREAD_POOL_MAX_SIZE.store(size);
+    LOG_INFO("set thread pool max size: {}", THREAD_POOL_MAX_SIZE.load());
 }
 
 void

@@ -45,6 +45,7 @@ extern std::atomic<float> MIDDLE_PRIORITY_THREAD_CORE_COEFFICIENT;
 extern std::atomic<float> LOW_PRIORITY_THREAD_CORE_COEFFICIENT;
 
 extern int CPU_NUM;
+extern std::atomic<int> THREAD_POOL_MAX_SIZE;
 
 void
 SetHighPriorityThreadCoreCoefficient(const float coefficient);
@@ -58,6 +59,9 @@ SetLowPriorityThreadCoreCoefficient(const float coefficient);
 void
 InitCpuNum(const int core);
 
+void
+SetThreadPoolMaxSize(const int size);
+
 class ThreadPool {
  public:
     explicit ThreadPool(const float thread_core_coefficient, std::string name)
@@ -65,16 +69,15 @@ class ThreadPool {
         idle_threads_size_ = 0;
         current_threads_size_ = 0;
         min_threads_size_ = 1;
-        max_threads_size_.store(std::max(
+        int computed = std::max(
             1,
-            static_cast<int>(std::round(CPU_NUM * thread_core_coefficient))));
-
-        // only IO pool will set large limit, but the CPU helps nothing to IO operations,
-        // we need to limit the max thread num, each thread will download 16~64 MiB data,
-        // according to our benchmark, 16 threads is enough to saturate the network bandwidth.
-        if (max_threads_size_.load() > 16) {
-            max_threads_size_.store(16);
+            static_cast<int>(std::round(CPU_NUM * thread_core_coefficient)));
+        int cap = THREAD_POOL_MAX_SIZE.load();
+        if (cap > 0 && computed > cap) {
+            computed = cap;
         }
+        max_threads_size_.store(computed);
+
         LOG_INFO("Init thread pool:{}", name_)
             << " with min worker num:" << min_threads_size_
             << " and max worker num:" << max_threads_size_.load();
@@ -153,8 +156,9 @@ class ThreadPool {
         //no need to hold mutex here as we don't require
         //max_threads_size to take effect instantly, just guaranteed atomic
         new_size = std::max(1, new_size);
-        if (new_size > 16) {
-            new_size = 16;
+        int cap = THREAD_POOL_MAX_SIZE.load();
+        if (cap > 0 && new_size > cap) {
+            new_size = cap;
         }
         max_threads_size_.store(new_size);
         if (metric_capacity_) {

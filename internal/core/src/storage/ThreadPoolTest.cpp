@@ -26,13 +26,14 @@ class ThreadPoolTest : public testing::Test {
     SetUp() override {
         // Ensure CPU_NUM is initialized
         InitCpuNum(4);
+        // Reset max size to no limit
+        SetThreadPoolMaxSize(0);
     }
 };
 
 TEST_F(ThreadPoolTest, ResizeWithinBounds) {
     ThreadPool pool(1.0, "test_pool");
 
-    // Resize to a value within bounds (1-16)
     pool.Resize(8);
     EXPECT_EQ(pool.GetMaxThreadNum(), 8);
 
@@ -57,18 +58,44 @@ TEST_F(ThreadPoolTest, ResizeBelowMinimum) {
     EXPECT_EQ(pool.GetMaxThreadNum(), 1);
 }
 
-TEST_F(ThreadPoolTest, ResizeAboveMaximum) {
+TEST_F(ThreadPoolTest, ResizeNoLimit) {
     ThreadPool pool(1.0, "test_pool");
 
-    // Resize to values above maximum (should be clamped to 16)
+    // With no limit (default 0), resize can go beyond 16
+    pool.Resize(17);
+    EXPECT_EQ(pool.GetMaxThreadNum(), 17);
+
+    pool.Resize(100);
+    EXPECT_EQ(pool.GetMaxThreadNum(), 100);
+
+    pool.Resize(1000);
+    EXPECT_EQ(pool.GetMaxThreadNum(), 1000);
+}
+
+TEST_F(ThreadPoolTest, ResizeWithMaxSize) {
+    SetThreadPoolMaxSize(16);
+    ThreadPool pool(1.0, "test_pool");
+
+    // Constructor should clamp to 16
+    EXPECT_LE(pool.GetMaxThreadNum(), 16);
+
+    // Resize above cap should be clamped
     pool.Resize(17);
     EXPECT_EQ(pool.GetMaxThreadNum(), 16);
 
     pool.Resize(100);
     EXPECT_EQ(pool.GetMaxThreadNum(), 16);
 
-    pool.Resize(1000);
-    EXPECT_EQ(pool.GetMaxThreadNum(), 16);
+    // Resize within cap should work
+    pool.Resize(8);
+    EXPECT_EQ(pool.GetMaxThreadNum(), 8);
+}
+
+TEST_F(ThreadPoolTest, ConstructorRespectsMaxSize) {
+    SetThreadPoolMaxSize(2);
+    // coefficient=10.0 with CPU_NUM=4 would give 40, but cap is 2
+    ThreadPool pool(10.0, "test_pool");
+    EXPECT_EQ(pool.GetMaxThreadNum(), 2);
 }
 
 }  // namespace milvus

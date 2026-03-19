@@ -230,6 +230,7 @@ type commonConfig struct {
 	HighPriorityThreadCoreCoefficient   ParamItem `refreshable:"true"`
 	MiddlePriorityThreadCoreCoefficient ParamItem `refreshable:"true"`
 	LowPriorityThreadCoreCoefficient    ParamItem `refreshable:"true"`
+	ThreadPoolMaxSize                   ParamItem `refreshable:"false"`
 	BM25LoadThreadCoreCoefficient       ParamItem `refreshable:"true"`
 	EnableMaterializedView              ParamItem `refreshable:"false"`
 	BuildIndexThreadPoolRatio           ParamItem `refreshable:"false"`
@@ -706,6 +707,15 @@ This configuration is only used by querynode and indexnode, it selects CPU instr
 		Export: true,
 	}
 	p.BM25LoadThreadCoreCoefficient.Init(base.mgr)
+
+	p.ThreadPoolMaxSize = ParamItem{
+		Key:          "common.threadPoolMaxSize",
+		Version:      "2.6.8",
+		DefaultValue: "16",
+		Doc:          "maximum number of threads per storage thread pool. 0 means no limit (determined by CPU cores * coefficient).",
+		Export:       true,
+	}
+	p.ThreadPoolMaxSize.Init(base.mgr)
 
 	p.DiskWriteMode = ParamItem{
 		Key:          "common.diskWriteMode",

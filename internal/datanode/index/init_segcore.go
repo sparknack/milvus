@@ -67,6 +67,9 @@ func InitSegcore(nodeID int64) error {
 	cCPUNum := C.int(hardware.GetCPUNum())
 	C.InitCpuNum(cCPUNum)
 
+	cThreadPoolMaxSize := C.int(paramtable.Get().CommonCfg.ThreadPoolMaxSize.GetAsInt())
+	C.SetThreadPoolMaxSize(cThreadPoolMaxSize)
+
 	cKnowhereThreadPoolSize := C.uint32_t(hardware.GetCPUNum() * paramtable.DefaultKnowhereThreadPoolNumRatioInBuild)
 	if paramtable.GetRole() == typeutil.StandaloneRole {
 		threadPoolSize := int(float64(hardware.GetCPUNum()) * paramtable.Get().CommonCfg.BuildIndexThreadPoolRatio.GetAsFloat())
