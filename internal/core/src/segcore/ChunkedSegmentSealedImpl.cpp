@@ -128,8 +128,53 @@ ChunkedSegmentSealedImpl::PinPkIndex(milvus::OpContext* op_ctx) const {
 bool
 ChunkedSegmentSealedImpl::Contain(const PkType& pk) const {
     auto pk_index = PinPkIndex(nullptr);
-    if (pk_index.get() != nullptr) {
+    if (pk_index.get() != nullptr && pk_index.get()->has_pk2offset()) {
         return pk_index.get()->contain(pk);
+    }
+    // Sorted-by-pk segment: binary search on pk column directly.
+    if (is_sorted_by_pk_) {
+        auto pk_field_id =
+            schema_->get_primary_field_id().value_or(FieldId(-1));
+        AssertInfo(pk_field_id.get() != -1, "Primary key is -1");
+        auto pk_column = get_column(pk_field_id);
+        if (pk_column != nullptr) {
+            auto num_chunks = pk_column->num_chunks();
+            auto all_chunks = pk_column->GetAllChunks(nullptr);
+            switch (schema_->get_fields()
+                        .at(pk_field_id)
+                        .get_data_type()) {
+                case DataType::INT64: {
+                    auto target = std::get<int64_t>(pk);
+                    for (int64_t i = 0; i < num_chunks; ++i) {
+                        auto* src = reinterpret_cast<const int64_t*>(
+                            all_chunks[i].get()->RawData());
+                        auto rows = pk_column->chunk_row_nums(i);
+                        auto it = std::lower_bound(src, src + rows, target);
+                        if (it != src + rows && *it == target) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                case DataType::VARCHAR: {
+                    auto& target = std::get<std::string>(pk);
+                    for (int64_t i = 0; i < num_chunks; ++i) {
+                        auto* chunk = static_cast<StringChunk*>(
+                            all_chunks[i].get());
+                        auto offset =
+                            chunk->binary_search_string(target);
+                        if (offset != -1 &&
+                            offset < chunk->RowNums() &&
+                            chunk->operator[](offset) == target) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                default:
+                    break;
+            }
+        }
     }
     return insert_record_.contain(pk);
 }
