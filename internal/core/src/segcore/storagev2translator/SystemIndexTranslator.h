@@ -23,19 +23,13 @@
 #include "common/Types.h"
 #include "mmap/ChunkedColumnInterface.h"
 #include "segcore/InsertRecord.h"
-#include "segcore/TimestampData.h"
 #include "segcore/TimestampIndex.h"
 
 namespace milvus::segcore::storagev2translator {
 
 class TimestampIndexCell {
  public:
-    TimestampIndexCell(TimestampData timestamps, TimestampIndex timestamp_index);
-
-    const TimestampData&
-    timestamps() const {
-        return timestamps_;
-    }
+    explicit TimestampIndexCell(TimestampIndex timestamp_index, int64_t num_rows);
 
     const TimestampIndex&
     timestamp_index() const {
@@ -48,7 +42,6 @@ class TimestampIndexCell {
     }
 
  private:
-    TimestampData timestamps_;
     TimestampIndex timestamp_index_;
     cachinglayer::ResourceUsage byte_size_;
 };

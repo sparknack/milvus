@@ -94,13 +94,10 @@ estimate_pk_index_bytes(DataType data_type,
 
 }  // namespace
 
-TimestampIndexCell::TimestampIndexCell(TimestampData timestamps,
-                                       TimestampIndex timestamp_index)
-    : timestamps_(std::move(timestamps)),
-      timestamp_index_(std::move(timestamp_index)),
-      byte_size_{estimate_timestamp_index_bytes(timestamps_.size(),
-                                                timestamps_.num_chunks()),
-                 0} {
+TimestampIndexCell::TimestampIndexCell(TimestampIndex timestamp_index,
+                                       int64_t num_rows)
+    : timestamp_index_(std::move(timestamp_index)),
+      byte_size_{estimate_timestamp_index_bytes(num_rows, 1), 0} {
 }
 
 PkIndexCell::PkIndexCell(std::unique_ptr<OffsetMap> pk2offset,
@@ -171,6 +168,11 @@ TimestampIndexTranslator::get_cells(
     CheckCancellation(
         ctx, segment_id_, "TimestampIndexTranslator::get_cells()");
 
+    // Pin column chunks temporarily to build the TimestampIndex, then release.
+    // TimestampIndexCell intentionally does NOT hold raw timestamp data or
+    // pins to GroupChunk cells — callers read raw timestamps by pinning the
+    // timestamp column directly. This avoids a DList deadlock where evicting
+    // this cell would unpin GroupChunk cells under the same list_mtx_.
     auto all_chunks = column_->GetAllChunks(ctx);
     TimestampIndex index;
     if (all_chunks.size() == 1) {
@@ -200,15 +202,11 @@ TimestampIndexTranslator::get_cells(
         index = build_timestamp_index(temp.data(), num_rows_);
     }
 
-    TimestampData timestamps;
-    timestamps.InitFromPinnedChunks(column_, std::move(all_chunks));
-
     std::vector<std::pair<milvus::cachinglayer::cid_t,
                           std::unique_ptr<TimestampIndexCell>>>
         result;
     result.emplace_back(
-        0, std::make_unique<TimestampIndexCell>(std::move(timestamps),
-                                                std::move(index)));
+        0, std::make_unique<TimestampIndexCell>(std::move(index), num_rows_));
     return result;
 }
 
