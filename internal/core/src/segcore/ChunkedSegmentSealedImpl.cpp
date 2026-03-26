@@ -1290,14 +1290,44 @@ ChunkedSegmentSealedImpl::search_batch_pks(
     bool include_same_ts,
     const std::function<void(const SegOffset offset, const Timestamp ts)>&
         callback) const {
+    // Helper to read a single timestamp by segment offset.
+    // For StorageV2: pins the timestamp column and indexes into chunks.
+    // For StorageV1: reads from insert_record_ directly.
+    auto ts_column = get_column(TimestampFieldID);
+    std::vector<cachinglayer::PinWrapper<Chunk*>> ts_chunk_pins;
+    std::vector<int64_t> ts_chunk_offsets;
+    if (ts_column) {
+        ts_chunk_pins = ts_column->GetAllChunks(nullptr);
+        auto num_ts_chunks = ts_column->num_chunks();
+        ts_chunk_offsets.resize(num_ts_chunks + 1, 0);
+        for (int64_t c = 0; c < num_ts_chunks; c++) {
+            ts_chunk_offsets[c + 1] =
+                ts_chunk_offsets[c] + ts_column->chunk_row_nums(c);
+        }
+    } else {
+        AssertInfo(!insert_record_.timestamps_.empty(),
+                   "timestamp data is not ready");
+    }
+    auto read_ts = [&](int64_t offset) -> Timestamp {
+        if (!ts_column) {
+            return insert_record_.timestamps_[offset];
+        }
+        auto num_ts_chunks =
+            static_cast<int64_t>(ts_chunk_pins.size());
+        int64_t c = 0;
+        while (c < num_ts_chunks - 1 &&
+               offset >= ts_chunk_offsets[c + 1]) {
+            ++c;
+        }
+        auto* data = reinterpret_cast<const Timestamp*>(
+            ts_chunk_pins[c].get()->RawData());
+        return data[offset - ts_chunk_offsets[c]];
+    };
+
     // handle unsorted case
     if (!is_sorted_by_pk_) {
         auto pk_index = PinPkIndex(nullptr);
-        auto ts_index = PinTimestampIndex(nullptr);
         auto* pk_cell = pk_index.get();
-        auto* ts_cell = ts_index.get();
-        AssertInfo(ts_cell != nullptr || !insert_record_.timestamps_.empty(),
-                   "timestamp index is not ready");
         auto timestamp_hit = include_same_ts
                                  ? [](Timestamp lhs, Timestamp rhs) {
                                        return lhs <= rhs;
@@ -1311,9 +1341,7 @@ ChunkedSegmentSealedImpl::search_batch_pks(
                                ? pk_cell->pk2offset().find(pks[i])
                                : insert_record_.pk2offset_->find(pks[i]);
             for (auto offset : offsets) {
-                auto insert_ts = ts_cell != nullptr
-                                     ? ts_cell->timestamps()[offset]
-                                     : insert_record_.timestamps_[offset];
+                auto insert_ts = read_ts(offset);
                 if (timestamp_hit(insert_ts, timestamp)) {
                     callback(SegOffset(offset), timestamp);
                 }
@@ -1328,10 +1356,6 @@ ChunkedSegmentSealedImpl::search_batch_pks(
     AssertInfo(pk_column != nullptr, "primary key column not loaded");
 
     auto all_chunk_pins = pk_column->GetAllChunks(nullptr);
-    auto ts_index = PinTimestampIndex(nullptr);
-    auto* ts_cell = ts_index.get();
-    AssertInfo(ts_cell != nullptr || !insert_record_.timestamps_.empty(),
-               "timestamp index is not ready");
 
     auto timestamp_hit = include_same_ts
                              ? [](const Timestamp& ts1,
@@ -1363,9 +1387,7 @@ ChunkedSegmentSealedImpl::search_batch_pks(
                         pk_column->GetNumRowsUntilChunk(i);
                     for (; it != src + chunk_row_num && *it == target; ++it) {
                         auto offset = it - src + num_rows_until_chunk;
-                        auto insert_ts = ts_cell != nullptr
-                                             ? ts_cell->timestamps()[offset]
-                                             : insert_record_.timestamps_[offset];
+                        auto insert_ts = read_ts(offset);
                         if (timestamp_hit(insert_ts, timestamp)) {
                             callback(SegOffset(offset), timestamp);
                         }
@@ -1391,9 +1413,7 @@ ChunkedSegmentSealedImpl::search_batch_pks(
                            string_chunk->operator[](offset) == target;
                          ++offset) {
                         auto segment_offset = offset + num_rows_until_chunk;
-                        auto insert_ts = ts_cell != nullptr
-                                             ? ts_cell->timestamps()[segment_offset]
-                                             : insert_record_.timestamps_[segment_offset];
+                        auto insert_ts = read_ts(segment_offset);
                         if (timestamp_hit(insert_ts, timestamp)) {
                             callback(SegOffset(segment_offset), timestamp);
                         }
@@ -1637,14 +1657,37 @@ ChunkedSegmentSealedImpl::bulk_subscript(milvus::OpContext* op_ctx,
     switch (system_type) {
         case SystemFieldType::Timestamp: {
             auto* dst = static_cast<Timestamp*>(output);
-            auto ts_index = PinTimestampIndex(op_ctx);
-            auto* ts_cell = ts_index.get();
-            AssertInfo(ts_cell != nullptr || !insert_record_.timestamps_.empty(),
-                       "timestamp index is not ready");
-            auto& ts = ts_cell != nullptr ? ts_cell->timestamps()
-                                          : insert_record_.timestamps_;
-            for (int64_t i = 0; i < count; ++i) {
-                dst[i] = ts[seg_offsets[i]];
+            auto ts_column = get_column(TimestampFieldID);
+            if (ts_column) {
+                // StorageV2: read from timestamp column directly
+                auto all_chunks = ts_column->GetAllChunks(op_ctx);
+                // Build prefix-sum for chunk offset lookup
+                auto num_chunks = ts_column->num_chunks();
+                std::vector<int64_t> chunk_offsets(num_chunks + 1, 0);
+                for (int64_t c = 0; c < num_chunks; c++) {
+                    chunk_offsets[c + 1] =
+                        chunk_offsets[c] + ts_column->chunk_row_nums(c);
+                }
+                for (int64_t i = 0; i < count; ++i) {
+                    auto offset = seg_offsets[i];
+                    // Find chunk via linear scan (chunks are typically few)
+                    int64_t c = 0;
+                    while (c < num_chunks - 1 &&
+                           offset >= chunk_offsets[c + 1]) {
+                        ++c;
+                    }
+                    auto* chunk_data = reinterpret_cast<const Timestamp*>(
+                        all_chunks[c].get()->RawData());
+                    dst[i] = chunk_data[offset - chunk_offsets[c]];
+                }
+            } else {
+                // StorageV1 fallback
+                AssertInfo(!insert_record_.timestamps_.empty(),
+                           "timestamp data is not ready");
+                auto& ts = insert_record_.timestamps_;
+                for (int64_t i = 0; i < count; ++i) {
+                    dst[i] = ts[seg_offsets[i]];
+                }
             }
             break;
         case SystemFieldType::RowId:
@@ -2480,6 +2523,59 @@ ChunkedSegmentSealedImpl::get_active_count(Timestamp ts) const {
     return this->get_row_count();
 }
 
+// Helper: apply a per-element timestamp scan over a range [beg, end),
+// calling `pred(global_offset, ts_value)` for each row.
+// Overload for TimestampData (StorageV1 / growing segment path).
+template <typename Pred>
+static void
+scan_timestamp_range(const TimestampData& ts,
+                     int64_t beg,
+                     int64_t end,
+                     Pred pred) {
+    for (int64_t c = 0; c < ts.num_chunks(); c++) {
+        auto chunk_start = ts.chunk_start_offset(c);
+        auto chunk_end = chunk_start + ts.chunk_row_count(c);
+        auto overlap_beg = std::max(beg, chunk_start);
+        auto overlap_end = std::min(end, chunk_end);
+        if (overlap_beg >= overlap_end) {
+            continue;
+        }
+        auto* data = ts.chunk_data(c);
+        auto local = overlap_beg - chunk_start;
+        for (int64_t i = overlap_beg; i < overlap_end; ++i, ++local) {
+            pred(i, data[local]);
+        }
+    }
+}
+
+// Overload for ChunkedColumnInterface (StorageV2 sealed segment path).
+// Pins each chunk on demand and releases after scanning.
+template <typename Pred>
+static void
+scan_timestamp_range(const ChunkedColumnInterface& column,
+                     int64_t beg,
+                     int64_t end,
+                     Pred pred) {
+    auto num_chunks = column.num_chunks();
+    int64_t chunk_start = 0;
+    for (int64_t c = 0; c < num_chunks; c++) {
+        auto chunk_rows = column.chunk_row_nums(c);
+        auto chunk_end = chunk_start + chunk_rows;
+        auto overlap_beg = std::max(beg, chunk_start);
+        auto overlap_end = std::min(end, chunk_end);
+        if (overlap_beg >= overlap_end) {
+            chunk_start = chunk_end;
+            continue;
+        }
+        auto pw = column.DataOfChunk(nullptr, c);
+        auto* data = reinterpret_cast<const Timestamp*>(pw.get());
+        auto local = overlap_beg - chunk_start;
+        for (int64_t i = overlap_beg; i < overlap_end; ++i, ++local) {
+            pred(i, data[local]);
+        }
+        chunk_start = chunk_end;
+    }
+}
 void
 ChunkedSegmentSealedImpl::mask_with_timestamps(BitsetTypeView& bitset_chunk,
                                                Timestamp timestamp,
@@ -2496,11 +2592,21 @@ ChunkedSegmentSealedImpl::mask_with_timestamps(BitsetTypeView& bitset_chunk,
     auto* ts_cell = ts_index.get();
     AssertInfo(ts_cell != nullptr || !insert_record_.timestamps_.empty(),
                "timestamp index is not ready");
-    auto& ts = ts_cell != nullptr ? ts_cell->timestamps()
-                                  : insert_record_.timestamps_;
     auto& ts_index_data = ts_cell != nullptr ? ts_cell->timestamp_index()
                                              : insert_record_.timestamp_index_;
-    auto total_size = static_cast<int64_t>(ts.size());
+    auto ts_column = ts_cell != nullptr ? get_column(TimestampFieldID)
+                                        : nullptr;
+    auto total_size = static_cast<int64_t>(get_row_count());
+
+    // Lambda to dispatch scan_timestamp_range to the right overload
+    auto do_scan = [&](int64_t beg, int64_t end, auto pred) {
+        if (ts_column) {
+            scan_timestamp_range(*ts_column, beg, end, pred);
+        } else {
+            scan_timestamp_range(
+                insert_record_.timestamps_, beg, end, pred);
+        }
+    };
 
     if (collection_ttl > 0) {
         auto range = ts_index_data.get_active_range(collection_ttl);
@@ -2508,22 +2614,25 @@ ChunkedSegmentSealedImpl::mask_with_timestamps(BitsetTypeView& bitset_chunk,
             bitset_chunk.set();
             return;
         } else {
-            auto ttl_mask = TimestampIndex::GenerateTTLBitset(
-                timestamps_data, timestamps_data_size, collection_ttl, range);
+            // TTL bitset: [0, beg) = true, [beg, end) = check, [end, size) = false
+            BitsetType ttl_mask;
+            ttl_mask.reserve(total_size);
+            ttl_mask.resize(range.first, true);
+            ttl_mask.resize(total_size, false);
+            do_scan(
+                range.first, range.second, [&](int64_t i, Timestamp val) {
+                    ttl_mask[i] = val <= collection_ttl;
+                });
             bitset_chunk |= ttl_mask;
         }
     }
 
-    AssertInfo(timestamps_data_size == get_row_count(),
-               fmt::format("Timestamp size not equal to row count: {}, {}",
-                           timestamps_data_size,
-                           get_row_count()));
     auto range = ts_index_data.get_active_range(timestamp);
 
     // range == (size_, size_) and size_ is this->timestamps_.size().
     // it means these data are all useful, we don't need to update bitset_chunk.
     // It can be thought of as an OR operation with another bitmask that is all 0s, but it is not necessary to do so.
-    if (range.first == range.second && range.first == timestamps_data_size) {
+    if (range.first == range.second && range.first == total_size) {
         // just skip
         return;
     }
@@ -2533,8 +2642,15 @@ ChunkedSegmentSealedImpl::mask_with_timestamps(BitsetTypeView& bitset_chunk,
         bitset_chunk.set();
         return;
     }
-    auto mask = TimestampIndex::GenerateBitset(
-        timestamp, range, timestamps_data, timestamps_data_size);
+    // [0, beg) = false, [beg, end) = check, [end, size) = true
+    BitsetType mask;
+    mask.reserve(total_size);
+    mask.resize(range.first, false);
+    mask.resize(total_size, true);
+    do_scan(
+        range.first, range.second, [&](int64_t i, Timestamp val) {
+            mask[i] = val > timestamp;
+        });
     bitset_chunk |= mask;
 }
 
