@@ -154,6 +154,40 @@ ManifestGroupTranslator::ManifestGroupTranslator(
         total_row_groups,
         num_cells,
         kRowGroupsPerCell);
+
+    // Set loading_overhead_upper_bound to cap total overhead reservation.
+    // During get_cells, decoded Arrow Tables exist simultaneously in:
+    //   - pool threads (pool_size): reading batches, pending push
+    //   - bounded channel (pool_size * kChannelCapacityMultiplier): pushed, awaiting pop
+    //   - main thread (1): being converted to GroupChunk
+    if (!meta_.chunk_memory_size_.empty()) {
+        // Use THREAD_POOL_MAX_SIZE as the upper bound for pool size.
+        // This is the global cap applied to all priority pools.
+        // TODO: if THREAD_POOL_MAX_SIZE is dynamically adjusted, add a callback
+        // to update loading_overhead_upper_bound for SCALAR_FIELD/VECTOR_FIELD.
+        int pool_size = milvus::THREAD_POOL_MAX_SIZE.load();
+        if (pool_size <= 0) {
+            // If not set, fall back to the highest possible pool size
+            pool_size = static_cast<int>(std::round(
+                milvus::CPU_NUM *
+                milvus::HIGH_PRIORITY_THREAD_CORE_COEFFICIENT.load()));
+        }
+        auto max_inflight = static_cast<int64_t>(
+            pool_size * (1.0 + kChannelCapacityMultiplier) + 1);
+        int64_t max_cell_sz = *std::max_element(
+            meta_.chunk_memory_size_.begin(), meta_.chunk_memory_size_.end());
+        auto ub = static_cast<int64_t>(
+            max_inflight * max_cell_sz * kLoadingOverheadInflationRatio);
+        if (use_mmap_) {
+            // In-flight Arrow Tables consume memory (ub).
+            // Disk overhead: mmap file writing temporary space, also bounded by ub.
+            meta_.loading_overhead_upper_bound =
+                milvus::cachinglayer::ResourceUsage{ub, ub};
+        } else {
+            meta_.loading_overhead_upper_bound =
+                milvus::cachinglayer::ResourceUsage{ub, 0};
+        }
+    }
 }
 
 size_t
@@ -230,7 +264,7 @@ ManifestGroupTranslator::get_cells(
     auto& pool = milvus::ThreadPools::GetThreadPool(
         milvus::PriorityForLoad(load_priority_));
     auto channel = std::make_shared<milvus::segcore::CellReaderChannel>(
-        static_cast<size_t>(pool.GetMaxThreadNum() * 1.5));
+        static_cast<size_t>(pool.GetMaxThreadNum() * milvus::segcore::kChannelCapacityMultiplier));
 
     auto load_futures =
         milvus::segcore::LoadCellBatchAsync(ctx,
