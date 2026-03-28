@@ -231,7 +231,8 @@ CSearch(CSegmentInterface c_segment,
                               timestamp,
                               0,
                               0,
-                              filter_only);
+                              filter_only,
+                              false);
     auto futurePtr = static_cast<milvus::futures::IFuture*>(
         static_cast<void*>(static_cast<CFuture*>(future)));
 
