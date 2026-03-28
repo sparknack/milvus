@@ -38,6 +38,13 @@ PhyFilterBitsNode::PhyFilterBitsNode(
     exprs_ = std::make_unique<ExprSet>(filters, exec_context);
     need_process_rows_ = query_context_->get_active_count();
     num_processed_rows_ = 0;
+
+    enable_expr_cache_ = query_context_->get_enable_expr_cache();
+    if (enable_expr_cache_) {
+        expr_cache_ =
+            query_context_->get_segment()->get_expr_filter_cache();
+        expr_cache_key_ = query_context_->get_expr_cache_key();
+    }
 }
 
 void
@@ -65,6 +72,18 @@ PhyFilterBitsNode::GetOutput() {
 
     if (AllInputProcessed()) {
         return nullptr;
+    }
+
+    // Cache read: Take (move out + delete entry) — Stage 2 of two-stage search
+    if (enable_expr_cache_ && expr_cache_ != nullptr) {
+        auto cached = expr_cache_->Take(expr_cache_key_);
+        if (cached.has_value()) {
+            num_processed_rows_ = need_process_rows_;
+            std::vector<VectorPtr> col_res;
+            col_res.push_back(std::make_shared<ColumnVector>(
+                std::move(cached->first), std::move(cached->second)));
+            return std::make_shared<RowVector>(col_res);
+        }
     }
 
     tracer::AutoSpan span(
@@ -110,6 +129,14 @@ PhyFilterBitsNode::GetOutput() {
                bitset.size(),
                need_process_rows_);
     Assert(valid_bitset.size() == need_process_rows_);
+
+    // Cache write: clone bitset into cache — Stage 1 of two-stage search.
+    // Must clone before move since Stage 1 still needs the bitset for valid_count.
+    if (enable_expr_cache_ && expr_cache_ != nullptr) {
+        expr_cache_->Put(expr_cache_key_,
+                         bitset.clone(),
+                         valid_bitset.clone());
+    }
 
     // num_processed_rows_ = need_process_rows_;
     std::vector<VectorPtr> col_res;

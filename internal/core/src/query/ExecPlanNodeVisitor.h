@@ -106,6 +106,17 @@ class ExecPlanNodeVisitor : public PlanNodeVisitor {
         return filter_only_;
     }
 
+    ExecPlanNodeVisitor&
+    SetEnableExprCache(bool enable) {
+        enable_expr_cache_ = enable;
+        return *this;
+    }
+
+    bool
+    GetEnableExprCache() {
+        return enable_expr_cache_;
+    }
+
     static BitsetType
     ExecuteTask(plan::PlanFragment& plan,
                 std::shared_ptr<milvus::exec::QueryContext> query_context);
@@ -123,6 +134,7 @@ class ExecPlanNodeVisitor : public PlanNodeVisitor {
 
     bool expr_use_pk_index_ = false;
     bool filter_only_ = false;
+    bool enable_expr_cache_ = false;
 };
 
 // for test use only

@@ -303,6 +303,26 @@ class QueryContext : public Context {
         return plan_options_;
     }
 
+    void
+    set_enable_expr_cache(bool enable) {
+        enable_expr_cache_ = enable;
+    }
+
+    bool
+    get_enable_expr_cache() const {
+        return enable_expr_cache_;
+    }
+
+    void
+    set_expr_cache_key(std::string key) {
+        expr_cache_key_ = std::move(key);
+    }
+
+    const std::string&
+    get_expr_cache_key() const {
+        return expr_cache_key_;
+    }
+
  private:
     folly::Executor* executor_;
     //folly::Executor::KeepAlive<> executor_keepalive_;
@@ -331,6 +351,10 @@ class QueryContext : public Context {
     int32_t consistency_level_ = 0;
 
     query::PlanOptions plan_options_;
+
+    // Expression filter cache for two-stage search
+    bool enable_expr_cache_ = false;
+    std::string expr_cache_key_;
 };
 
 // Represent the state of one thread of query execution.

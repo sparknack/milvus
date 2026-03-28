@@ -66,6 +66,7 @@ type AutoIndexConfig struct {
 	TwoStageSearchEnabled        ParamItem `refreshable:"true"`
 	TwoStageSearchMinTopk        ParamItem `refreshable:"true"`
 	TwoStageSearchMinNumSegments ParamItem `refreshable:"true"`
+	TwoStageSearchExprCacheSize  ParamItem `refreshable:"true"`
 }
 
 const (
@@ -338,6 +339,15 @@ func (p *AutoIndexConfig) init(base *BaseTable) {
 		Export:       true,
 	}
 	p.TwoStageSearchMinNumSegments.Init(base.mgr)
+
+	p.TwoStageSearchExprCacheSize = ParamItem{
+		Key:          "autoIndex.twoStageSearch.exprCacheSize",
+		Version:      "2.6.10",
+		DefaultValue: "16",
+		Doc:          `Number of expression filter cache entries per sealed segment for two-stage search. Works like CPU cacheline - evicts LRU when full.`,
+		Export:       true,
+	}
+	p.TwoStageSearchExprCacheSize.Init(base.mgr)
 }
 
 func setDefaultIfNotExist(params map[string]string, key string, defaultValue string) {

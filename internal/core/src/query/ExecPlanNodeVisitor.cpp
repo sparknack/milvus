@@ -163,6 +163,18 @@ ExecPlanNodeVisitor::visit(VectorPlanNode& node) {
 
     auto active_count = segment->get_active_count(timestamp_);
 
+    // Extract expr cache key from the filter plan if expr cache is enabled.
+    // Uses the filter expression's ToString() which is deterministic and
+    // independent of topk/search_params (which change between Stage 1 and Stage 2).
+    std::string expr_cache_key;
+    if (enable_expr_cache_) {
+        auto filter_plan =
+            ProtoParser::ExtractFilterOnlyPlan(node.plannodes_);
+        if (filter_plan) {
+            expr_cache_key = filter_plan->ToString();
+        }
+    }
+
     // Handle filter-only mode: execute only the filter and return valid_count
     if (filter_only_) {
         SearchResult filter_only_result;
@@ -191,6 +203,10 @@ ExecPlanNodeVisitor::visit(VectorPlanNode& node) {
                                                  collection_ttl_timestamp_,
                                                  consistency_level_,
                                                  node.plan_options_);
+        if (enable_expr_cache_) {
+            query_context->set_enable_expr_cache(true);
+            query_context->set_expr_cache_key(expr_cache_key);
+        }
 
         auto result = ExecuteTask(plan_fragment, query_context);
 
@@ -231,6 +247,10 @@ ExecPlanNodeVisitor::visit(VectorPlanNode& node) {
 
     query_context->set_search_info(node.search_info_);
     query_context->set_placeholder_group(placeholder_group_);
+    if (enable_expr_cache_) {
+        query_context->set_enable_expr_cache(true);
+        query_context->set_expr_cache_key(expr_cache_key);
+    }
 
     // Set op context to query context
     auto op_context = milvus::OpContext(cancel_token_);

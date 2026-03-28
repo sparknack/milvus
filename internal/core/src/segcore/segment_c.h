@@ -153,6 +153,7 @@ GetSearchResultValidCount(CSearchResult search_result);
  * @param consistency_level: Consistency level for the query
  * @param collection_ttl: Collection TTL for query context
  * @param filter_only: If true, only execute filter and return valid_count in result (Stage 1 of two-stage search)
+ * @param enable_expr_cache: If true, enable expression filter cache for two-stage search
  * @return CFuture* Future that resolves to SearchResult (with valid_count set if filter_only=true)
  */
 CFuture*  // Future<CSearchResultBody>
@@ -163,7 +164,8 @@ AsyncSearch(CTraceContext c_trace,
             uint64_t timestamp,
             int32_t consistency_level,
             uint64_t collection_ttl,
-            bool filter_only);
+            bool filter_only,
+            bool enable_expr_cache);
 
 void
 DeleteRetrieveResult(CRetrieveResult* retrieve_result);

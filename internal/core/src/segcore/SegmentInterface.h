@@ -51,6 +51,8 @@
 
 namespace milvus::segcore {
 
+class ExprFilterCache;
+
 using namespace milvus::cachinglayer;
 
 struct SegmentStats {
@@ -80,7 +82,8 @@ class SegmentInterface {
            const folly::CancellationToken& cancel_token,
            int32_t consistency_level,
            Timestamp collection_ttl,
-           bool filter_only = false) const = 0;
+           bool filter_only = false,
+           bool enable_expr_cache = false) const = 0;
 
     // Only used for test
     std::unique_ptr<SearchResult>
@@ -93,6 +96,7 @@ class SegmentInterface {
                       folly::CancellationToken(),
                       0,
                       0,
+                      false,
                       false);
     }
 
@@ -367,7 +371,8 @@ class SegmentInternalInterface : public SegmentInterface {
            const folly::CancellationToken& cancel_token,
            int32_t consistency_level,
            Timestamp collection_ttl,
-           bool filter_only = false) const override;
+           bool filter_only = false,
+           bool enable_expr_cache = false) const override;
 
     void
     FillPrimaryKeys(const query::Plan* plan,
@@ -398,6 +403,11 @@ class SegmentInternalInterface : public SegmentInterface {
 
     virtual bool
     HasIndex(FieldId field_id) const = 0;
+
+    virtual ExprFilterCache*
+    get_expr_filter_cache() const {
+        return nullptr;  // default: no cache (growing segments)
+    }
 
     int64_t
     get_real_count() const override;

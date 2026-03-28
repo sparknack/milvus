@@ -2864,6 +2864,9 @@ type SearchRequest struct {
 	// If true, only execute filter and return valid counts per segment (two-stage search stage 1).
 	// Results are returned in SearchResults.FilterValidCounts corresponding to SealedSegmentIDsSearched.
 	FilterOnly bool `protobuf:"varint,7,opt,name=filter_only,json=filterOnly,proto3" json:"filter_only,omitempty"`
+	// If true, enable expression filter cache for two-stage search.
+	// Stage 1 caches filter bitset, Stage 2 reuses it to skip re-execution.
+	EnableExprCache bool `protobuf:"varint,8,opt,name=enable_expr_cache,json=enableExprCache,proto3" json:"enable_expr_cache,omitempty"`
 }
 
 func (x *SearchRequest) Reset() {
@@ -2943,6 +2946,13 @@ func (x *SearchRequest) GetTotalChannelNum() int32 {
 func (x *SearchRequest) GetFilterOnly() bool {
 	if x != nil {
 		return x.FilterOnly
+	}
+	return false
+}
+
+func (x *SearchRequest) GetEnableExprCache() bool {
+	if x != nil {
+		return x.EnableExprCache
 	}
 	return false
 }

@@ -167,6 +167,16 @@ class SegcoreConfig {
         return interim_index_mem_expansion_rate_;
     }
 
+    void
+    set_expr_cache_size(int64_t size) {
+        expr_cache_size_ = size;
+    }
+
+    int64_t
+    get_expr_cache_size() const {
+        return expr_cache_size_;
+    }
+
  private:
     inline static const std::unordered_set<std::string>
         valid_dense_vector_index_type = {
@@ -187,6 +197,7 @@ class SegcoreConfig {
     inline static bool refine_with_quant_flag_ = false;
     inline static bool enable_geometry_cache_ = false;
     inline static float interim_index_mem_expansion_rate_ = 1.15f;
+    inline static int64_t expr_cache_size_ = 16;
 };
 
 }  // namespace milvus::segcore

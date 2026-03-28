@@ -35,6 +35,7 @@
 #include "cachinglayer/CacheSlot.h"
 #include "cachinglayer/CacheSlot.h"
 #include "segcore/IndexConfigGenerator.h"
+#include "segcore/ExprFilterCache.h"
 #include "segcore/SegcoreConfig.h"
 #include "folly/concurrency/ConcurrentHashMap.h"
 #include "index/json_stats/JsonKeyStats.h"
@@ -112,6 +113,11 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
 
     bool
     Contain(const PkType& pk) const override;
+
+    ExprFilterCache*
+    get_expr_filter_cache() const override {
+        return &expr_filter_cache_;
+    }
 
     void
     AddFieldDataInfoForSealed(
@@ -1138,6 +1144,11 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
 
     // milvus storage internal api reader instance
     std::unique_ptr<milvus_storage::api::Reader> reader_;
+
+    // Expression filter cache for two-stage search.
+    // Capacity from SegcoreConfig::get_expr_cache_size().
+    mutable ExprFilterCache expr_filter_cache_{
+        static_cast<size_t>(segcore_config_.get_expr_cache_size())};
 };
 
 inline SegmentSealedUPtr
