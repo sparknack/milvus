@@ -23,6 +23,7 @@
 #include "exec/expression/Expr.h"
 #include "exec/operator/Operator.h"
 #include "exec/QueryContext.h"
+#include "segcore/ExprFilterCache.h"
 
 namespace milvus {
 namespace exec {
@@ -77,6 +78,11 @@ class PhyFilterBitsNode : public Operator {
     int64_t num_processed_rows_;
     int64_t need_process_rows_;
     bool is_always_true_{false};
+
+    // Expression filter cache for two-stage search
+    segcore::ExprFilterCache* expr_cache_ = nullptr;
+    bool enable_expr_cache_ = false;
+    std::string expr_cache_key_;
 };
 }  // namespace exec
 }  // namespace milvus

@@ -83,6 +83,7 @@ type SearchRequest struct {
 	consistencyLevel  commonpb.ConsistencyLevel
 	collectionTTL     typeutil.Timestamp
 	filterOnly        bool // If true, only execute filter and return valid count (for two-stage search Stage 1)
+	enableExprCache   bool // If true, enable expression filter cache for two-stage search
 }
 
 func NewSearchRequest(collection *CCollection, req *querypb.SearchRequest, placeholderGrp []byte) (*SearchRequest, error) {
@@ -134,6 +135,7 @@ func NewSearchRequest(collection *CCollection, req *querypb.SearchRequest, place
 		consistencyLevel:  cl,
 		collectionTTL:     req.GetReq().GetCollectionTtlTimestamps(),
 		filterOnly:        req.GetFilterOnly(),
+		enableExprCache:   req.GetEnableExprCache(),
 	}, nil
 }
 
@@ -156,6 +158,10 @@ func (req *SearchRequest) SearchFieldID() int64 {
 
 func (req *SearchRequest) FilterOnly() bool {
 	return req.filterOnly
+}
+
+func (req *SearchRequest) EnableExprCache() bool {
+	return req.enableExprCache
 }
 
 func (req *SearchRequest) Delete() {

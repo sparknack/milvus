@@ -255,7 +255,8 @@ AsyncSearch(CTraceContext c_trace,
             uint64_t timestamp,
             int32_t consistency_level,
             uint64_t collection_ttl,
-            bool filter_only) {
+            bool filter_only,
+            bool enable_expr_cache) {
     auto plan = static_cast<milvus::query::Plan*>(c_plan);
     auto phg_ptr = reinterpret_cast<const milvus::query::PlaceholderGroup*>(
         c_placeholder_group);
@@ -270,7 +271,8 @@ AsyncSearch(CTraceContext c_trace,
          timestamp,
          consistency_level,
          collection_ttl,
-         filter_only](folly::CancellationToken cancel_token) {
+         filter_only,
+         enable_expr_cache](folly::CancellationToken cancel_token) {
             // Set up trace context
             auto& trace_ctx = plan->plan_node_->search_info_.trace_ctx_;
             trace_ctx.traceID = c_trace.traceID;
@@ -290,7 +292,8 @@ AsyncSearch(CTraceContext c_trace,
                                                  cancel_token,
                                                  consistency_level,
                                                  collection_ttl,
-                                                 filter_only);
+                                                 filter_only,
+                                                 enable_expr_cache);
             if (!filter_only &&
                 !milvus::PositivelyRelated(
                     plan->plan_node_->search_info_.metric_type_)) {

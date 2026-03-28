@@ -320,10 +320,11 @@ func (s *TwoStageSearchSuite) TestExecuteFilterStage() {
 		worker1 := &cluster.MockWorker{}
 		workers[1] = worker1
 
-		// Verify that the request has FilterOnly=true
+		// Verify that the request has FilterOnly=true and EnableExprCache=true
 		worker1.EXPECT().SearchSegments(mock.Anything, mock.AnythingOfType("*querypb.SearchRequest")).
 			Run(func(_ context.Context, req *querypb.SearchRequest) {
 				s.True(req.GetFilterOnly(), "FilterOnly should be true in filter stage")
+				s.True(req.GetEnableExprCache(), "EnableExprCache should be true in filter stage")
 			}).Return(&internalpb.SearchResults{
 			FilterValidCounts: []int64{100},
 		}, nil)
@@ -480,9 +481,11 @@ func (s *TwoStageSearchSuite) TestTwoStageSearch() {
 				if callCount == 1 {
 					// First call should be filter stage with FilterOnly=true
 					s.True(req.GetFilterOnly(), "First call should have FilterOnly=true")
+					s.True(req.GetEnableExprCache(), "First call should have EnableExprCache=true")
 				} else {
-					// Second call should be normal search with FilterOnly=false
+					// Second call should be normal search with FilterOnly=false but EnableExprCache=true
 					s.False(req.GetFilterOnly(), "Second call should have FilterOnly=false")
+					s.True(req.GetEnableExprCache(), "Second call should have EnableExprCache=true")
 				}
 			}).Return(&internalpb.SearchResults{
 			FilterValidCounts: []int64{100},
@@ -753,6 +756,8 @@ func (s *TwoStageSearchSuite) TestTwoStageSearchWithGrowingSegments() {
 		worker1.EXPECT().SearchSegments(mock.Anything, mock.AnythingOfType("*querypb.SearchRequest")).
 			Run(func(_ context.Context, req *querypb.SearchRequest) {
 				callCount++
+				// All calls in two-stage search should have EnableExprCache=true
+				s.True(req.GetEnableExprCache(), "EnableExprCache should be true for all two-stage search calls")
 			}).Return(&internalpb.SearchResults{
 			FilterValidCounts: []int64{100},
 		}, nil)

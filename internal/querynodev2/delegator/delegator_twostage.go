@@ -53,6 +53,7 @@ func (sd *shardDelegator) executeFilterStage(
 	sealedRowCount map[int64]int64,
 ) ([]int64, error) {
 	req.FilterOnly = true
+	req.EnableExprCache = true
 	// filteronly stage only need to search sealed segments
 	filterResults, err := sd.executeSearchSubTasks(ctx, req, sealed, []SegmentEntry{}, sealedRowCount)
 	if err != nil {
@@ -71,7 +72,7 @@ func (sd *shardDelegator) executeFilterStage(
 // twoStageSearch implements the two-stage search flow:
 // Stage 1: Execute filter-only on all segments to get actual filter statistics
 // Stage 2: Optimize search params using actual filter stats, execute normal search (filter re-executed)
-// Note: Bitsets are NOT cached since filtering is lightweight and can be re-executed in stage 2
+// Note: Filter bitsets are cached via ExprFilterCache (Stage 1 writes, Stage 2 reads via one-shot Take)
 func (sd *shardDelegator) twoStageSearch(
 	ctx context.Context,
 	req *querypb.SearchRequest,
@@ -103,8 +104,9 @@ func (sd *shardDelegator) twoStageSearch(
 	}
 
 	// ==================== STAGE 2: Normal Search with optimized params ====================
-	// Filter is re-executed (lightweight) since we could enable expr cache
+	// Filter bitset is read from ExprFilterCache (cached in Stage 1), skipping re-execution
 	log.Debug("Starting vector search stage with optimized params")
+	optimizedReq.EnableExprCache = true
 	// vector search stage need to search both sealed and growing segments
 	results, err := sd.executeSearchSubTasks(ctx, optimizedReq, sealed, growing, sealedRowCount)
 	if err != nil {

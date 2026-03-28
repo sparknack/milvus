@@ -295,6 +295,7 @@ func (sd *shardDelegator) modifySearchRequest(req *querypb.SearchRequest, scope 
 		FromShardLeader: req.FromShardLeader,
 		TotalChannelNum: req.TotalChannelNum,
 		FilterOnly:      req.FilterOnly,
+		EnableExprCache: req.EnableExprCache,
 	}
 	// For sealed segments with eventual consistency (non-iterator), use MaxUint64
 	// to completely skip timestamp masking in segcore, avoiding lazy TimestampIndex

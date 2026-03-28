@@ -101,7 +101,8 @@ SegmentInternalInterface::Search(
     const folly::CancellationToken& cancel_token,
     int32_t consistency_level,
     Timestamp collection_ttl,
-    bool filter_only) const {
+    bool filter_only,
+    bool enable_expr_cache) const {
     std::shared_lock lck(mutex_);
     milvus::tracer::AddEvent("obtained_segment_lock_mutex");
 
@@ -116,6 +117,7 @@ SegmentInternalInterface::Search(
                                        consistency_level,
                                        collection_ttl);
     visitor.SetFilterOnly(filter_only);
+    visitor.SetEnableExprCache(enable_expr_cache);
     *results = visitor.get_moved_result(*plan->plan_node_);
     results->segment_ = (void*)this;
     return results;
