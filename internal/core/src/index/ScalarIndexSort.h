@@ -168,6 +168,12 @@ class ScalarIndexSort : public ScalarIndex<T> {
     LoadWithoutAssemble(const BinarySet& binary_set,
                         const Config& config) override;
 
+    void
+    LoadWithStreamingToDisk(
+        const std::vector<std::string>& index_files,
+        const Config& config,
+        milvus::proto::common::LoadPriority load_priority);
+
  public:
     // zero-cost data acess api
     ALWAYS_INLINE const IndexStructure<T>&
