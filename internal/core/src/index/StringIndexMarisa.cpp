@@ -27,6 +27,8 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <filesystem>
+#include "common/Consts.h"
 #include "common/File.h"
 #include "common/RegexQuery.h"
 #include "common/Types.h"
@@ -50,6 +52,9 @@ StringIndexMarisa::StringIndexMarisa(
     if (file_manager_context.Valid()) {
         file_manager_ =
             std::make_shared<storage::MemFileManagerImpl>(file_manager_context);
+        disk_file_manager_ =
+            std::make_shared<storage::DiskFileManagerImpl>(
+                file_manager_context);
     }
 }
 
@@ -293,13 +298,139 @@ StringIndexMarisa::Load(milvus::tracer::TraceContext ctx,
         GetValueFromConfig<milvus::proto::common::LoadPriority>(
             config, milvus::LOAD_PRIORITY)
             .value_or(milvus::proto::common::LoadPriority::HIGH);
-    auto index_datas =
-        file_manager_->LoadIndexToMemory(index_files.value(), load_priority);
-    BinarySet binary_set;
-    AssembleIndexDatas(index_datas, binary_set);
-    // clear index_datas to free memory early
-    index_datas.clear();
-    LoadWithoutAssemble(binary_set, config);
+
+    if (disk_file_manager_ != nullptr) {
+        LoadWithStreaming(index_files.value(), config, load_priority);
+    } else {
+        // Fallback for unit tests without valid file_manager_context
+        auto index_datas =
+            file_manager_->LoadIndexToMemory(index_files.value(), load_priority);
+        BinarySet binary_set;
+        AssembleIndexDatas(index_datas, binary_set);
+        index_datas.clear();
+        LoadWithoutAssemble(binary_set, config);
+    }
+}
+
+int64_t
+StringIndexMarisa::StreamFilesToDisk(
+    const std::vector<std::string>& files,
+    const std::string& local_path,
+    milvus::proto::common::LoadPriority load_priority,
+    uint64_t parallel_degree) {
+    std::filesystem::create_directories(
+        std::filesystem::path(local_path).parent_path());
+
+    int64_t total_size = 0;
+    auto file_writer = storage::FileWriter(
+        local_path,
+        storage::io::GetPriorityFromLoadPriority(load_priority));
+
+    std::vector<std::string> batch;
+    auto flushBatch = [&]() {
+        auto futures = storage::GetObjectData(
+            file_manager_->GetChunkManager().get(),
+            batch,
+            milvus::PriorityForLoad(load_priority));
+        auto codecs =
+            storage::WaitAllFutures(std::move(futures));
+        for (auto& codec : codecs) {
+            file_writer.Write(codec->PayloadData(), codec->PayloadSize());
+            total_size += codec->PayloadSize();
+        }
+        batch.clear();
+    };
+
+    for (auto& file : files) {
+        batch.push_back(file);
+        if (batch.size() >= parallel_degree) {
+            flushBatch();
+        }
+    }
+    if (!batch.empty()) {
+        flushBatch();
+    }
+
+    file_writer.Finish();
+    return total_size;
+}
+
+void
+StringIndexMarisa::LoadWithStreaming(
+    const std::vector<std::string>& index_files,
+    const Config& config,
+    milvus::proto::common::LoadPriority load_priority) {
+    // Separate files: trie data, str_ids data, skip SLICE_META.
+    // Both may be sliced by Disassemble (e.g. marisa_trie_index_0, _1, ...).
+    std::vector<std::string> trie_files;
+    std::vector<std::string> str_ids_files;
+
+    for (auto& file : index_files) {
+        auto file_name = file.substr(file.find_last_of('/') + 1);
+        if (file_name.rfind(MARISA_STR_IDS, 0) == 0) {
+            str_ids_files.push_back(file);
+        } else if (file_name.rfind(MARISA_TRIE_INDEX, 0) == 0) {
+            trie_files.push_back(file);
+        }
+        // SLICE_META is skipped — streaming handles ordering directly
+    }
+
+    // Sort sliced files by numeric suffix (safe: only called when > 1 file)
+    auto sortBySliceIndex = [](std::vector<std::string>& files) {
+        if (files.size() <= 1) return;
+        std::sort(files.begin(), files.end(),
+                  [](const std::string& a, const std::string& b) {
+                      return std::stoi(a.substr(a.find_last_of('_') + 1)) <
+                             std::stoi(b.substr(b.find_last_of('_') + 1));
+                  });
+    };
+    sortBySliceIndex(trie_files);
+    sortBySliceIndex(str_ids_files);
+
+    auto parallel_degree = static_cast<uint64_t>(
+        DEFAULT_FIELD_MAX_MEMORY_LIMIT / FILE_SLICE_SIZE.load());
+    auto local_prefix = disk_file_manager_->GetLocalIndexObjectPrefix();
+    auto trie_path = local_prefix + "marisa-trie";
+    auto str_ids_path = local_prefix + "marisa-str-ids";
+
+    // Stream trie data to disk file
+    StreamFilesToDisk(trie_files, trie_path, load_priority, parallel_degree);
+
+    // Load trie from disk (mmap or read)
+    bool use_mmap = config.contains(MMAP_FILE_PATH);
+    if (use_mmap) {
+        trie_.mmap(trie_path.c_str());
+        mmap_file_raii_ = std::make_unique<MmapFileRAII>(trie_path);
+    } else {
+        auto file = File::Open(trie_path, O_RDONLY);
+        trie_.read(file.Descriptor());
+        file.Close();
+        unlink(trie_path.c_str());
+    }
+
+    // Stream str_ids data to disk, then read into vector
+    auto str_ids_total = StreamFilesToDisk(
+        str_ids_files, str_ids_path, load_priority, parallel_degree);
+    str_ids_.resize(str_ids_total / sizeof(size_t), MARISA_NULL_KEY_ID);
+    {
+        auto fd = open(str_ids_path.c_str(), O_RDONLY);
+        AssertInfo(fd >= 0, "failed to open str_ids file");
+        ReadDataFromFD(fd, str_ids_.data(), str_ids_total);
+        close(fd);
+    }
+    unlink(str_ids_path.c_str());
+
+    fill_offsets();
+    built_ = true;
+    total_size_ = CalculateTotalSize();
+    ComputeByteSize();
+
+    LOG_INFO(
+        "load StringIndexMarisa done (streaming), use_mmap: {}, "
+        "trie_size: {}, str_ids_size: {}",
+        use_mmap,
+        trie_.io_size(),
+        str_ids_total);
 }
 
 const TargetBitmap
