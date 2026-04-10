@@ -150,7 +150,7 @@ class VectorBase {
     num_chunk() const = 0;
 
     virtual bool
-    empty() = 0;
+    empty() const = 0;
 
     virtual void
     clear() = 0;
@@ -324,7 +324,7 @@ class ConcurrentVectorImpl : public VectorBase {
     }
 
     bool
-    empty() override {
+    empty() const override {
         for (size_t i = 0; i < chunks_ptr_->size(); i++) {
             if (chunks_ptr_->get_chunk_size(i) > 0) {
                 return false;

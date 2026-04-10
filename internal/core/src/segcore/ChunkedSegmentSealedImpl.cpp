@@ -632,7 +632,7 @@ ChunkedSegmentSealedImpl::load_system_field_internal(
             offset += chunk_ptr->Span().row_count();
         }
 
-        init_timestamp_index_owned(std::move(timestamps), num_rows);
+        init_timestamp_index(timestamps, num_rows);
     } else {
         AssertInfo(system_field_type == SystemFieldType::RowId,
                    "System field type of id column is not RowId");
@@ -1735,6 +1735,7 @@ ChunkedSegmentSealedImpl::bulk_subscript(milvus::OpContext* op_ctx,
                 }
             }
             break;
+        }
         case SystemFieldType::RowId:
             ThrowInfo(ErrorCode::Unsupported, "RowId retrieve not supported");
             break;
@@ -2570,26 +2571,15 @@ ChunkedSegmentSealedImpl::get_active_count(Timestamp ts) const {
 
 // Helper: apply a per-element timestamp scan over a range [beg, end),
 // calling `pred(global_offset, ts_value)` for each row.
-// Overload for TimestampData (StorageV1 / growing segment path).
+// Overload for ConcurrentVector<Timestamp> (StorageV1 / insert_record path).
 template <typename Pred>
 static void
-scan_timestamp_range(const TimestampData& ts,
+scan_timestamp_range(const ConcurrentVector<Timestamp>& ts,
                      int64_t beg,
                      int64_t end,
                      Pred pred) {
-    for (int64_t c = 0; c < ts.num_chunks(); c++) {
-        auto chunk_start = ts.chunk_start_offset(c);
-        auto chunk_end = chunk_start + ts.chunk_row_count(c);
-        auto overlap_beg = std::max(beg, chunk_start);
-        auto overlap_end = std::min(end, chunk_end);
-        if (overlap_beg >= overlap_end) {
-            continue;
-        }
-        auto* data = ts.chunk_data(c);
-        auto local = overlap_beg - chunk_start;
-        for (int64_t i = overlap_beg; i < overlap_end; ++i, ++local) {
-            pred(i, data[local]);
-        }
+    for (int64_t i = beg; i < end; ++i) {
+        pred(i, ts[i]);
     }
 }
 

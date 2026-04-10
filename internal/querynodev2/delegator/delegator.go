@@ -339,7 +339,7 @@ func (sd *shardDelegator) shallowCopyRetrieveRequest(req *internalpb.RetrieveReq
 }
 
 func (sd *shardDelegator) modifyQueryRequest(req *querypb.QueryRequest, scope querypb.DataScope, segmentIDs []int64, targetID int64) *querypb.QueryRequest {
-	nodeReq := proto.Clone(req).(*querypb.QueryRequest)
+	nodeReq := typeutil.Clone(req)
 	nodeReq.Scope = scope
 	nodeReq.Req.Base.TargetID = targetID
 	nodeReq.SegmentIDs = segmentIDs

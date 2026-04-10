@@ -237,7 +237,7 @@ GroupChunkTranslator::GroupChunkTranslator(
         // This is the global cap applied to all priority pools.
         // TODO: if THREAD_POOL_MAX_SIZE is dynamically adjusted, add a callback
         // to update loading_overhead_upper_bound for SCALAR_FIELD/VECTOR_FIELD.
-        int pool_size = milvus::THREAD_POOL_MAX_SIZE.load();
+        int pool_size = milvus::THREAD_POOL_MAX_THREADS_SIZE.load();
         if (pool_size <= 0) {
             // If not set, fall back to the highest possible pool size
             pool_size = static_cast<int>(std::round(

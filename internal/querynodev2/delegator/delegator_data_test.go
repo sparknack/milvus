@@ -1686,6 +1686,62 @@ func (s *DelegatorDataSuite) TestLoadSegmentsDoesNotBlockProcessDelete() {
 	s.False(processDeleteBlocked.Load(), "ProcessDelete was blocked for too long during LoadSegments — tsafe would freeze")
 }
 
+func (s *DelegatorDataSuite) TestLoadSegmentsWithBloomFilterDisabledDoesNotPanicAndForwardsDeletes() {
+	defer func() {
+		s.workerManager.ExpectedCalls = nil
+		s.loader.ExpectedCalls = nil
+	}()
+
+	paramtable.Get().Save(paramtable.Get().CommonCfg.BloomFilterEnabled.Key, "false")
+	defer paramtable.Get().Reset(paramtable.Get().CommonCfg.BloomFilterEnabled.Key)
+
+	worker := &cluster.MockWorker{}
+	s.workerManager.EXPECT().GetWorker(mock.Anything, int64(1)).Return(worker, nil)
+	worker.EXPECT().LoadSegments(mock.Anything, mock.AnythingOfType("*querypb.LoadSegmentsRequest")).
+		Return(nil)
+
+	var deleteReqs []*querypb.DeleteRequest
+	worker.EXPECT().Delete(mock.Anything, mock.AnythingOfType("*querypb.DeleteRequest")).
+		RunAndReturn(func(_ context.Context, req *querypb.DeleteRequest) error {
+			deleteReqs = append(deleteReqs, req)
+			return nil
+		})
+
+	s.delegator.ProcessDelete([]*DeleteData{
+		{
+			PartitionID: 500,
+			PrimaryKeys: []storage.PrimaryKey{
+				storage.NewInt64PrimaryKey(101),
+				storage.NewInt64PrimaryKey(202),
+			},
+			Timestamps: []uint64{11, 12},
+			RowCount:   2,
+		},
+	}, 12)
+
+	err := s.delegator.LoadSegments(context.Background(), &querypb.LoadSegmentsRequest{
+		Base:         commonpbutil.NewMsgBase(),
+		DstNodeID:    1,
+		CollectionID: s.collectionID,
+		Infos: []*querypb.SegmentLoadInfo{
+			{
+				CollectionID:  s.collectionID,
+				SegmentID:     300,
+				PartitionID:   500,
+				StartPosition: &msgpb.MsgPosition{Timestamp: 5},
+				DeltaPosition: &msgpb.MsgPosition{Timestamp: 5},
+				Level:         datapb.SegmentLevel_L1,
+				InsertChannel: fmt.Sprintf("by-dev-rootcoord-dml_0_%dv0", s.collectionID),
+			},
+		},
+	})
+	s.Require().NoError(err)
+	s.Require().Len(deleteReqs, 1)
+	s.Equal(querypb.DataScope_Historical, deleteReqs[0].GetScope())
+	s.Equal(int64(300), deleteReqs[0].GetSegmentId())
+	s.Len(deleteReqs[0].GetTimestamps(), 2)
+}
+
 func (s *DelegatorDataSuite) TestDelegatorData_ExcludeSegments() {
 	s.delegator.AddExcludedSegments(map[int64]uint64{
 		1: 3,

@@ -534,19 +534,11 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 		log.Info("skip loading bloom filter set for sealed segments because bloom filter is disabled")
 	}
 
-	// Load BM25 stats BEFORE loadStreamDelete so stats are ready before segment becomes visible
 	refundCandidatesOnErr := func(err error) error {
 		for _, c := range candidates {
 			c.Refund()
 		}
 		return err
-	}
-
-	log.Debug("load delete...")
-	err = sd.loadStreamDelete(ctx, candidates, infos, req, targetNodeID, worker)
-	if err != nil {
-		log.Warn("load stream delete failed", zap.Error(err))
-		return refundCandidatesOnErr(err)
 	}
 
 	err = sd.loadBM25Stats(ctx, infos, req)
@@ -579,16 +571,11 @@ func (sd *shardDelegator) LoadSegments(ctx context.Context, req *querypb.LoadSeg
 	}
 
 	log.Debug("load delete...")
-	// loadStreamDelete now handles distribution add atomically in Phase 3
+	// loadStreamDelete handles distribution add atomically in Phase 3
 	err = sd.loadStreamDelete(ctx, candidates, infos, req, targetNodeID, worker,
 		entries, req.GetLoadMeta().GetSchemaVersion())
 	if err != nil {
 		log.Warn("load stream delete failed", zap.Error(err))
-		return err
-	}
-
-	err = sd.addDistributionIfVersionOK(req.GetLoadMeta().GetSchemaVersion(), entries...)
-	if err != nil {
 		return refundCandidatesOnErr(err)
 	}
 	return nil
@@ -764,7 +751,7 @@ func (sd *shardDelegator) processDeleteRecords(
 	for _, entry := range records {
 		for _, record := range entry.Data {
 			tsHit += int64(len(record.DeleteData.Pks))
-			if record.PartitionID != common.AllPartitionsID && candidate.Partition() != record.PartitionID {
+			if candidate != nil && record.PartitionID != common.AllPartitionsID && candidate.Partition() != record.PartitionID {
 				continue
 			}
 			pks := record.DeleteData.Pks
@@ -773,6 +760,16 @@ func (sd *shardDelegator) processDeleteRecords(
 				endIdx := idx + batchSize
 				if endIdx > len(pks) {
 					endIdx = len(pks)
+				}
+
+				if candidate == nil {
+					for i := idx; i < endIdx; i++ {
+						bfHit++
+						if err = forwarder.Buffer(pks[i], record.DeleteData.Tss[i]); err != nil {
+							return tsHit, bfHit, err
+						}
+					}
+					continue
 				}
 
 				lc := storage.NewBatchLocationsCache(pks[idx:endIdx])
@@ -867,56 +864,7 @@ func (sd *shardDelegator) loadStreamDelete(ctx context.Context,
 	for i, info := range infos {
 		candidate := idCandidates[info.GetSegmentID()]
 		start := time.Now()
-		for _, entry := range deleteRecords {
-			for _, record := range entry.Data {
-				tsHitDeleteRows += int64(len(record.DeleteData.Pks))
-				if candidate != nil && record.PartitionID != common.AllPartitionsID && candidate.Partition() != record.PartitionID {
-					continue
-				}
-				pks := record.DeleteData.Pks
-				batchSize := paramtable.Get().CommonCfg.BloomFilterApplyBatchSize.GetAsInt()
-				for idx := 0; idx < len(pks); idx += batchSize {
-					endIdx := idx + batchSize
-					if endIdx > len(pks) {
-						endIdx = len(pks)
-					}
-
-					if candidate == nil {
-						for i := idx; i < endIdx; i++ {
-							bfHitDeleteRows += 1
-							err := bufferedForwarder.Buffer(pks[i], record.DeleteData.Tss[i])
-							if err != nil {
-								return err
-							}
-						}
-						continue
-					}
-
-					lc := storage.NewBatchLocationsCache(pks[idx:endIdx])
-					hits := candidate.BatchPkExist(lc)
-					for i, hit := range hits {
-						if !hit {
-							continue
-						}
-						bfHitDeleteRows += 1
-						err := bufferedForwarder.Buffer(pks[idx+i], record.DeleteData.Tss[idx+i])
-						if err != nil {
-							return err
-						}
-					}
-				}
-			}
-		}
-		log.Info("forward delete to worker...",
-			zap.String("channel", info.InsertChannel),
-			zap.Int64("segmentID", info.GetSegmentID()),
-			zap.Bool("broadcast", candidate == nil),
-			zap.Time("startPosition", tsoutil.PhysicalTime(info.GetStartPosition().GetTimestamp())),
-			zap.Int64("tsHitDeleteRowNum", tsHitDeleteRows),
-			zap.Int64("bfHitDeleteRowNum", bfHitDeleteRows),
-			zap.Int64("bfCost", time.Since(start).Milliseconds()),
-		)
-		err := bufferedForwarder.Flush()
+		tsHit, bfHit, err := sd.processDeleteRecords(candidate, snapshots[i].records, forwarders[i])
 		if err != nil {
 			return err
 		}
