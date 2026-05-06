@@ -1206,6 +1206,13 @@ func (s *LocalSegment) innerLoadIndex(ctx context.Context,
 }
 
 func (s *LocalSegment) LoadTextIndex(ctx context.Context, textLogs *datapb.TextIndexStats, schemaHelper *typeutil.SchemaHelper) error {
+	_, err := GetLoadPool().Submit(func() (any, error) {
+		return nil, s.loadTextIndexCgo(ctx, textLogs, schemaHelper)
+	}).Await()
+	return err
+}
+
+func (s *LocalSegment) loadTextIndexCgo(ctx context.Context, textLogs *datapb.TextIndexStats, schemaHelper *typeutil.SchemaHelper) error {
 	log.Ctx(ctx).Info("load text index", zap.Int64("field id", textLogs.GetFieldID()), zap.Any("text logs", textLogs))
 
 	if !s.ptrLock.PinIf(state.IsNotReleased) {
@@ -1245,10 +1252,7 @@ func (s *LocalSegment) LoadTextIndex(ctx context.Context, textLogs *datapb.TextI
 	defer guard.Close()
 
 	var status C.CStatus
-	_, _ = GetLoadPool().Submit(func() (any, error) {
-		status = C.LoadTextIndex(s.ptr, (*C.uint8_t)(unsafe.Pointer(&marshaled[0])), (C.uint64_t)(len(marshaled)), (C.CLoadCancellationSource)(guard.Source()))
-		return nil, nil
-	}).Await()
+	status = C.LoadTextIndex(s.ptr, (*C.uint8_t)(unsafe.Pointer(&marshaled[0])), (C.uint64_t)(len(marshaled)), (C.CLoadCancellationSource)(guard.Source()))
 
 	return HandleCStatus(ctx, &status, "LoadTextIndex failed")
 }
