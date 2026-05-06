@@ -94,6 +94,9 @@ SetExprResCacheCapacityBytes(int64_t bytes);
 void
 SetArrowIOThreadPoolCapacity(int threads);
 
+void
+UpdateArrowIOThreadPoolMetrics();
+
 #ifdef __cplusplus
 };
 #endif

@@ -14,16 +14,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
 #include <mutex>
 
 #include <arrow/io/interfaces.h>
+#include <arrow/io/type_fwd.h>
+#include <arrow/util/thread_pool.h>
 #include <openssl/evp.h>
 #include "common/init_c.h"
 #include "common/Common.h"
 #include "common/Tracer.h"
+#include "monitor/Monitor.h"
 #include "log/Log.h"
 #include "storage/ThreadPool.h"
-#include "log/Log.h"
 #include "exec/expression/ExprCache.h"
 
 std::once_flag traceFlag;
@@ -119,6 +122,26 @@ SetArrowIOThreadPoolCapacity(int threads) {
         return;
     }
     LOG_INFO("arrow io thread pool capacity set to {}", threads);
+    UpdateArrowIOThreadPoolMetrics();
+}
+
+void
+UpdateArrowIOThreadPoolMetrics() {
+    auto capacity = arrow::io::GetIOThreadPoolCapacity();
+    milvus::monitor::internal_arrow_io_pool_capacity_all.Set(capacity);
+
+    auto* executor = arrow::io::default_io_context().executor();
+    auto* thread_pool = dynamic_cast<arrow::internal::ThreadPool*>(executor);
+    if (thread_pool == nullptr) {
+        milvus::monitor::internal_arrow_io_pool_tasks_total_all.Set(-1);
+        milvus::monitor::internal_arrow_io_pool_queue_depth_approx_all.Set(-1);
+        return;
+    }
+
+    auto tasks = thread_pool->GetNumTasks();
+    milvus::monitor::internal_arrow_io_pool_tasks_total_all.Set(tasks);
+    milvus::monitor::internal_arrow_io_pool_queue_depth_approx_all.Set(
+        std::max(tasks - capacity, 0));
 }
 
 void

@@ -11,11 +11,13 @@
 
 #include <string.h>
 
+#include "common/init_c.h"
 #include "monitor_c.h"
 #include "common/PrometheusClient.h"
 
 char*
 GetCoreMetrics() {
+    UpdateArrowIOThreadPoolMetrics();
     auto str = milvus::monitor::getPrometheusClient().GetMetrics();
     auto len = str.length();
     char* res = static_cast<char*>(malloc(len + 1));

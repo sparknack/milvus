@@ -68,7 +68,10 @@ ThreadPools::GetThreadPool(milvus::ThreadPoolPriority priority) {
                     &monitor::internal_storage_pool_idle_threads_high,
                     &monitor::internal_storage_pool_queue_depth_high,
                     &monitor::internal_storage_pool_task_submitted_total_high,
-                    &monitor::internal_storage_pool_task_completed_total_high);
+                    &monitor::internal_storage_pool_task_completed_total_high,
+                    &monitor::internal_storage_pool_queue_duration_seconds_high,
+                    &monitor::
+                        internal_storage_pool_execute_duration_seconds_high);
                 break;
             case MIDDLE:
                 pool.SetMetrics(
@@ -77,8 +80,11 @@ ThreadPools::GetThreadPool(milvus::ThreadPoolPriority priority) {
                     &monitor::internal_storage_pool_idle_threads_middle,
                     &monitor::internal_storage_pool_queue_depth_middle,
                     &monitor::internal_storage_pool_task_submitted_total_middle,
+                    &monitor::internal_storage_pool_task_completed_total_middle,
                     &monitor::
-                        internal_storage_pool_task_completed_total_middle);
+                        internal_storage_pool_queue_duration_seconds_middle,
+                    &monitor::
+                        internal_storage_pool_execute_duration_seconds_middle);
                 break;
             case LOW:
                 pool.SetMetrics(
@@ -87,7 +93,10 @@ ThreadPools::GetThreadPool(milvus::ThreadPoolPriority priority) {
                     &monitor::internal_storage_pool_idle_threads_low,
                     &monitor::internal_storage_pool_queue_depth_low,
                     &monitor::internal_storage_pool_task_submitted_total_low,
-                    &monitor::internal_storage_pool_task_completed_total_low);
+                    &monitor::internal_storage_pool_task_completed_total_low,
+                    &monitor::internal_storage_pool_queue_duration_seconds_low,
+                    &monitor::
+                        internal_storage_pool_execute_duration_seconds_low);
                 break;
         }
         return pool;
