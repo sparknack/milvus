@@ -482,6 +482,18 @@ func InitDiskFileWriterConfig(params *paramtable.ComponentParam) error {
 	return HandleCStatus(&status, "InitDiskFileWriterConfig failed")
 }
 
+func InitArrowReaderConfig(params *paramtable.ComponentParam) error {
+	cfg := params.CommonCfg
+	arrowReaderConfig := C.CArrowReaderConfig{
+		hole_size_limit_bytes:  C.int64_t(cfg.ArrowReadCacheHoleSizeLimitBytes.GetAsInt64()),
+		range_size_limit_bytes: C.int64_t(cfg.ArrowReadCacheRangeSizeLimitBytes.GetAsInt64()),
+		lazy:                   C.bool(cfg.ArrowReadCacheLazy.GetAsBool()),
+		prefetch_limit:         C.int64_t(cfg.ArrowReadCachePrefetchLimit.GetAsInt64()),
+	}
+	status := C.InitArrowReaderConfig(arrowReaderConfig)
+	return HandleCStatus(&status, "InitArrowReaderConfig failed")
+}
+
 var coreParamCallbackInitOnce sync.Once
 
 func SetupCoreConfigChangelCallback() {

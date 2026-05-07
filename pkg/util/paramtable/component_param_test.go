@@ -59,6 +59,19 @@ func TestComponentParam(t *testing.T) {
 		assert.Equal(t, Params.IndexSliceSize.GetAsInt64(), int64(DefaultIndexSliceSize))
 		t.Logf("knowhere index slice size = %d", Params.IndexSliceSize.GetAsInt64())
 
+		assert.Equal(t, int64(0), Params.ArrowReadCacheHoleSizeLimitBytes.GetAsInt64())
+		assert.Equal(t, int64(0), Params.ArrowReadCacheRangeSizeLimitBytes.GetAsInt64())
+		assert.True(t, Params.ArrowReadCacheLazy.GetAsBool())
+		assert.Equal(t, int64(0), Params.ArrowReadCachePrefetchLimit.GetAsInt64())
+		params.Save(Params.ArrowReadCacheHoleSizeLimitBytes.Key, "1048576")
+		params.Save(Params.ArrowReadCacheRangeSizeLimitBytes.Key, "67108864")
+		params.Save(Params.ArrowReadCacheLazy.Key, "false")
+		params.Save(Params.ArrowReadCachePrefetchLimit.Key, "2")
+		assert.Equal(t, int64(1048576), Params.ArrowReadCacheHoleSizeLimitBytes.GetAsInt64())
+		assert.Equal(t, int64(67108864), Params.ArrowReadCacheRangeSizeLimitBytes.GetAsInt64())
+		assert.False(t, Params.ArrowReadCacheLazy.GetAsBool())
+		assert.Equal(t, int64(2), Params.ArrowReadCachePrefetchLimit.GetAsInt64())
+
 		assert.Equal(t, Params.GracefulTime.GetAsInt64(), int64(DefaultGracefulTime))
 		t.Logf("default grafeful time = %d", Params.GracefulTime.GetAsInt64())
 

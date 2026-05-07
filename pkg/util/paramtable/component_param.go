@@ -235,6 +235,10 @@ type commonConfig struct {
 	ThreadPoolMaxThreadsSize            ParamItem `refreshable:"true"`
 	ArrowIOThreadPoolCoefficient        ParamItem `refreshable:"true"`
 	ArrowIOThreadPoolMaxCapacity        ParamItem `refreshable:"true"`
+	ArrowReadCacheHoleSizeLimitBytes    ParamItem `refreshable:"true"`
+	ArrowReadCacheRangeSizeLimitBytes   ParamItem `refreshable:"true"`
+	ArrowReadCacheLazy                  ParamItem `refreshable:"true"`
+	ArrowReadCachePrefetchLimit         ParamItem `refreshable:"true"`
 	EnableMaterializedView              ParamItem `refreshable:"false"`
 	BuildIndexThreadPoolRatio           ParamItem `refreshable:"false"`
 	MaxDegree                           ParamItem `refreshable:"true"`
@@ -749,6 +753,48 @@ This configuration is only used by querynode and indexnode, it selects CPU instr
 		Export: false,
 	}
 	p.ArrowIOThreadPoolMaxCapacity.Init(base.mgr)
+
+	p.ArrowReadCacheHoleSizeLimitBytes = ParamItem{
+		Key:          "common.arrow.readCache.holeSizeLimitBytes",
+		Version:      "2.6.14",
+		DefaultValue: "0",
+		Doc: `Maximum byte gap between adjacent Arrow read ranges that can be coalesced. ` +
+			`0 keeps Arrow's default. Increasing this can reduce remote object-store GET ` +
+			`count by reading small holes between Parquet column chunk ranges.`,
+		Export: false,
+	}
+	p.ArrowReadCacheHoleSizeLimitBytes.Init(base.mgr)
+
+	p.ArrowReadCacheRangeSizeLimitBytes = ParamItem{
+		Key:          "common.arrow.readCache.rangeSizeLimitBytes",
+		Version:      "2.6.14",
+		DefaultValue: "0",
+		Doc: `Maximum size in bytes of a coalesced Arrow read range. 0 keeps Arrow's ` +
+			`default. Increase this with holeSizeLimitBytes when larger remote reads ` +
+			`are needed to amortize object-store request latency.`,
+		Export: false,
+	}
+	p.ArrowReadCacheRangeSizeLimitBytes.Init(base.mgr)
+
+	p.ArrowReadCacheLazy = ParamItem{
+		Key:          "common.arrow.readCache.lazy",
+		Version:      "2.6.14",
+		DefaultValue: "true",
+		Doc: `Whether Arrow ReadRangeCache should issue remote reads lazily when ranges ` +
+			`are requested. true matches Arrow's default Parquet reader behavior.`,
+		Export: false,
+	}
+	p.ArrowReadCacheLazy.Init(base.mgr)
+
+	p.ArrowReadCachePrefetchLimit = ParamItem{
+		Key:          "common.arrow.readCache.prefetchLimit",
+		Version:      "2.6.14",
+		DefaultValue: "0",
+		Doc: `Maximum number of next ranges Arrow may prefetch after a lazy read. ` +
+			`0 disables lazy prefetch and matches Arrow's default.`,
+		Export: false,
+	}
+	p.ArrowReadCachePrefetchLimit.Init(base.mgr)
 
 	p.DiskWriteMode = ParamItem{
 		Key:          "common.diskWriteMode",
