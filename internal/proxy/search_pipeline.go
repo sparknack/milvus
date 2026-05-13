@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/apache/arrow/go/v17/arrow/memory"
 	"github.com/samber/lo"
@@ -2178,11 +2179,19 @@ func (p *pipeline) Run(ctx context.Context, span trace.Span, toReduceResults []*
 	for _, node := range p.nodes {
 		var err error
 		log.Ctx(ctx).Debug("SearchPipeline run node", zap.String("node", node.name))
+		nodeStart := time.Now()
 		msg, err = node.Run(ctx, span, msg)
+		nodeDur := time.Since(nodeStart)
 		if err != nil {
 			log.Ctx(ctx).Error("Run node failed: ", zap.String("err", err.Error()))
 			return nil, storageCost, err
 		}
+		log.Ctx(ctx).Debug("SearchPipeline node done",
+			zap.String("pipeline", p.name),
+			zap.String("node", node.name),
+			zap.String("op", node.opName),
+			zap.Duration("duration", nodeDur),
+		)
 		pTrace.TraceMsg(node.opName, msg)
 	}
 	pTrace.LogIfEnabled(ctx, p.name)

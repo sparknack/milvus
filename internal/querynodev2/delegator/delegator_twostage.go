@@ -152,6 +152,9 @@ func (sd *shardDelegator) twoStageSearch(
 		return nil, false, err
 	}
 
-	log.Debug("Two-stage search completed", zap.Int("results", len(results)))
+	log.Debug("Two-stage search completed",
+		zap.Int("results", len(results)),
+		zap.Float64("stage1DurMs", stage1Dur),
+		zap.Float64("stage2DurMs", stage2Dur))
 	return results, false, nil
 }
