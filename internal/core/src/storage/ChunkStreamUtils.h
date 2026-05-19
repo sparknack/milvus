@@ -24,6 +24,7 @@
 #include <mutex>
 #include <vector>
 
+#include "common/Consts.h"
 #include "storage/ThreadPools.h"
 
 namespace milvus::storage {
@@ -56,6 +57,12 @@ class TransientMemoryBudget {
     GetScalarIndexChunkBudget() {
         static TransientMemoryBudget instance(
             DefaultScalarIndexChunkBudgetBytes());
+        return instance;
+    }
+
+    static TransientMemoryBudget&
+    GetFieldDataLoadBudget() {
+        static TransientMemoryBudget instance(DEFAULT_FIELD_MAX_MEMORY_LIMIT);
         return instance;
     }
 
