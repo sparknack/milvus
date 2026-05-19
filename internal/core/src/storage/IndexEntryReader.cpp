@@ -590,23 +590,28 @@ IndexEntryReader::ReadPlainEntryStream(
     }
 
     auto& pool = ThreadPools::GetThreadPool(priority_);
-    auto& budget = ChunkInflightBudget::GetInstance();
-    auto channel = std::make_shared<Channel<std::shared_ptr<ChunkResult>>>(
-        budget.MaxInflight());
+    auto& budget = TransientMemoryBudget::GetScalarIndexChunkBudget();
+    auto channel = std::make_shared<Channel<std::shared_ptr<ChunkResult>>>();
 
     size_t next_submit = 0;
     size_t next_consume = 0;
     size_t local_inflight = 0;
 
+    auto chunkLen = [&](size_t seq) {
+        size_t off = seq * chunk_size;
+        return std::min<size_t>(chunk_size, pm.size - off);
+    };
+
     auto submitOne = [&]() {
         size_t seq = next_submit;
         size_t off = seq * chunk_size;
-        size_t len = std::min<size_t>(chunk_size, pm.size - off);
+        size_t len = chunkLen(seq);
         size_t src = pm.offset + off;
 
         pool.Submit([this, channel, seq, src, len]() {
             auto r = std::make_shared<ChunkResult>();
             r->seq = seq;
+            r->budget_bytes = len;
             r->data.resize(len);
             size_t n =
                 input_->ReadAt(r->data.data(), MILVUS_V3_MAGIC_SIZE + src, len);
@@ -618,16 +623,17 @@ IndexEntryReader::ReadPlainEntryStream(
         local_inflight++;
     };
 
-    // 1. Fill window: block for first slot, then try-acquire remaining.
+    // 1. Fill budget: block for first chunk, then try-acquire remaining.
     if (next_submit < num_chunks) {
-        budget.Acquire();
+        budget.Acquire(chunkLen(next_submit));
         submitOne();
     }
-    while (next_submit < num_chunks && budget.TryAcquire()) {
+    while (next_submit < num_chunks &&
+           budget.TryAcquire(chunkLen(next_submit))) {
         submitOne();
     }
 
-    // 2. Slide: consume one, submit next
+    // 2. Consume one, then submit more while budget is available.
     uint32_t running_crc = 0;
     bool first = true;
     std::map<size_t, std::shared_ptr<ChunkResult>> reorder_buf;
@@ -639,7 +645,7 @@ IndexEntryReader::ReadPlainEntryStream(
                   : Crc32cCombine(running_crc, chunk_crc, c->data.size());
         first = false;
         callback(c->data.data(), c->data.size());
-        budget.Release();
+        budget.Release(c->budget_bytes);
         next_consume++;
         local_inflight--;
     };
@@ -661,15 +667,16 @@ IndexEntryReader::ReadPlainEntryStream(
             deliverChunk(node.mapped());
         }
 
-        // Replenish: try non-blocking first
-        while (next_submit < num_chunks && budget.TryAcquire()) {
+        // Replenish: try non-blocking first.
+        while (next_submit < num_chunks &&
+               budget.TryAcquire(chunkLen(next_submit))) {
             submitOne();
         }
 
         // If nothing inflight but still work to do, must block-acquire
         // to guarantee progress. Safe because channel is empty here.
         if (local_inflight == 0 && next_submit < num_chunks) {
-            budget.Acquire();
+            budget.Acquire(chunkLen(next_submit));
             submitOne();
         }
     }
@@ -690,13 +697,14 @@ IndexEntryReader::ReadEncryptedEntryStream(
     }
 
     auto& pool = ThreadPools::GetThreadPool(priority_);
-    auto& budget = ChunkInflightBudget::GetInstance();
-    auto channel = std::make_shared<Channel<std::shared_ptr<ChunkResult>>>(
-        budget.MaxInflight());
+    auto& budget = TransientMemoryBudget::GetScalarIndexChunkBudget();
+    auto channel = std::make_shared<Channel<std::shared_ptr<ChunkResult>>>();
 
     size_t next_submit = 0;
     size_t next_consume = 0;
     size_t local_inflight = 0;
+
+    auto sliceBudgetBytes = [&](size_t seq) { return em.slices[seq].size; };
 
     auto submitOne = [&]() {
         size_t seq = next_submit;
@@ -714,6 +722,7 @@ IndexEntryReader::ReadEncryptedEntryStream(
 
             auto r = std::make_shared<ChunkResult>();
             r->seq = seq;
+            r->budget_bytes = slice.size;
             r->data.assign(
                 reinterpret_cast<const uint8_t*>(plain.data()),
                 reinterpret_cast<const uint8_t*>(plain.data()) + plain.size());
@@ -724,16 +733,17 @@ IndexEntryReader::ReadEncryptedEntryStream(
         local_inflight++;
     };
 
-    // Fill window: block for first slot, then try-acquire remaining
+    // Fill budget: block for first slice, then try-acquire remaining.
     if (next_submit < num_slices) {
-        budget.Acquire();
+        budget.Acquire(sliceBudgetBytes(next_submit));
         submitOne();
     }
-    while (next_submit < num_slices && budget.TryAcquire()) {
+    while (next_submit < num_slices &&
+           budget.TryAcquire(sliceBudgetBytes(next_submit))) {
         submitOne();
     }
 
-    // Slide: consume + replenish
+    // Consume + replenish.
     uint32_t running_crc = 0;
     bool first = true;
     std::map<size_t, std::shared_ptr<ChunkResult>> reorder_buf;
@@ -745,7 +755,7 @@ IndexEntryReader::ReadEncryptedEntryStream(
                   : Crc32cCombine(running_crc, chunk_crc, c->data.size());
         first = false;
         callback(c->data.data(), c->data.size());
-        budget.Release();
+        budget.Release(c->budget_bytes);
         next_consume++;
         local_inflight--;
     };
@@ -766,12 +776,13 @@ IndexEntryReader::ReadEncryptedEntryStream(
             deliverChunk(node.mapped());
         }
 
-        while (next_submit < num_slices && budget.TryAcquire()) {
+        while (next_submit < num_slices &&
+               budget.TryAcquire(sliceBudgetBytes(next_submit))) {
             submitOne();
         }
 
         if (local_inflight == 0 && next_submit < num_slices) {
-            budget.Acquire();
+            budget.Acquire(sliceBudgetBytes(next_submit));
             submitOne();
         }
     }
