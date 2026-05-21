@@ -575,6 +575,9 @@ IndexEntryReader::ReadEntryStream(
     if (meta.encrypted) {
         ReadEncryptedEntryStream(meta.enc, callback);
     } else {
+        chunk_size = chunk_size > 0
+                         ? chunk_size
+                         : TransientMemoryBudget::ScalarIndexStreamChunkBytes();
         ReadPlainEntryStream(meta.plain, callback, chunk_size);
     }
 }

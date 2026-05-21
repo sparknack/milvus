@@ -63,6 +63,30 @@ func UpdateThreadPoolMaxThreadsSize(size int) {
 	C.SetThreadPoolMaxThreadsSize(C.int(size))
 }
 
+func UpdateFieldDataLoadMemoryLimitMB(size int) {
+	C.SetFieldDataLoadMemoryLimitMB(C.int64_t(size))
+}
+
+func UpdateFieldDataLoadBatchSizeMB(size int) {
+	C.SetFieldDataLoadBatchSizeMB(C.int64_t(size))
+}
+
+func UpdateFieldDataLoadReadBufferSizeMB(size int) {
+	C.SetFieldDataLoadReadBufferSizeMB(C.int64_t(size))
+}
+
+func UpdateFieldDataLoadMaxReadParallelism(parallelism int) {
+	C.SetFieldDataLoadMaxReadParallelism(C.int64_t(parallelism))
+}
+
+func UpdateScalarIndexLoadMemoryLimitMB(size int) {
+	C.SetScalarIndexLoadMemoryLimitMB(C.int64_t(size))
+}
+
+func UpdateScalarIndexLoadStreamChunkSizeMB(size int) {
+	C.SetScalarIndexLoadStreamChunkSizeMB(C.int64_t(size))
+}
+
 func UpdateDefaultExprEvalBatchSize(size int) {
 	C.SetDefaultExprEvalBatchSize(C.int64_t(size))
 }

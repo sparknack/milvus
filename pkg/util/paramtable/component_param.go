@@ -50,6 +50,12 @@ const (
 	DefaultLowPriorityThreadCoreCoefficient    = 1
 	DefaultBM25LoadThreadCoreCoefficient       = 1
 	DefaultThreadPoolMaxThreadsSize            = 16
+	DefaultFieldDataLoadMemoryLimitMB          = 128
+	DefaultFieldDataLoadBatchSizeMB            = 32
+	DefaultFieldDataLoadReadBufferSizeMB       = 16
+	DefaultFieldDataLoadMaxReadParallelism     = 8
+	DefaultScalarIndexLoadMemoryLimitMB        = 0
+	DefaultScalarIndexLoadStreamChunkSizeMB    = 2
 
 	DefaultSessionTTL        = 15 // s
 	DefaultSessionRetryTimes = 30
@@ -232,6 +238,12 @@ type commonConfig struct {
 	LowPriorityThreadCoreCoefficient    ParamItem `refreshable:"true"`
 	BM25LoadThreadCoreCoefficient       ParamItem `refreshable:"true"`
 	ThreadPoolMaxThreadsSize            ParamItem `refreshable:"true"`
+	FieldDataLoadMemoryLimitMB          ParamItem `refreshable:"true"`
+	FieldDataLoadBatchSizeMB            ParamItem `refreshable:"true"`
+	FieldDataLoadReadBufferSizeMB       ParamItem `refreshable:"true"`
+	FieldDataLoadMaxReadParallelism     ParamItem `refreshable:"true"`
+	ScalarIndexLoadMemoryLimitMB        ParamItem `refreshable:"true"`
+	ScalarIndexLoadStreamChunkSizeMB    ParamItem `refreshable:"true"`
 	ArrowIOThreadPoolCoefficient        ParamItem `refreshable:"true"`
 	ArrowIOThreadPoolMaxCapacity        ParamItem `refreshable:"true"`
 	EnableMaterializedView              ParamItem `refreshable:"false"`
@@ -705,6 +717,60 @@ This configuration is only used by querynode and indexnode, it selects CPU instr
 		Export:       true,
 	}
 	p.ThreadPoolMaxThreadsSize.Init(base.mgr)
+
+	p.FieldDataLoadMemoryLimitMB = ParamItem{
+		Key:          "common.fieldDataLoad.memoryLimitMB",
+		Version:      "3.0.0",
+		DefaultValue: strconv.Itoa(DefaultFieldDataLoadMemoryLimitMB),
+		Doc:          "Global transient memory budget for concurrent field data loading in MB",
+		Export:       true,
+	}
+	p.FieldDataLoadMemoryLimitMB.Init(base.mgr)
+
+	p.FieldDataLoadBatchSizeMB = ParamItem{
+		Key:          "common.fieldDataLoad.batchSizeMB",
+		Version:      "3.0.0",
+		DefaultValue: strconv.Itoa(DefaultFieldDataLoadBatchSizeMB),
+		Doc:          "Target size for grouping field data cells into one load batch in MB",
+		Export:       true,
+	}
+	p.FieldDataLoadBatchSizeMB.Init(base.mgr)
+
+	p.FieldDataLoadReadBufferSizeMB = ParamItem{
+		Key:          "common.fieldDataLoad.readBufferSizeMB",
+		Version:      "3.0.0",
+		DefaultValue: strconv.Itoa(DefaultFieldDataLoadReadBufferSizeMB),
+		Doc:          "Per-reader buffer/window size for field data loading in MB",
+		Export:       true,
+	}
+	p.FieldDataLoadReadBufferSizeMB.Init(base.mgr)
+
+	p.FieldDataLoadMaxReadParallelism = ParamItem{
+		Key:          "common.fieldDataLoad.maxReadParallelism",
+		Version:      "3.0.0",
+		DefaultValue: strconv.Itoa(DefaultFieldDataLoadMaxReadParallelism),
+		Doc:          "Maximum read parallelism within one field data load batch",
+		Export:       true,
+	}
+	p.FieldDataLoadMaxReadParallelism.Init(base.mgr)
+
+	p.ScalarIndexLoadMemoryLimitMB = ParamItem{
+		Key:          "common.scalarIndexLoad.memoryLimitMB",
+		Version:      "3.0.0",
+		DefaultValue: strconv.Itoa(DefaultScalarIndexLoadMemoryLimitMB),
+		Doc:          "Global transient memory budget for scalar index v3 stream loading in MB. 0 derives it from the HIGH priority pool size.",
+		Export:       true,
+	}
+	p.ScalarIndexLoadMemoryLimitMB.Init(base.mgr)
+
+	p.ScalarIndexLoadStreamChunkSizeMB = ParamItem{
+		Key:          "common.scalarIndexLoad.streamChunkSizeMB",
+		Version:      "3.0.0",
+		DefaultValue: strconv.Itoa(DefaultScalarIndexLoadStreamChunkSizeMB),
+		Doc:          "Chunk size for scalar index v3 stream loading in MB",
+		Export:       true,
+	}
+	p.ScalarIndexLoadStreamChunkSizeMB.Init(base.mgr)
 
 	p.ArrowIOThreadPoolCoefficient = ParamItem{
 		Key:          "common.arrow.ioThreadPoolCoefficient",

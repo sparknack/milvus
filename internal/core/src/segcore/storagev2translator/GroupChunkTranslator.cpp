@@ -365,7 +365,7 @@ GroupChunkTranslator::get_cells(milvus::OpContext* ctx,
                                             std::move(cell_specs),
                                             std::move(factory),
                                             channel,
-                                            kFieldDataLoadBatchTargetBytes,
+                                            FieldDataLoadBatchTargetBytes(),
                                             load_priority_);
 
     LOG_INFO(

@@ -44,6 +44,24 @@ void
 SetThreadPoolMaxThreadsSize(const int);
 
 void
+SetFieldDataLoadMemoryLimitMB(const int64_t);
+
+void
+SetFieldDataLoadBatchSizeMB(const int64_t);
+
+void
+SetFieldDataLoadReadBufferSizeMB(const int64_t);
+
+void
+SetFieldDataLoadMaxReadParallelism(const int64_t);
+
+void
+SetScalarIndexLoadMemoryLimitMB(const int64_t);
+
+void
+SetScalarIndexLoadStreamChunkSizeMB(const int64_t);
+
+void
 SetDefaultExprEvalBatchSize(int64_t val);
 
 void

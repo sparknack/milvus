@@ -69,7 +69,7 @@ class IndexEntryReader {
     ReadEntryStream(
         const std::string& name,
         std::function<void(const uint8_t* data, size_t len)> callback,
-        size_t chunk_size = kDefaultStreamChunkSize);
+        size_t chunk_size = 0);
 
     /// Return the uncompressed data size of an entry without reading it.
     size_t

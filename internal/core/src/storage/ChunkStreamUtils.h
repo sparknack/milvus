@@ -17,6 +17,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -60,10 +61,34 @@ class TransientMemoryBudget {
         return instance;
     }
 
+    static void
+    SetScalarIndexChunkBudgetBytes(size_t bytes) {
+        auto capacity =
+            bytes > 0 ? bytes : DefaultScalarIndexChunkBudgetBytes();
+        GetScalarIndexChunkBudget().SetCapacityBytes(capacity);
+    }
+
+    static size_t
+    ScalarIndexStreamChunkBytes() {
+        auto bytes = ScalarIndexStreamChunkBytesRef().load();
+        return std::max<size_t>(bytes, 1);
+    }
+
+    static void
+    SetScalarIndexStreamChunkBytes(size_t bytes) {
+        ScalarIndexStreamChunkBytesRef().store(
+            bytes > 0 ? bytes : kDefaultStreamChunkSize);
+    }
+
     static TransientMemoryBudget&
     GetFieldDataLoadBudget() {
         static TransientMemoryBudget instance(DEFAULT_FIELD_MAX_MEMORY_LIMIT);
         return instance;
+    }
+
+    static void
+    SetFieldDataLoadBudgetBytes(size_t bytes) {
+        GetFieldDataLoadBudget().SetCapacityBytes(bytes);
     }
 
     /// Block until enough budget is available. Safe to call when the calling
@@ -102,7 +127,17 @@ class TransientMemoryBudget {
 
     size_t
     CapacityBytes() const {
+        std::lock_guard<std::mutex> lock(mu_);
         return capacity_bytes_;
+    }
+
+    void
+    SetCapacityBytes(size_t bytes) {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            capacity_bytes_ = std::max<size_t>(bytes, 1);
+        }
+        cv_.notify_all();
     }
 
  private:
@@ -119,6 +154,12 @@ class TransientMemoryBudget {
         return std::max<size_t>(capacity, kDefaultStreamChunkSize);
     }
 
+    static std::atomic<size_t>&
+    ScalarIndexStreamChunkBytesRef() {
+        static std::atomic<size_t> chunk_bytes(kDefaultStreamChunkSize);
+        return chunk_bytes;
+    }
+
     bool
     CanAcquireLocked(size_t bytes) const {
         if (bytes > capacity_bytes_) {
@@ -128,7 +169,7 @@ class TransientMemoryBudget {
                bytes <= capacity_bytes_ - inflight_bytes_;
     }
 
-    std::mutex mu_;
+    mutable std::mutex mu_;
     std::condition_variable cv_;
     size_t inflight_bytes_{0};
     size_t capacity_bytes_;

@@ -316,7 +316,7 @@ ManifestGroupTranslator::get_cells(
                                             std::move(cell_specs),
                                             std::move(factory),
                                             channel,
-                                            kFieldDataLoadBatchTargetBytes,
+                                            FieldDataLoadBatchTargetBytes(),
                                             load_priority_);
 
     {

@@ -116,6 +116,19 @@ func doInitQueryNodeOnce(ctx context.Context) error {
 	cThreadPoolMaxThreadsSize := C.int(paramtable.Get().CommonCfg.ThreadPoolMaxThreadsSize.GetAsInt())
 	C.SetThreadPoolMaxThreadsSize(cThreadPoolMaxThreadsSize)
 
+	cFieldDataLoadMemoryLimitMB := C.int64_t(paramtable.Get().CommonCfg.FieldDataLoadMemoryLimitMB.GetAsInt())
+	C.SetFieldDataLoadMemoryLimitMB(cFieldDataLoadMemoryLimitMB)
+	cFieldDataLoadBatchSizeMB := C.int64_t(paramtable.Get().CommonCfg.FieldDataLoadBatchSizeMB.GetAsInt())
+	C.SetFieldDataLoadBatchSizeMB(cFieldDataLoadBatchSizeMB)
+	cFieldDataLoadReadBufferSizeMB := C.int64_t(paramtable.Get().CommonCfg.FieldDataLoadReadBufferSizeMB.GetAsInt())
+	C.SetFieldDataLoadReadBufferSizeMB(cFieldDataLoadReadBufferSizeMB)
+	cFieldDataLoadMaxReadParallelism := C.int64_t(paramtable.Get().CommonCfg.FieldDataLoadMaxReadParallelism.GetAsInt())
+	C.SetFieldDataLoadMaxReadParallelism(cFieldDataLoadMaxReadParallelism)
+	cScalarIndexLoadMemoryLimitMB := C.int64_t(paramtable.Get().CommonCfg.ScalarIndexLoadMemoryLimitMB.GetAsInt())
+	C.SetScalarIndexLoadMemoryLimitMB(cScalarIndexLoadMemoryLimitMB)
+	cScalarIndexLoadStreamChunkSizeMB := C.int64_t(paramtable.Get().CommonCfg.ScalarIndexLoadStreamChunkSizeMB.GetAsInt())
+	C.SetScalarIndexLoadStreamChunkSizeMB(cScalarIndexLoadStreamChunkSizeMB)
+
 	cCPUNum := C.int(hardware.GetCPUNum())
 	C.InitCpuNum(cCPUNum)
 
