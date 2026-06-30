@@ -17,10 +17,14 @@
 #include "segcore/storagev2translator/AsyncLoadPipeline.h"
 
 #include <algorithm>
+#include <limits>
+#include <unordered_map>
 #include <utility>
 
 #include "common/EasyAssert.h"
+#include "folly/coro/Collect.h"
 #include "folly/coro/FutureUtil.h"
+#include "segcore/Utils.h"
 
 namespace milvus::segcore::storagev2translator {
 
@@ -81,6 +85,91 @@ BuildStorageV3LoadBatches(std::vector<StorageV3LoadUnit> units,
     return batches;
 }
 
+namespace {
+
+size_t
+StorageV3LoadUnitBudgetBytes(const StorageV3LoadUnit& unit) {
+    auto overhead_size = unit.loading_overhead_size > 0
+                             ? unit.loading_overhead_size
+                             : unit.memory_size;
+    AssertInfo(overhead_size > 0,
+               "[StorageV3] Load unit cid={} has invalid budget bytes {}",
+               unit.cid,
+               overhead_size);
+    return static_cast<size_t>(overhead_size);
+}
+
+int64_t
+StorageV3BatchReaderMemoryLimit(const StorageV3LoadBatch& batch,
+                                int64_t split_target_bytes) {
+    auto capped = split_target_bytes > 0
+                      ? std::min(batch.batch_memory, split_target_bytes)
+                      : batch.batch_memory;
+    return std::max<int64_t>(capped,
+                             milvus::segcore::FieldDataReadWindowBytes());
+}
+
+using StorageV3LoadedCellsPtr = std::shared_ptr<StorageV3LoadedCells>;
+
+StorageV3LoadedCellsPtr
+ReadAndFinalizeStorageV3Batch(
+    milvus::OpContext* op_ctx,
+    StorageV3LoadBatch batch,
+    const std::shared_ptr<milvus::segcore::BatchReaderFactory>& reader_factory,
+    const std::shared_ptr<milvus::segcore::CellFinalizeFunc>& finalize_cell,
+    int64_t split_target_bytes) {
+    CheckCancellation(op_ctx, -1, "LoadStorageV3CellsAsync");
+
+    auto tables_result = (*reader_factory)(
+        /*batch_key=*/0,
+        batch.rg_offset,
+        batch.rg_count,
+        StorageV3BatchReaderMemoryLimit(batch, split_target_bytes),
+        /*read_parallelism=*/1);
+    AssertInfo(tables_result.ok(),
+               "[StorageV3] Failed to read batch: {}",
+               tables_result.status().ToString());
+    auto all_tables = std::move(tables_result).ValueOrDie();
+    AssertInfo(all_tables.size() == static_cast<size_t>(batch.rg_count),
+               "[StorageV3] reader returns less tables than expected, batch rg "
+               "count: {}, result size: {}",
+               batch.rg_count,
+               all_tables.size());
+    CheckCancellation(op_ctx, -1, "LoadStorageV3CellsAsync");
+
+    auto loaded_cells = std::make_shared<StorageV3LoadedCells>();
+    loaded_cells->reserve(batch.units.size());
+    int64_t table_offset = 0;
+    for (const auto& unit : batch.units) {
+        CheckCancellation(op_ctx, -1, "LoadStorageV3CellsAsync");
+        std::vector<std::shared_ptr<arrow::Table>> cell_tables;
+        cell_tables.reserve(unit.rg_count);
+        for (int64_t i = 0; i < unit.rg_count; ++i) {
+            cell_tables.push_back(std::move(all_tables[table_offset + i]));
+        }
+        table_offset += unit.rg_count;
+        loaded_cells->push_back(
+            {unit.cid, (*finalize_cell)(cell_tables, unit.cid)});
+    }
+
+    return loaded_cells;
+}
+
+}  // namespace
+
+size_t
+StorageV3LoadBatchBudgetBytes(const StorageV3LoadBatch& batch) {
+    size_t total = 0;
+    for (const auto& unit : batch.units) {
+        auto bytes = StorageV3LoadUnitBudgetBytes(unit);
+        if (bytes > std::numeric_limits<size_t>::max() - total) {
+            return std::numeric_limits<size_t>::max();
+        }
+        total += bytes;
+    }
+    return total;
+}
+
 std::vector<StorageV3LoadUnit>
 BuildStorageV3LoadUnitsForCells(
     const GroupCTMeta& meta,
@@ -105,6 +194,77 @@ BuildStorageV3LoadUnitsForCells(
     }
 
     return units;
+}
+
+folly::coro::Task<StorageV3LoadedCells>
+LoadStorageV3CellsAsync(milvus::OpContext* op_ctx,
+                        std::vector<StorageV3LoadUnit> units,
+                        milvus::segcore::BatchReaderFactory reader_factory,
+                        milvus::segcore::CellFinalizeFunc finalize_cell,
+                        int64_t split_target_bytes,
+                        milvus::proto::common::LoadPriority priority,
+                        StorageV3AdmissionScheduler& scheduler) {
+    if (units.empty()) {
+        co_return StorageV3LoadedCells{};
+    }
+
+    std::vector<milvus::cachinglayer::cid_t> requested_cids;
+    requested_cids.reserve(units.size());
+    for (const auto& unit : units) {
+        requested_cids.push_back(unit.cid);
+    }
+
+    auto batches =
+        BuildStorageV3LoadBatches(std::move(units), split_target_bytes);
+    auto shared_reader = std::make_shared<milvus::segcore::BatchReaderFactory>(
+        std::move(reader_factory));
+    auto shared_finalizer = std::make_shared<milvus::segcore::CellFinalizeFunc>(
+        std::move(finalize_cell));
+
+    std::vector<folly::coro::Task<StorageV3LoadedCellsPtr>> tasks;
+    tasks.reserve(batches.size());
+    for (auto& batch : batches) {
+        auto budget_bytes = StorageV3LoadBatchBudgetBytes(batch);
+        tasks.push_back(AdmitAndSubmitStorageV3LoadTask(
+            scheduler,
+            priority,
+            budget_bytes,
+            [op_ctx,
+             batch = std::move(batch),
+             shared_reader,
+             shared_finalizer,
+             split_target_bytes]() mutable {
+                return ReadAndFinalizeStorageV3Batch(op_ctx,
+                                                     std::move(batch),
+                                                     shared_reader,
+                                                     shared_finalizer,
+                                                     split_target_bytes);
+            }));
+    }
+
+    auto batch_results =
+        co_await folly::coro::collectAllRange(std::move(tasks));
+
+    std::unordered_map<milvus::cachinglayer::cid_t,
+                       std::unique_ptr<milvus::GroupChunk>>
+        cells_by_cid;
+    cells_by_cid.reserve(requested_cids.size());
+    for (auto& batch_result : batch_results) {
+        for (auto& cell : *batch_result) {
+            cells_by_cid.emplace(cell.cid, std::move(cell.chunk));
+        }
+    }
+
+    StorageV3LoadedCells ordered_cells;
+    ordered_cells.reserve(requested_cids.size());
+    for (auto cid : requested_cids) {
+        auto it = cells_by_cid.find(cid);
+        AssertInfo(
+            it != cells_by_cid.end(), "[StorageV3] cell {} not loaded", cid);
+        ordered_cells.push_back({cid, std::move(it->second)});
+    }
+
+    co_return ordered_cells;
 }
 
 StorageV3LoadBudgetLease::StorageV3LoadBudgetLease(

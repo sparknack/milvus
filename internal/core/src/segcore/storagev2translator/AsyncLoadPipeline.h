@@ -28,7 +28,10 @@
 #include <vector>
 
 #include "cachinglayer/Utils.h"
+#include "common/GroupChunk.h"
+#include "common/OpContext.h"
 #include "pb/common.pb.h"
+#include "segcore/memory_planner.h"
 #include "segcore/storagev2translator/GroupCTMeta.h"
 #include "storage/ThreadPools.h"
 
@@ -54,9 +57,19 @@ struct StorageV3LoadBatch {
     std::vector<StorageV3LoadUnit> units;
 };
 
+struct StorageV3LoadedCell {
+    milvus::cachinglayer::cid_t cid;
+    std::unique_ptr<milvus::GroupChunk> chunk;
+};
+
+using StorageV3LoadedCells = std::vector<StorageV3LoadedCell>;
+
 std::vector<StorageV3LoadBatch>
 BuildStorageV3LoadBatches(std::vector<StorageV3LoadUnit> units,
                           int64_t split_target_bytes);
+
+size_t
+StorageV3LoadBatchBudgetBytes(const StorageV3LoadBatch& batch);
 
 using StorageV3LoadingOverheadFunc = std::function<int64_t(int64_t)>;
 
@@ -176,17 +189,26 @@ class StorageV3AdmissionScheduler {
     mutable std::mutex mutex_;
 };
 
+folly::coro::Task<StorageV3LoadedCells>
+LoadStorageV3CellsAsync(milvus::OpContext* op_ctx,
+                        std::vector<StorageV3LoadUnit> units,
+                        milvus::segcore::BatchReaderFactory reader_factory,
+                        milvus::segcore::CellFinalizeFunc finalize_cell,
+                        int64_t split_target_bytes,
+                        milvus::proto::common::LoadPriority priority,
+                        StorageV3AdmissionScheduler& scheduler);
+
 template <typename Func>
 auto
 AdmitAndSubmitStorageV3LoadTask(StorageV3AdmissionScheduler& scheduler,
                                 milvus::proto::common::LoadPriority priority,
                                 size_t bytes,
-                                Func&& func)
+                                Func func)
     -> folly::coro::Task<std::invoke_result_t<std::decay_t<Func>&>> {
     using TaskFunc = std::decay_t<Func>;
     using Result = std::invoke_result_t<TaskFunc&>;
 
-    auto shared_func = std::make_shared<TaskFunc>(std::forward<Func>(func));
+    auto shared_func = std::make_shared<TaskFunc>(std::move(func));
     auto lease = co_await folly::coro::toTask(scheduler.Admit(priority, bytes));
     (void)lease;
 

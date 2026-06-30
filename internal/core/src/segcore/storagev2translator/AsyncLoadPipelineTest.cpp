@@ -22,12 +22,14 @@
 #include <future>
 #include <memory>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 #include <vector>
 
 #include "folly/coro/BlockingWait.h"
 #include "folly/coro/FutureUtil.h"
 #include "gtest/gtest.h"
+#include "common/GroupChunk.h"
 #include "pb/common.pb.h"
 
 using namespace milvus::segcore::storagev2translator;
@@ -162,6 +164,70 @@ TEST(ManifestGroupTranslatorAsyncPipelineTest,
     EXPECT_EQ(batches[1].batch_memory, 24 * MB);
     ASSERT_EQ(batches[1].units.size(), 1);
     EXPECT_EQ(batches[1].units[0].cid, 2);
+}
+
+TEST(ManifestGroupTranslatorAsyncPipelineTest,
+     LoadCellsAsyncMergesIoBatchesAndReturnsRequestedOrder) {
+    constexpr int64_t MB = 1 << 20;
+    std::vector<StorageV3LoadUnit> units = {
+        {/*cid=*/2,
+         /*rg_offset=*/2,
+         /*rg_count=*/1,
+         /*memory_size=*/16 * MB,
+         /*loading_overhead_size=*/16 * MB},
+        {/*cid=*/0,
+         /*rg_offset=*/0,
+         /*rg_count=*/1,
+         /*memory_size=*/16 * MB,
+         /*loading_overhead_size=*/16 * MB},
+        {/*cid=*/1,
+         /*rg_offset=*/1,
+         /*rg_count=*/1,
+         /*memory_size=*/16 * MB,
+         /*loading_overhead_size=*/16 * MB},
+    };
+    std::vector<std::tuple<int64_t, int64_t>> reads;
+    std::vector<int64_t> finalized_cids;
+    auto reader =
+        [&](size_t, int64_t rg_offset, int64_t rg_count, int64_t, uint64_t)
+        -> arrow::Result<std::vector<std::shared_ptr<arrow::Table>>> {
+        reads.emplace_back(rg_offset, rg_count);
+        return std::vector<std::shared_ptr<arrow::Table>>(
+            static_cast<size_t>(rg_count));
+    };
+    auto finalizer =
+        [&](const std::vector<std::shared_ptr<arrow::Table>>& tables,
+            int64_t cid) {
+            finalized_cids.push_back(cid);
+            reads.emplace_back(/*rg_offset=*/-1,
+                               static_cast<int64_t>(tables.size()));
+            return std::make_unique<milvus::GroupChunk>();
+        };
+    StorageV3AdmissionScheduler scheduler(
+        {/*total_bytes=*/64 * MB, /*high_reserved_bytes=*/0});
+
+    auto cells =
+        folly::coro::blockingWait(LoadStorageV3CellsAsync(nullptr,
+                                                          std::move(units),
+                                                          std::move(reader),
+                                                          std::move(finalizer),
+                                                          64 * MB,
+                                                          LoadPriority::HIGH,
+                                                          scheduler));
+
+    ASSERT_EQ(reads.size(), 4);
+    EXPECT_EQ(reads[0], (std::tuple<int64_t, int64_t>{0, 3}));
+    EXPECT_EQ(reads[1], (std::tuple<int64_t, int64_t>{-1, 1}));
+    EXPECT_EQ(reads[2], (std::tuple<int64_t, int64_t>{-1, 1}));
+    EXPECT_EQ(reads[3], (std::tuple<int64_t, int64_t>{-1, 1}));
+    EXPECT_EQ(finalized_cids, std::vector<int64_t>({0, 1, 2}));
+    ASSERT_EQ(cells.size(), 3);
+    EXPECT_EQ(cells[0].cid, 2);
+    EXPECT_EQ(cells[1].cid, 0);
+    EXPECT_EQ(cells[2].cid, 1);
+    EXPECT_NE(cells[0].chunk, nullptr);
+    EXPECT_NE(cells[1].chunk, nullptr);
+    EXPECT_NE(cells[2].chunk, nullptr);
 }
 
 TEST(ManifestGroupTranslatorAsyncPipelineTest,
