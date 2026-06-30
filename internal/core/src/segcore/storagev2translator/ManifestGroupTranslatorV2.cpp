@@ -44,6 +44,7 @@
 #include "common/Types.h"
 #include "fmt/core.h"
 #include "fmt/ranges.h"
+#include "folly/coro/BlockingWait.h"
 #include "glog/logging.h"
 #include "log/Log.h"
 #include "milvus-storage/common/constants.h"
@@ -53,7 +54,6 @@
 #include "segcore/storagev2translator/AsyncLoadPipeline.h"
 #include "segcore/storagev2translator/GroupCTMeta.h"
 #include "storage/EntryStreamUtils.h"
-#include "storage/ThreadPools.h"
 #include "storage/Util.h"
 
 #include <atomic>
@@ -291,109 +291,37 @@ ManifestGroupTranslatorV2::get_cells(
         meta_, cids, [this](int64_t memory_size) {
             return loading_overhead_bytes(memory_size);
         });
-    std::vector<milvus::segcore::CellSpec> cell_specs;
-    cell_specs.reserve(load_units.size());
-    for (const auto& unit : load_units) {
-        cell_specs.push_back({unit.cid,
-                              /*file_idx=*/0,
-                              unit.rg_offset,
-                              unit.rg_count,
-                              unit.memory_size,
-                              unit.loading_overhead_size});
-    }
 
     // Create factory using ChunkReader — reads a batch of row groups at once
     auto factory = milvus::segcore::MakeChunkReaderFactory(chunk_reader_);
 
-    // Submit cell-batch loading tasks
-    auto& pool = milvus::ThreadPools::GetThreadPool(
-        milvus::PriorityForLoad(load_priority_));
-    auto channel = std::make_shared<milvus::segcore::CellReaderChannel>(
-        static_cast<size_t>(pool.GetMaxThreadNum() *
-                            milvus::segcore::kChannelCapacityMultiplier));
-
-    auto load_futures = milvus::segcore::LoadCellBatchAsync(
+    auto loaded_cells = folly::coro::blockingWait(LoadStorageV3CellsAsync(
         ctx,
-        std::move(cell_specs),
+        std::move(load_units),
         std::move(factory),
-        channel,
-        FieldDataLoadBatchSplitTargetBytes(),
-        load_priority_,
         [this](const std::vector<std::shared_ptr<arrow::Table>>& tables,
                int64_t cid) {
             return load_group_chunk(
                 tables, static_cast<milvus::cachinglayer::cid_t>(cid));
-        });
+        },
+        FieldDataLoadBatchSplitTargetBytes(),
+        load_priority_,
+        GetStorageV3LoadAdmissionScheduler()));
 
     LOG_INFO(
-        "[StorageV2] translator {} submits {} batch tasks for manifest "
+        "[StorageV3] translator {} loaded {} cells for manifest "
         "column group {}",
         key_,
-        load_futures.size(),
+        loaded_cells.size(),
         column_group_index_);
 
-    // Pop loop — batch tasks finalize cells before pushing.
-    std::unordered_map<milvus::cachinglayer::cid_t,
-                       std::unique_ptr<milvus::GroupChunk>>
-        completed_cells;
-    completed_cells.reserve(cids.size());
-
-    try {
-        std::shared_ptr<milvus::segcore::CellLoadResult> cell_data;
-        while (channel->pop(cell_data)) {
-            try {
-                CheckCancellation(
-                    ctx, segment_id_, "ManifestGroupTranslatorV2::get_cells()");
-                AssertInfo(cell_data->chunk != nullptr,
-                           "[StorageV2] translator {} cell {} is not "
-                           "finalized by batch task",
-                           key_,
-                           cell_data->cid);
-                completed_cells[cell_data->cid] = std::move(cell_data->chunk);
-                milvus::segcore::ReleaseCellLoadResultBudget(cell_data);
-            } catch (...) {
-                milvus::segcore::ReleaseCellLoadResultBudget(cell_data);
-                throw;
-            }
-        }
-    } catch (...) {
-        // Drain the channel to unblock producers that may be stuck on push()
-        // to a full bounded channel. Without draining, producers block forever
-        // and their task_guard (which calls channel->close()) never executes.
-        std::shared_ptr<milvus::segcore::CellLoadResult> discard;
-        try {
-            while (channel->pop(discard)) {
-                milvus::segcore::ReleaseCellLoadResultBudget(discard);
-            }
-        } catch (...) {
-            LOG_WARN("drain channel exception swallowed");
-        }
-        try {
-            storage::WaitAllFutures(load_futures);
-        } catch (const std::exception& e) {
-            LOG_WARN(
-                "[StorageV2] translator {} cleanup ignored background load "
-                "exception after cancellation: {}",
-                key_,
-                e.what());
-        } catch (...) {
-            LOG_WARN(
-                "[StorageV2] translator {} cleanup ignored unknown background "
-                "load exception after cancellation",
-                key_);
-        }
-        throw;
-    }
-
-    storage::WaitAllFutures(load_futures);
-
-    for (auto cid : cids) {
-        auto it = completed_cells.find(cid);
-        AssertInfo(
-            it != completed_cells.end(),
-            fmt::format(
-                "[StorageV2] translator {} cell {} not loaded", key_, cid));
-        cells.emplace_back(cid, std::move(it->second));
+    for (auto& cell : loaded_cells) {
+        AssertInfo(cell.chunk != nullptr,
+                   "[StorageV3] translator {} cell {} is not finalized by "
+                   "async load pipeline",
+                   key_,
+                   cell.cid);
+        cells.emplace_back(cell.cid, std::move(cell.chunk));
     }
 
     return cells;

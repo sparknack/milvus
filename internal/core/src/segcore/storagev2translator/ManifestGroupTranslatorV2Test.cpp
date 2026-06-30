@@ -27,10 +27,12 @@
 #include "cachinglayer/Utils.h"
 #include "common/GroupChunk.h"
 #include "common/Schema.h"
+#include "folly/ScopeGuard.h"
 #include "gtest/gtest.h"
 #include "pb/common.pb.h"
 #include "segcore/storagev2translator/AsyncLoadPipeline.h"
 #include "segcore/storagev2translator/ManifestGroupTranslator.h"
+#include "storage/EntryStreamUtils.h"
 #include "test_utils/Constants.h"
 #include "test_utils/DataGen.h"
 #include "test_utils/ManifestTestUtil.h"
@@ -162,6 +164,32 @@ TEST_P(ManifestGroupTranslatorV2ParityTest,
         EXPECT_EQ(units[i].memory_size, meta->chunk_memory_size_[cid]);
         EXPECT_EQ(units[i].loading_overhead_size,
                   meta->chunk_memory_size_[cid] + 17);
+    }
+}
+
+TEST_P(ManifestGroupTranslatorV2ParityTest, LoadsCellsWithTinyAdmissionBudget) {
+    auto& budget =
+        milvus::storage::TransientMemoryBudget::GetLoadTransientBudget();
+    auto old_capacity = budget.CapacityBytes();
+    auto restore_budget = folly::makeGuard(
+        [&budget, old_capacity]() { budget.SetCapacityBytes(old_capacity); });
+    budget.SetCapacityBytes(1);
+
+    auto use_mmap = GetParam();
+    auto v2 = MakeV2Translator(/*cg_index=*/0, use_mmap);
+    ASSERT_GT(v2->num_cells(), 0);
+
+    std::vector<cachinglayer::cid_t> cids;
+    for (size_t i = 0; i < v2->num_cells(); ++i) {
+        cids.push_back(static_cast<cachinglayer::cid_t>(i));
+    }
+
+    auto cells = v2->get_cells(nullptr, cids);
+
+    ASSERT_EQ(cells.size(), cids.size());
+    for (size_t i = 0; i < cells.size(); ++i) {
+        EXPECT_EQ(cells[i].first, cids[i]);
+        EXPECT_NE(cells[i].second, nullptr);
     }
 }
 
