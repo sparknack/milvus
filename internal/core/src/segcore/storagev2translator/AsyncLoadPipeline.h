@@ -155,6 +155,9 @@ class StorageV3AdmissionScheduler {
  public:
     explicit StorageV3AdmissionScheduler(StorageV3AdmissionConfig config);
 
+    void
+    UpdateConfig(StorageV3AdmissionConfig config);
+
     folly::SemiFuture<StorageV3LoadBudgetLease>
     Admit(milvus::proto::common::LoadPriority priority, size_t bytes);
 
@@ -188,6 +191,12 @@ class StorageV3AdmissionScheduler {
     std::deque<PendingAdmission> low_pending_;
     mutable std::mutex mutex_;
 };
+
+StorageV3AdmissionConfig
+StorageV3AdmissionConfigFromLoadBudget();
+
+StorageV3AdmissionScheduler&
+GetStorageV3LoadAdmissionScheduler();
 
 folly::coro::Task<StorageV3LoadedCells>
 LoadStorageV3CellsAsync(milvus::OpContext* op_ctx,

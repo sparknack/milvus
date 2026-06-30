@@ -25,6 +25,7 @@
 #include "folly/coro/Collect.h"
 #include "folly/coro/FutureUtil.h"
 #include "segcore/Utils.h"
+#include "storage/EntryStreamUtils.h"
 
 namespace milvus::segcore::storagev2translator {
 
@@ -320,6 +321,15 @@ StorageV3AdmissionScheduler::StorageV3AdmissionScheduler(
         std::min(config_.high_reserved_bytes, config_.total_bytes);
 }
 
+void
+StorageV3AdmissionScheduler::UpdateConfig(StorageV3AdmissionConfig config) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    config.high_reserved_bytes =
+        std::min(config.high_reserved_bytes, config.total_bytes);
+    config_ = config;
+    TryScheduleLocked();
+}
+
 folly::SemiFuture<StorageV3LoadBudgetLease>
 StorageV3AdmissionScheduler::Admit(milvus::proto::common::LoadPriority priority,
                                    size_t bytes) {
@@ -374,8 +384,15 @@ StorageV3AdmissionScheduler::TryScheduleLocked() {
 bool
 StorageV3AdmissionScheduler::CanAdmitLocked(
     milvus::proto::common::LoadPriority priority, size_t bytes) const {
+    if (config_.total_bytes == 0) {
+        return true;
+    }
+
     auto used_total = used_high_bytes_ + used_low_bytes_;
-    if (bytes > config_.total_bytes || used_total > config_.total_bytes ||
+    if (bytes > config_.total_bytes) {
+        return used_total == 0;
+    }
+    if (used_total > config_.total_bytes ||
         bytes > config_.total_bytes - used_total) {
         return false;
     }
@@ -385,6 +402,10 @@ StorageV3AdmissionScheduler::CanAdmitLocked(
     }
 
     auto low_capacity = config_.total_bytes - config_.high_reserved_bytes;
+    if (bytes > low_capacity) {
+        return used_total == 0;
+    }
+
     return used_low_bytes_ <= low_capacity &&
            bytes <= low_capacity - used_low_bytes_;
 }
@@ -397,6 +418,24 @@ StorageV3AdmissionScheduler::MarkAdmittedLocked(
         return;
     }
     used_low_bytes_ += bytes;
+}
+
+StorageV3AdmissionConfig
+StorageV3AdmissionConfigFromLoadBudget() {
+    auto total_bytes =
+        milvus::storage::TransientMemoryBudget::GetLoadTransientBudget()
+            .CapacityBytes();
+    auto high_reserved_bytes =
+        total_bytes == 0 ? size_t{0} : std::max<size_t>(1, total_bytes / 4);
+    return {total_bytes, high_reserved_bytes};
+}
+
+StorageV3AdmissionScheduler&
+GetStorageV3LoadAdmissionScheduler() {
+    static StorageV3AdmissionScheduler scheduler(
+        StorageV3AdmissionConfigFromLoadBudget());
+    scheduler.UpdateConfig(StorageV3AdmissionConfigFromLoadBudget());
+    return scheduler;
 }
 
 folly::coro::Task<int>

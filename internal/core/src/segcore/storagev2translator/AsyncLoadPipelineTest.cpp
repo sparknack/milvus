@@ -274,3 +274,47 @@ TEST(ManifestGroupTranslatorAsyncPipelineTest,
     low_lease.Release();
     EXPECT_TRUE(low_waiting.isReady());
 }
+
+TEST(ManifestGroupTranslatorAsyncPipelineTest,
+     AdmissionTreatsZeroCapacityAsUnlimited) {
+    StorageV3AdmissionScheduler scheduler(
+        {/*total_bytes=*/0, /*high_reserved_bytes=*/0});
+
+    auto high = scheduler.Admit(LoadPriority::HIGH, 100);
+    auto low = scheduler.Admit(LoadPriority::LOW, 100);
+
+    EXPECT_TRUE(high.isReady());
+    EXPECT_TRUE(low.isReady());
+}
+
+TEST(ManifestGroupTranslatorAsyncPipelineTest,
+     AdmissionAllowsOversizedBatchToRunExclusivelyWhenIdle) {
+    StorageV3AdmissionScheduler scheduler(
+        {/*total_bytes=*/10, /*high_reserved_bytes=*/4});
+
+    auto oversized_low = scheduler.Admit(LoadPriority::LOW, 11);
+    ASSERT_TRUE(oversized_low.isReady());
+    auto oversized_lease = std::move(oversized_low).get();
+
+    auto high_waiting = scheduler.Admit(LoadPriority::HIGH, 1);
+    EXPECT_FALSE(high_waiting.isReady());
+
+    oversized_lease.Release();
+    EXPECT_TRUE(high_waiting.isReady());
+}
+
+TEST(ManifestGroupTranslatorAsyncPipelineTest,
+     AdmissionUpdateConfigWakesPendingRequest) {
+    StorageV3AdmissionScheduler scheduler(
+        {/*total_bytes=*/1, /*high_reserved_bytes=*/0});
+
+    auto running = scheduler.Admit(LoadPriority::HIGH, 1);
+    ASSERT_TRUE(running.isReady());
+    auto running_lease = std::move(running).get();
+
+    auto waiting = scheduler.Admit(LoadPriority::HIGH, 1);
+    EXPECT_FALSE(waiting.isReady());
+
+    scheduler.UpdateConfig({/*total_bytes=*/2, /*high_reserved_bytes=*/0});
+    EXPECT_TRUE(waiting.isReady());
+}
