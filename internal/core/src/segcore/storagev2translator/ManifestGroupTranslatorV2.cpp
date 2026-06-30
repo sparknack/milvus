@@ -276,6 +276,9 @@ ManifestGroupTranslatorV2::get_cells(
                           std::unique_ptr<milvus::GroupChunk>>>
         cells;
     cells.reserve(cids.size());
+    if (cids.empty()) {
+        return cells;
+    }
 
     auto max_cid = *std::max_element(cids.begin(), cids.end());
     if (max_cid >= meta_.chunk_memory_size_.size()) {

@@ -193,6 +193,15 @@ TEST_P(ManifestGroupTranslatorV2ParityTest, LoadsCellsWithTinyAdmissionBudget) {
     }
 }
 
+TEST_P(ManifestGroupTranslatorV2ParityTest, ReturnsEmptyForEmptyCellRequest) {
+    auto use_mmap = GetParam();
+    auto v2 = MakeV2Translator(/*cg_index=*/0, use_mmap);
+
+    auto cells = v2->get_cells(nullptr, {});
+
+    EXPECT_TRUE(cells.empty());
+}
+
 INSTANTIATE_TEST_SUITE_P(ManifestGroupTranslatorV2,
                          ManifestGroupTranslatorV2ParityTest,
                          testing::Bool());
