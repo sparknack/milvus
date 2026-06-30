@@ -400,6 +400,9 @@ StorageV3AdmissionScheduler::CanAdmitLocked(
     if (IsHighPriority(priority)) {
         return true;
     }
+    if (!high_pending_.empty()) {
+        return false;
+    }
 
     auto low_capacity = config_.total_bytes - config_.high_reserved_bytes;
     if (bytes > low_capacity) {

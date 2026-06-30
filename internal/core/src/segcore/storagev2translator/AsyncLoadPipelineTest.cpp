@@ -254,6 +254,32 @@ TEST(ManifestGroupTranslatorAsyncPipelineTest,
 }
 
 TEST(ManifestGroupTranslatorAsyncPipelineTest,
+     AdmissionDoesNotLetNewLowBypassQueuedHigh) {
+    StorageV3AdmissionScheduler scheduler(
+        {/*total_bytes=*/2, /*high_reserved_bytes=*/0});
+
+    auto low_running = scheduler.Admit(LoadPriority::LOW, 1);
+    ASSERT_TRUE(low_running.isReady());
+    auto low_lease = std::move(low_running).get();
+
+    auto high_waiting = scheduler.Admit(LoadPriority::HIGH, 2);
+    EXPECT_FALSE(high_waiting.isReady());
+
+    auto low_waiting = scheduler.Admit(LoadPriority::LOW, 1);
+    EXPECT_FALSE(low_waiting.isReady());
+
+    low_lease.Release();
+    EXPECT_TRUE(high_waiting.isReady());
+    EXPECT_FALSE(low_waiting.isReady());
+
+    auto high_lease = std::move(high_waiting).get();
+    high_lease.Release();
+    EXPECT_TRUE(low_waiting.isReady());
+    auto low_waiting_lease = std::move(low_waiting).get();
+    low_waiting_lease.Release();
+}
+
+TEST(ManifestGroupTranslatorAsyncPipelineTest,
      AdmissionDoesNotLetLowBorrowHighReservedBytes) {
     StorageV3AdmissionScheduler scheduler(
         {/*total_bytes=*/2, /*high_reserved_bytes=*/1});
