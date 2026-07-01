@@ -27,6 +27,8 @@
 #include "common/EasyAssert.h"
 #include "folly/coro/Collect.h"
 #include "folly/coro/FutureUtil.h"
+#include "folly/executors/CPUThreadPoolExecutor.h"
+#include "folly/executors/thread_factory/NamedThreadFactory.h"
 #include "segcore/Utils.h"
 #include "storage/EntryStreamUtils.h"
 
@@ -111,7 +113,120 @@ StorageV3HighPriorityExecutor() {
     return &executor;
 }
 
+class StorageV3DiskArrowExecutor final : public arrow::internal::Executor {
+ public:
+    StorageV3DiskArrowExecutor()
+        : thread_count_(std::max(1, milvus::CPU_NUM)),
+          executor_(
+              thread_count_,
+              std::make_shared<folly::NamedThreadFactory>("STORAGEV3_DISK_")) {
+    }
+
+    int
+    GetCapacity() override {
+        return static_cast<int>(thread_count_);
+    }
+
+    bool
+    OwnsThisThread() override {
+        return current_executor_ == this;
+    }
+
+ protected:
+    arrow::Status
+    SpawnReal(arrow::internal::TaskHints,
+              arrow::internal::FnOnce<void()> task,
+              arrow::StopToken stop_token,
+              StopCallback&& stop_callback) override {
+        auto task_ptr =
+            std::make_shared<arrow::internal::FnOnce<void()>>(std::move(task));
+        auto stop_callback_ptr =
+            std::make_shared<StopCallback>(std::move(stop_callback));
+        try {
+            executor_.add([this,
+                           task_ptr,
+                           stop_token = std::move(stop_token),
+                           stop_callback_ptr]() mutable {
+                if (stop_token.IsStopRequested()) {
+                    if (*stop_callback_ptr) {
+                        std::move (*stop_callback_ptr)(stop_token.Poll());
+                    }
+                    return;
+                }
+                auto* previous_executor = current_executor_;
+                current_executor_ = this;
+                try {
+                    std::move (*task_ptr)();
+                } catch (...) {
+                    current_executor_ = previous_executor;
+                    throw;
+                }
+                current_executor_ = previous_executor;
+            });
+        } catch (const std::exception& e) {
+            return arrow::Status::IOError(e.what());
+        } catch (...) {
+            return arrow::Status::IOError(
+                "failed to submit task to StorageV3 disk executor");
+        }
+        return arrow::Status::OK();
+    }
+
+ private:
+    size_t thread_count_;
+    folly::CPUThreadPoolExecutor executor_;
+    static thread_local StorageV3DiskArrowExecutor* current_executor_;
+};
+
+thread_local StorageV3DiskArrowExecutor*
+    StorageV3DiskArrowExecutor::current_executor_ = nullptr;
+
+template <typename Result, typename Func>
+folly::SemiFuture<Result>
+SubmitStorageV3ArrowExecutorTask(arrow::internal::Executor* executor,
+                                 Func&& func) {
+    if (executor == nullptr) {
+        return folly::makeSemiFuture(
+            Result(arrow::Status::Invalid("StorageV3 executor is null")));
+    }
+
+    using TaskFunc = std::decay_t<Func>;
+    auto task = std::make_shared<TaskFunc>(std::forward<Func>(func));
+
+    if (executor->OwnsThisThread()) {
+        try {
+            return folly::makeSemiFuture(std::invoke(*task));
+        } catch (...) {
+            return folly::makeSemiFuture<Result>(
+                folly::exception_wrapper(std::current_exception()));
+        }
+    }
+
+    folly::Promise<Result> promise;
+    auto future = promise.getSemiFuture();
+    auto shared_promise =
+        std::make_shared<folly::Promise<Result>>(std::move(promise));
+    auto status = executor->Spawn([shared_promise, task]() mutable {
+        try {
+            shared_promise->setValue(std::invoke(*task));
+        } catch (...) {
+            shared_promise->setException(
+                folly::exception_wrapper(std::current_exception()));
+        }
+    });
+    if (!status.ok()) {
+        shared_promise->setValue(Result(std::move(status)));
+    }
+    return future;
+}
+
 }  // namespace
+
+arrow::internal::Executor*
+StorageV3DiskExecutor() {
+    static StorageV3DiskArrowExecutor executor;
+    return &executor;
+}
 
 std::vector<StorageV3ReadTask>
 BuildStorageV3ReadTasks(std::vector<StorageV3LoadUnit> units,
@@ -299,11 +414,14 @@ BuildStorageV3LoadUnitsForCells(
 StorageV3AsyncLoadFn
 MakeStorageV3ChunkLoadFn(
     std::shared_ptr<milvus_storage::api::ChunkReader> chunk_reader,
-    milvus::segcore::CellFinalizeFunc finalize_cell) {
+    milvus::segcore::CellFinalizeFunc finalize_cell,
+    StorageV3LocalizeExecutor localize_executor) {
     auto shared_finalizer = std::make_shared<milvus::segcore::CellFinalizeFunc>(
         std::move(finalize_cell));
-    return [chunk_reader = std::move(chunk_reader), shared_finalizer](
-               milvus::OpContext* op_ctx, StorageV3ReadTask task)
+    return [chunk_reader = std::move(chunk_reader),
+            shared_finalizer,
+            localize_executor](milvus::OpContext* op_ctx,
+                               StorageV3ReadTask task)
                -> folly::SemiFuture<StorageV3LoadResult> {
         constexpr const char* cancellation_scope = "LoadStorageV3CellsAsync";
         std::vector<int64_t> rg_indices(task.rg_count);
@@ -314,19 +432,56 @@ MakeStorageV3ChunkLoadFn(
         options.materialize_executor = StorageV3HighPriorityExecutor();
 
         try {
-            return milvus_storage::api::get_chunks_async_then(
-                chunk_reader,
-                std::move(rg_indices),
-                options,
-                [op_ctx, task = std::move(task), shared_finalizer](
-                    milvus_storage::api::RecordBatchVector&& batches) mutable
-                -> StorageV3LoadResult {
-                    return FinalizeStorageV3ReadTask(op_ctx,
-                                                     std::move(task),
-                                                     std::move(batches),
-                                                     shared_finalizer,
-                                                     cancellation_scope);
-                });
+            if (localize_executor == StorageV3LocalizeExecutor::Materialize) {
+                return milvus_storage::api::get_chunks_async_then(
+                    chunk_reader,
+                    std::move(rg_indices),
+                    options,
+                    [op_ctx, task = std::move(task), shared_finalizer](
+                        milvus_storage::api::RecordBatchVector&&
+                            batches) mutable -> StorageV3LoadResult {
+                        return FinalizeStorageV3ReadTask(op_ctx,
+                                                         std::move(task),
+                                                         std::move(batches),
+                                                         shared_finalizer,
+                                                         cancellation_scope);
+                    });
+            }
+
+            auto read_future =
+                chunk_reader->get_chunks_async(std::move(rg_indices), options);
+            return std::move(read_future)
+                .deferValue(
+                    [chunk_reader,
+                     op_ctx,
+                     task = std::move(task),
+                     shared_finalizer](
+                        arrow::Result<milvus_storage::api::RecordBatchVector>&&
+                            read_result) mutable
+                    -> folly::SemiFuture<StorageV3LoadResult> {
+                        (void)chunk_reader;
+                        if (!read_result.ok()) {
+                            return folly::makeSemiFuture(
+                                StorageV3LoadResult(read_result.status()));
+                        }
+
+                        auto batches = read_result.MoveValueUnsafe();
+                        return SubmitStorageV3ArrowExecutorTask<
+                            StorageV3LoadResult>(
+                            StorageV3DiskExecutor(),
+                            [op_ctx,
+                             task = std::move(task),
+                             batches = std::move(batches),
+                             shared_finalizer]() mutable
+                            -> StorageV3LoadResult {
+                                return FinalizeStorageV3ReadTask(
+                                    op_ctx,
+                                    std::move(task),
+                                    std::move(batches),
+                                    shared_finalizer,
+                                    cancellation_scope);
+                            });
+                    });
         } catch (...) {
             return folly::makeSemiFuture<StorageV3LoadResult>(
                 folly::exception_wrapper(std::current_exception()));

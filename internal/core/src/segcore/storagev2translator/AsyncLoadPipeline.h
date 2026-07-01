@@ -43,6 +43,10 @@
 #include <folly/futures/Future.h>
 #include <folly/futures/Promise.h>
 
+namespace arrow::internal {
+class Executor;
+}  // namespace arrow::internal
+
 namespace milvus::segcore::storagev2translator {
 
 struct StorageV3LoadUnit {
@@ -89,10 +93,20 @@ using StorageV3AsyncLoadFn =
     std::function<folly::SemiFuture<StorageV3LoadResult>(
         milvus::OpContext* op_ctx, StorageV3ReadTask task)>;
 
+enum class StorageV3LocalizeExecutor {
+    Materialize,
+    Disk,
+};
+
+arrow::internal::Executor*
+StorageV3DiskExecutor();
+
 StorageV3AsyncLoadFn
 MakeStorageV3ChunkLoadFn(
     std::shared_ptr<milvus_storage::api::ChunkReader> chunk_reader,
-    milvus::segcore::CellFinalizeFunc finalize_cell);
+    milvus::segcore::CellFinalizeFunc finalize_cell,
+    StorageV3LocalizeExecutor localize_executor =
+        StorageV3LocalizeExecutor::Materialize);
 
 template <typename Func>
 auto

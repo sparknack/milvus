@@ -441,6 +441,7 @@ TEST(ManifestGroupTranslatorAsyncPipelineTest,
                 finalizer_on_materialize_executor.store(
                     executor->OwnsThisThread());
             }
+            EXPECT_FALSE(StorageV3DiskExecutor()->OwnsThisThread());
             return std::make_unique<milvus::GroupChunk>();
         };
     auto load = MakeStorageV3ChunkLoadFn(reader, std::move(finalizer));
@@ -470,6 +471,84 @@ TEST(ManifestGroupTranslatorAsyncPipelineTest,
     EXPECT_EQ(cells[0].cid, 0);
     EXPECT_NE(cells[0].chunk, nullptr);
     EXPECT_TRUE(finalizer_on_materialize_executor.load());
+}
+
+TEST(ManifestGroupTranslatorAsyncPipelineTest,
+     MmapLoadCellsAsyncFinalizesOnDiskExecutorThread) {
+    constexpr int64_t MB = 1 << 20;
+    std::vector<StorageV3LoadUnit> units = {
+        {/*cid=*/0,
+         /*rg_offset=*/0,
+         /*rg_count=*/1,
+         /*memory_size=*/16 * MB,
+         /*loading_overhead_size=*/16 * MB},
+    };
+
+    folly::Promise<arrow::Result<milvus_storage::api::RecordBatchVector>>
+        read_promise;
+    auto read_future = read_promise.getSemiFuture();
+    std::promise<void> read_started;
+    std::atomic<arrow::internal::Executor*> materialize_executor{nullptr};
+    std::atomic<bool> finalizer_on_materialize_executor{true};
+    std::atomic<bool> finalizer_on_disk_executor{false};
+
+    auto reader = std::make_shared<AsyncTestChunkReader>(
+        [&](const std::vector<int64_t>& chunk_indices,
+            const milvus_storage::api::AsyncReadOptions& options)
+            -> folly::SemiFuture<
+                arrow::Result<milvus_storage::api::RecordBatchVector>> {
+            EXPECT_EQ(chunk_indices, std::vector<int64_t>({0}));
+            EXPECT_NE(options.materialize_executor, nullptr);
+            EXPECT_NE(options.materialize_executor,
+                      arrow::internal::GetCpuThreadPool());
+            materialize_executor.store(options.materialize_executor);
+            read_started.set_value();
+            return std::move(read_future);
+        });
+    auto finalizer =
+        [&](const std::vector<std::shared_ptr<arrow::Table>>& tables,
+            int64_t cid) {
+            EXPECT_EQ(cid, 0);
+            EXPECT_EQ(tables.size(), 1);
+            auto* executor = materialize_executor.load();
+            EXPECT_NE(executor, nullptr);
+            if (executor != nullptr) {
+                finalizer_on_materialize_executor.store(
+                    executor->OwnsThisThread());
+            }
+            finalizer_on_disk_executor.store(
+                StorageV3DiskExecutor()->OwnsThisThread());
+            return std::make_unique<milvus::GroupChunk>();
+        };
+    auto load = MakeStorageV3ChunkLoadFn(
+        reader, std::move(finalizer), StorageV3LocalizeExecutor::Disk);
+    StorageV3AdmissionScheduler scheduler(
+        {/*total_bytes=*/64 * MB, /*high_reserved_bytes=*/0});
+
+    auto result = std::async(std::launch::async, [&] {
+        return folly::coro::blockingWait(
+            LoadStorageV3CellsAsync(nullptr,
+                                    std::move(units),
+                                    std::move(load),
+                                    16 * MB,
+                                    LoadPriority::HIGH,
+                                    scheduler));
+    });
+
+    ASSERT_EQ(read_started.get_future().wait_for(5s),
+              std::future_status::ready);
+    auto completer = std::async(std::launch::async, [&] {
+        read_promise.setValue(MakeEmptyRecordBatchesForTest(1));
+    });
+    ASSERT_EQ(completer.wait_for(5s), std::future_status::ready);
+    completer.get();
+
+    auto cells = result.get();
+    ASSERT_EQ(cells.size(), 1);
+    EXPECT_EQ(cells[0].cid, 0);
+    EXPECT_NE(cells[0].chunk, nullptr);
+    EXPECT_FALSE(finalizer_on_materialize_executor.load());
+    EXPECT_TRUE(finalizer_on_disk_executor.load());
 }
 
 TEST(ManifestGroupTranslatorAsyncPipelineTest,

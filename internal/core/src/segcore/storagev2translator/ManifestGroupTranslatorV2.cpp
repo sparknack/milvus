@@ -301,7 +301,9 @@ ManifestGroupTranslatorV2::get_cells(
                int64_t cid) {
             return load_group_chunk(
                 tables, static_cast<milvus::cachinglayer::cid_t>(cid));
-        });
+        },
+        use_mmap_ ? StorageV3LocalizeExecutor::Disk
+                  : StorageV3LocalizeExecutor::Materialize);
 
     auto loaded_cells = folly::coro::blockingWait(
         LoadStorageV3CellsAsync(ctx,
