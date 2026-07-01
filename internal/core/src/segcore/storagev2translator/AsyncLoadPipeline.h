@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "arrow/result.h"
 #include "arrow/table.h"
 #include "cachinglayer/Utils.h"
 #include "common/GroupChunk.h"
@@ -65,6 +66,7 @@ struct StorageV3LoadedCell {
 };
 
 using StorageV3LoadedCells = std::vector<StorageV3LoadedCell>;
+using StorageV3LoadedCellsPtr = std::shared_ptr<StorageV3LoadedCells>;
 
 std::vector<StorageV3ReadTask>
 BuildStorageV3ReadTasks(std::vector<StorageV3LoadUnit> units,
@@ -81,16 +83,16 @@ BuildStorageV3LoadUnitsForCells(
     const std::vector<milvus::cachinglayer::cid_t>& cids,
     const StorageV3LoadingOverheadFunc& loading_overhead_bytes);
 
-using StorageV3ReadResult =
-    arrow::Result<std::vector<std::shared_ptr<arrow::Table>>>;
+using StorageV3LoadResult = arrow::Result<StorageV3LoadedCellsPtr>;
 
-using StorageV3AsyncReadFn =
-    std::function<folly::SemiFuture<StorageV3ReadResult>(int64_t rg_offset,
-                                                         int64_t rg_count)>;
+using StorageV3AsyncLoadFn =
+    std::function<folly::SemiFuture<StorageV3LoadResult>(
+        milvus::OpContext* op_ctx, StorageV3ReadTask task)>;
 
-StorageV3AsyncReadFn
-MakeStorageV3ChunkReadFn(
-    std::shared_ptr<milvus_storage::api::ChunkReader> chunk_reader);
+StorageV3AsyncLoadFn
+MakeStorageV3ChunkLoadFn(
+    std::shared_ptr<milvus_storage::api::ChunkReader> chunk_reader,
+    milvus::segcore::CellFinalizeFunc finalize_cell);
 
 template <typename Func>
 auto
@@ -186,8 +188,11 @@ class StorageV3AdmissionScheduler {
     void
     Release(milvus::proto::common::LoadPriority priority, size_t bytes);
 
+    std::vector<PendingAdmission>
+    TakeAdmittedLocked();
+
     void
-    TryScheduleLocked();
+    FulfillAdmissions(std::vector<PendingAdmission> admissions);
 
     bool
     CanAdmitLocked(milvus::proto::common::LoadPriority priority,
@@ -214,8 +219,7 @@ GetStorageV3LoadAdmissionScheduler();
 folly::coro::Task<StorageV3LoadedCells>
 LoadStorageV3CellsAsync(milvus::OpContext* op_ctx,
                         std::vector<StorageV3LoadUnit> units,
-                        StorageV3AsyncReadFn read,
-                        milvus::segcore::CellFinalizeFunc finalize_cell,
+                        StorageV3AsyncLoadFn load,
                         int64_t read_task_target_bytes,
                         milvus::proto::common::LoadPriority priority,
                         StorageV3AdmissionScheduler& scheduler);

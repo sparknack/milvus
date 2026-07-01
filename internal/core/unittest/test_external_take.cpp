@@ -194,11 +194,11 @@ class MockTakeReader : public milvus_storage::api::Reader {
 
     folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>>
     take_async(const std::vector<int64_t>& row_indices,
-               size_t parallelism,
+               const milvus_storage::api::AsyncReadOptions& options,
                const std::shared_ptr<std::vector<std::string>>& needed_columns)
         override {
         return folly::makeSemiFuture(
-            take(row_indices, parallelism, needed_columns));
+            take(row_indices, options.read_parallelism, needed_columns));
     }
 
     void
@@ -1058,11 +1058,11 @@ class ErrorMockTakeReader : public milvus_storage::api::Reader {
     }
     folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>>
     take_async(const std::vector<int64_t>& row_indices,
-               size_t parallelism,
+               const milvus_storage::api::AsyncReadOptions& options,
                const std::shared_ptr<std::vector<std::string>>& needed_columns)
         override {
         return folly::makeSemiFuture(
-            take(row_indices, parallelism, needed_columns));
+            take(row_indices, options.read_parallelism, needed_columns));
     }
     void
     set_keyretriever(

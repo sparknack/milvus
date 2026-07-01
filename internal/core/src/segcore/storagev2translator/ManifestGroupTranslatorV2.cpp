@@ -295,20 +295,21 @@ ManifestGroupTranslatorV2::get_cells(
             return loading_overhead_bytes(memory_size);
         });
 
-    auto read = MakeStorageV3ChunkReadFn(chunk_reader_);
-
-    auto loaded_cells = folly::coro::blockingWait(LoadStorageV3CellsAsync(
-        ctx,
-        std::move(load_units),
-        std::move(read),
+    auto load = MakeStorageV3ChunkLoadFn(
+        chunk_reader_,
         [this](const std::vector<std::shared_ptr<arrow::Table>>& tables,
                int64_t cid) {
             return load_group_chunk(
                 tables, static_cast<milvus::cachinglayer::cid_t>(cid));
-        },
-        FieldDataReadWindowBytes(),
-        load_priority_,
-        GetStorageV3LoadAdmissionScheduler()));
+        });
+
+    auto loaded_cells = folly::coro::blockingWait(
+        LoadStorageV3CellsAsync(ctx,
+                                std::move(load_units),
+                                std::move(load),
+                                FieldDataReadWindowBytes(),
+                                load_priority_,
+                                GetStorageV3LoadAdmissionScheduler()));
 
     LOG_INFO(
         "[StorageV3] translator {} loaded {} cells for manifest "

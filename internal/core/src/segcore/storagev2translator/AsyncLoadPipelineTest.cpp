@@ -20,6 +20,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -28,10 +29,12 @@
 #include <utility>
 #include <vector>
 
+#include "arrow/util/thread_pool.h"
 #include "folly/coro/BlockingWait.h"
 #include "folly/coro/FutureUtil.h"
 #include "gtest/gtest.h"
 #include "common/GroupChunk.h"
+#include "milvus-storage/async_read_options.h"
 #include "pb/common.pb.h"
 
 using namespace milvus::segcore::storagev2translator;
@@ -46,6 +49,79 @@ AwaitSubmittedLoadTaskForTest() {
         SubmitStorageV3LoadTask(LoadPriority::HIGH, [] { return 41; }));
     co_return value + 1;
 }
+
+std::shared_ptr<arrow::RecordBatch>
+MakeEmptyRecordBatchForTest() {
+    return arrow::RecordBatch::Make(
+        std::make_shared<arrow::Schema>(
+            std::vector<std::shared_ptr<arrow::Field>>{}),
+        0,
+        std::vector<std::shared_ptr<arrow::Array>>{});
+}
+
+std::vector<std::shared_ptr<arrow::RecordBatch>>
+MakeEmptyRecordBatchesForTest(size_t count) {
+    std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
+    batches.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        batches.push_back(MakeEmptyRecordBatchForTest());
+    }
+    return batches;
+}
+
+class AsyncTestChunkReader final : public milvus_storage::api::ChunkReader {
+ public:
+    using ReadImpl = std::function<folly::SemiFuture<
+        arrow::Result<milvus_storage::api::RecordBatchVector>>(
+        const std::vector<int64_t>&,
+        const milvus_storage::api::AsyncReadOptions&)>;
+
+    explicit AsyncTestChunkReader(ReadImpl read_impl, size_t chunk_count = 1024)
+        : read_impl_(std::move(read_impl)), chunk_count_(chunk_count) {
+    }
+
+    size_t
+    total_number_of_chunks() const override {
+        return chunk_count_;
+    }
+
+    arrow::Result<std::vector<int64_t>>
+    get_chunk_indices(const std::vector<int64_t>& row_indices) override {
+        return row_indices;
+    }
+
+    arrow::Result<std::shared_ptr<arrow::RecordBatch>>
+    get_chunk(int64_t) override {
+        return MakeEmptyRecordBatchForTest();
+    }
+
+    arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>>
+    get_chunks(const std::vector<int64_t>& chunk_indices,
+               size_t /*parallelism*/) override {
+        return MakeEmptyRecordBatchesForTest(chunk_indices.size());
+    }
+
+    folly::SemiFuture<arrow::Result<milvus_storage::api::RecordBatchVector>>
+    get_chunks_async(
+        const std::vector<int64_t>& chunk_indices,
+        const milvus_storage::api::AsyncReadOptions& options) override {
+        return read_impl_(chunk_indices, options);
+    }
+
+    arrow::Result<std::vector<uint64_t>>
+    get_chunk_size() override {
+        return std::vector<uint64_t>(chunk_count_, 1);
+    }
+
+    arrow::Result<std::vector<uint64_t>>
+    get_chunk_rows() override {
+        return std::vector<uint64_t>(chunk_count_, 1);
+    }
+
+ private:
+    ReadImpl read_impl_;
+    size_t chunk_count_;
+};
 
 }  // namespace
 
@@ -113,6 +189,29 @@ TEST(ManifestGroupTranslatorAsyncPipelineTest,
     existing_lease.Release();
     EXPECT_EQ(result.get(), 42);
     EXPECT_TRUE(task_started.load());
+}
+
+TEST(ManifestGroupTranslatorAsyncPipelineTest,
+     AdmissionFulfillsPendingRequestsOutsideSchedulerLock) {
+    StorageV3AdmissionScheduler scheduler(
+        {/*total_bytes=*/1, /*high_reserved_bytes=*/0});
+    auto running = scheduler.Admit(LoadPriority::HIGH, 1);
+    ASSERT_TRUE(running.isReady());
+    auto running_lease = std::move(running).get();
+
+    auto waiting =
+        scheduler.Admit(LoadPriority::HIGH, 1)
+            .deferValue([](StorageV3LoadBudgetLease&& admitted_lease) {
+                admitted_lease.Release();
+                return 7;
+            });
+    EXPECT_FALSE(waiting.isReady());
+
+    auto release =
+        std::async(std::launch::async, [&] { running_lease.Release(); });
+    ASSERT_EQ(release.wait_for(5s), std::future_status::ready);
+    release.get();
+    EXPECT_EQ(std::move(waiting).get(), 7);
 }
 
 TEST(ManifestGroupTranslatorAsyncPipelineTest,
@@ -192,33 +291,30 @@ TEST(ManifestGroupTranslatorAsyncPipelineTest,
     std::mutex reads_mutex;
     std::vector<int64_t> finalized_cids;
     std::mutex finalized_cids_mutex;
-    StorageV3AsyncReadFn reader =
-        [&](int64_t rg_offset,
-            int64_t rg_count) -> folly::SemiFuture<StorageV3ReadResult> {
+    StorageV3AsyncLoadFn load =
+        [&](milvus::OpContext*,
+            StorageV3ReadTask task) -> folly::SemiFuture<StorageV3LoadResult> {
         {
             std::lock_guard<std::mutex> lock(reads_mutex);
-            reads.emplace_back(rg_offset, rg_count);
+            reads.emplace_back(task.rg_offset, task.rg_count);
         }
-        return folly::makeSemiFuture(
-            StorageV3ReadResult(std::vector<std::shared_ptr<arrow::Table>>(
-                static_cast<size_t>(rg_count))));
-    };
-    auto finalizer =
-        [&](const std::vector<std::shared_ptr<arrow::Table>>& tables,
-            int64_t cid) {
+        auto loaded_cells = std::make_shared<StorageV3LoadedCells>();
+        loaded_cells->reserve(task.units.size());
+        for (const auto& unit : task.units) {
             std::lock_guard<std::mutex> lock(finalized_cids_mutex);
-            finalized_cids.push_back(cid);
-            EXPECT_EQ(tables.size(), 1);
-            return std::make_unique<milvus::GroupChunk>();
-        };
+            finalized_cids.push_back(unit.cid);
+            loaded_cells->push_back(
+                {unit.cid, std::make_unique<milvus::GroupChunk>()});
+        }
+        return folly::makeSemiFuture(StorageV3LoadResult(loaded_cells));
+    };
     StorageV3AdmissionScheduler scheduler(
         {/*total_bytes=*/64 * MB, /*high_reserved_bytes=*/0});
 
     auto cells =
         folly::coro::blockingWait(LoadStorageV3CellsAsync(nullptr,
                                                           std::move(units),
-                                                          std::move(reader),
-                                                          std::move(finalizer),
+                                                          std::move(load),
                                                           16 * MB,
                                                           LoadPriority::HIGH,
                                                           scheduler));
@@ -249,18 +345,24 @@ TEST(ManifestGroupTranslatorAsyncPipelineTest,
          /*loading_overhead_size=*/16 * MB},
     };
 
-    using TablesResult =
-        arrow::Result<std::vector<std::shared_ptr<arrow::Table>>>;
-    folly::Promise<TablesResult> read_promise;
+    folly::Promise<arrow::Result<milvus_storage::api::RecordBatchVector>>
+        read_promise;
     auto read_future = read_promise.getSemiFuture();
     std::promise<void> read_started;
     std::atomic<int> finalize_calls{0};
 
-    StorageV3AsyncReadFn read =
-        [&](int64_t, int64_t) -> folly::SemiFuture<TablesResult> {
-        read_started.set_value();
-        return std::move(read_future);
-    };
+    auto reader = std::make_shared<AsyncTestChunkReader>(
+        [&](const std::vector<int64_t>& chunk_indices,
+            const milvus_storage::api::AsyncReadOptions& options)
+            -> folly::SemiFuture<
+                arrow::Result<milvus_storage::api::RecordBatchVector>> {
+            EXPECT_EQ(chunk_indices, std::vector<int64_t>({0}));
+            EXPECT_NE(options.materialize_executor, nullptr);
+            EXPECT_NE(options.materialize_executor,
+                      arrow::internal::GetCpuThreadPool());
+            read_started.set_value();
+            return std::move(read_future);
+        });
     auto finalizer =
         [&](const std::vector<std::shared_ptr<arrow::Table>>& tables,
             int64_t cid) {
@@ -269,6 +371,7 @@ TEST(ManifestGroupTranslatorAsyncPipelineTest,
             finalize_calls.fetch_add(1);
             return std::make_unique<milvus::GroupChunk>();
         };
+    auto load = MakeStorageV3ChunkLoadFn(reader, std::move(finalizer));
     StorageV3AdmissionScheduler scheduler(
         {/*total_bytes=*/64 * MB, /*high_reserved_bytes=*/0});
 
@@ -276,8 +379,7 @@ TEST(ManifestGroupTranslatorAsyncPipelineTest,
         return folly::coro::blockingWait(
             LoadStorageV3CellsAsync(nullptr,
                                     std::move(units),
-                                    std::move(read),
-                                    std::move(finalizer),
+                                    std::move(load),
                                     16 * MB,
                                     LoadPriority::HIGH,
                                     scheduler));
@@ -288,14 +390,86 @@ TEST(ManifestGroupTranslatorAsyncPipelineTest,
     EXPECT_EQ(result.wait_for(50ms), std::future_status::timeout);
     EXPECT_EQ(finalize_calls.load(), 0);
 
-    read_promise.setValue(
-        std::vector<std::shared_ptr<arrow::Table>>(1, nullptr));
+    read_promise.setValue(MakeEmptyRecordBatchesForTest(1));
 
     auto cells = result.get();
     ASSERT_EQ(cells.size(), 1);
     EXPECT_EQ(cells[0].cid, 0);
     EXPECT_NE(cells[0].chunk, nullptr);
     EXPECT_EQ(finalize_calls.load(), 1);
+}
+
+TEST(ManifestGroupTranslatorAsyncPipelineTest,
+     LoadCellsAsyncFinalizesOnMaterializeExecutorThread) {
+    constexpr int64_t MB = 1 << 20;
+    std::vector<StorageV3LoadUnit> units = {
+        {/*cid=*/0,
+         /*rg_offset=*/0,
+         /*rg_count=*/1,
+         /*memory_size=*/16 * MB,
+         /*loading_overhead_size=*/16 * MB},
+    };
+
+    folly::Promise<arrow::Result<milvus_storage::api::RecordBatchVector>>
+        read_promise;
+    auto read_future = read_promise.getSemiFuture();
+    std::promise<void> read_started;
+    std::atomic<arrow::internal::Executor*> materialize_executor{nullptr};
+    std::atomic<bool> finalizer_on_materialize_executor{false};
+
+    auto reader = std::make_shared<AsyncTestChunkReader>(
+        [&](const std::vector<int64_t>& chunk_indices,
+            const milvus_storage::api::AsyncReadOptions& options)
+            -> folly::SemiFuture<
+                arrow::Result<milvus_storage::api::RecordBatchVector>> {
+            EXPECT_EQ(chunk_indices, std::vector<int64_t>({0}));
+            EXPECT_NE(options.materialize_executor, nullptr);
+            EXPECT_NE(options.materialize_executor,
+                      arrow::internal::GetCpuThreadPool());
+            materialize_executor.store(options.materialize_executor);
+            read_started.set_value();
+            return std::move(read_future);
+        });
+    auto finalizer =
+        [&](const std::vector<std::shared_ptr<arrow::Table>>& tables,
+            int64_t cid) {
+            EXPECT_EQ(cid, 0);
+            EXPECT_EQ(tables.size(), 1);
+            auto* executor = materialize_executor.load();
+            EXPECT_NE(executor, nullptr);
+            if (executor != nullptr) {
+                finalizer_on_materialize_executor.store(
+                    executor->OwnsThisThread());
+            }
+            return std::make_unique<milvus::GroupChunk>();
+        };
+    auto load = MakeStorageV3ChunkLoadFn(reader, std::move(finalizer));
+    StorageV3AdmissionScheduler scheduler(
+        {/*total_bytes=*/64 * MB, /*high_reserved_bytes=*/0});
+
+    auto result = std::async(std::launch::async, [&] {
+        return folly::coro::blockingWait(
+            LoadStorageV3CellsAsync(nullptr,
+                                    std::move(units),
+                                    std::move(load),
+                                    16 * MB,
+                                    LoadPriority::HIGH,
+                                    scheduler));
+    });
+
+    ASSERT_EQ(read_started.get_future().wait_for(5s),
+              std::future_status::ready);
+    auto completer = std::async(std::launch::async, [&] {
+        read_promise.setValue(MakeEmptyRecordBatchesForTest(1));
+    });
+    ASSERT_EQ(completer.wait_for(5s), std::future_status::ready);
+    completer.get();
+
+    auto cells = result.get();
+    ASSERT_EQ(cells.size(), 1);
+    EXPECT_EQ(cells[0].cid, 0);
+    EXPECT_NE(cells[0].chunk, nullptr);
+    EXPECT_TRUE(finalizer_on_materialize_executor.load());
 }
 
 TEST(ManifestGroupTranslatorAsyncPipelineTest,

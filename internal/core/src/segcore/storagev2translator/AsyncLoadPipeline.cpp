@@ -17,11 +17,13 @@
 #include "segcore/storagev2translator/AsyncLoadPipeline.h"
 
 #include <algorithm>
+#include <exception>
 #include <limits>
 #include <numeric>
 #include <unordered_map>
 #include <utility>
 
+#include "arrow/util/thread_pool.h"
 #include "common/EasyAssert.h"
 #include "folly/coro/Collect.h"
 #include "folly/coro/FutureUtil.h"
@@ -35,6 +37,78 @@ namespace {
 bool
 IsHighPriority(milvus::proto::common::LoadPriority priority) {
     return priority == milvus::proto::common::LoadPriority::HIGH;
+}
+
+class MilvusThreadPoolArrowExecutor final : public arrow::internal::Executor {
+ public:
+    explicit MilvusThreadPoolArrowExecutor(milvus::ThreadPoolPriority priority)
+        : priority_(priority) {
+    }
+
+    int
+    GetCapacity() override {
+        return static_cast<int>(
+            milvus::ThreadPools::GetThreadPool(priority_).GetMaxThreadNum());
+    }
+
+    bool
+    OwnsThisThread() override {
+        return current_executor_ == this;
+    }
+
+ protected:
+    arrow::Status
+    SpawnReal(arrow::internal::TaskHints,
+              arrow::internal::FnOnce<void()> task,
+              arrow::StopToken stop_token,
+              StopCallback&& stop_callback) override {
+        auto task_ptr =
+            std::make_shared<arrow::internal::FnOnce<void()>>(std::move(task));
+        auto stop_callback_ptr =
+            std::make_shared<StopCallback>(std::move(stop_callback));
+        try {
+            milvus::ThreadPools::GetThreadPool(priority_).Submit(
+                [this,
+                 task_ptr,
+                 stop_token = std::move(stop_token),
+                 stop_callback_ptr]() mutable {
+                    if (stop_token.IsStopRequested()) {
+                        if (*stop_callback_ptr) {
+                            std::move (*stop_callback_ptr)(stop_token.Poll());
+                        }
+                        return;
+                    }
+                    auto* previous_executor = current_executor_;
+                    current_executor_ = this;
+                    try {
+                        std::move (*task_ptr)();
+                    } catch (...) {
+                        current_executor_ = previous_executor;
+                        throw;
+                    }
+                    current_executor_ = previous_executor;
+                });
+        } catch (const std::exception& e) {
+            return arrow::Status::IOError(e.what());
+        } catch (...) {
+            return arrow::Status::IOError(
+                "failed to submit task to Milvus thread pool");
+        }
+        return arrow::Status::OK();
+    }
+
+ private:
+    milvus::ThreadPoolPriority priority_;
+    static thread_local MilvusThreadPoolArrowExecutor* current_executor_;
+};
+
+thread_local MilvusThreadPoolArrowExecutor*
+    MilvusThreadPoolArrowExecutor::current_executor_ = nullptr;
+
+arrow::internal::Executor*
+StorageV3HighPriorityExecutor() {
+    static MilvusThreadPoolArrowExecutor executor(milvus::HIGH);
+    return &executor;
 }
 
 }  // namespace
@@ -101,7 +175,7 @@ StorageV3LoadUnitBudgetBytes(const StorageV3LoadUnit& unit) {
     return static_cast<size_t>(overhead_size);
 }
 
-StorageV3ReadResult
+arrow::Result<std::vector<std::shared_ptr<arrow::Table>>>
 RecordBatchesToTables(
     std::vector<std::shared_ptr<arrow::RecordBatch>> batches) {
     std::vector<std::shared_ptr<arrow::Table>> tables;
@@ -116,16 +190,20 @@ RecordBatchesToTables(
     return tables;
 }
 
-using StorageV3LoadedCellsPtr = std::shared_ptr<StorageV3LoadedCells>;
-
-StorageV3LoadedCellsPtr
+StorageV3LoadResult
 FinalizeStorageV3ReadTask(
     milvus::OpContext* op_ctx,
     StorageV3ReadTask task,
-    std::vector<std::shared_ptr<arrow::Table>> all_tables,
+    milvus_storage::api::RecordBatchVector batches,
     const std::shared_ptr<milvus::segcore::CellFinalizeFunc>& finalize_cell,
     const char* cancellation_scope) {
     CheckCancellation(op_ctx, -1, "LoadStorageV3CellsAsync");
+
+    auto tables_result = RecordBatchesToTables(std::move(batches));
+    if (!tables_result.ok()) {
+        return tables_result.status();
+    }
+    auto all_tables = std::move(tables_result).ValueOrDie();
 
     AssertInfo(
         all_tables.size() == static_cast<size_t>(task.rg_count),
@@ -157,8 +235,7 @@ folly::coro::Task<StorageV3LoadedCellsPtr>
 ReadAndFinalizeStorageV3TaskAsync(
     milvus::OpContext* op_ctx,
     StorageV3ReadTask task,
-    const std::shared_ptr<StorageV3AsyncReadFn>& read,
-    const std::shared_ptr<milvus::segcore::CellFinalizeFunc>& finalize_cell,
+    const std::shared_ptr<StorageV3AsyncLoadFn>& load,
     milvus::proto::common::LoadPriority priority,
     StorageV3AdmissionScheduler& scheduler) {
     constexpr const char* cancellation_scope = "LoadStorageV3CellsAsync";
@@ -170,29 +247,12 @@ ReadAndFinalizeStorageV3TaskAsync(
     (void)lease;
 
     CheckCancellation(op_ctx, -1, cancellation_scope);
-    auto tables_result =
-        co_await folly::coro::toTask((*read)(task.rg_offset, task.rg_count));
-    AssertInfo(tables_result.ok(),
-               "[StorageV3] Failed to read task: {}",
-               tables_result.status().ToString());
-    auto all_tables = std::move(tables_result).ValueOrDie();
-
-    CheckCancellation(op_ctx, -1, cancellation_scope);
-    auto finalize_future = SubmitStorageV3LoadTask(
-        priority,
-        [op_ctx,
-         task = std::move(task),
-         all_tables = std::move(all_tables),
-         finalize_cell]() mutable {
-            return FinalizeStorageV3ReadTask(op_ctx,
-                                             std::move(task),
-                                             std::move(all_tables),
-                                             finalize_cell,
-                                             cancellation_scope);
-        });
-    auto loaded_cells =
-        co_await folly::coro::toTask(std::move(finalize_future));
-    co_return loaded_cells;
+    auto loaded_cells_result =
+        co_await folly::coro::toTask((*load)(op_ctx, std::move(task)));
+    AssertInfo(loaded_cells_result.ok(),
+               "[StorageV3] Failed to load task: {}",
+               loaded_cells_result.status().ToString());
+    co_return std::move(loaded_cells_result).ValueOrDie();
 }
 
 }  // namespace
@@ -236,29 +296,39 @@ BuildStorageV3LoadUnitsForCells(
     return units;
 }
 
-StorageV3AsyncReadFn
-MakeStorageV3ChunkReadFn(
-    std::shared_ptr<milvus_storage::api::ChunkReader> chunk_reader) {
-    return [chunk_reader = std::move(chunk_reader)](
-               int64_t rg_offset,
-               int64_t rg_count) -> folly::SemiFuture<StorageV3ReadResult> {
-        std::vector<int64_t> rg_indices(rg_count);
-        std::iota(rg_indices.begin(), rg_indices.end(), rg_offset);
+StorageV3AsyncLoadFn
+MakeStorageV3ChunkLoadFn(
+    std::shared_ptr<milvus_storage::api::ChunkReader> chunk_reader,
+    milvus::segcore::CellFinalizeFunc finalize_cell) {
+    auto shared_finalizer = std::make_shared<milvus::segcore::CellFinalizeFunc>(
+        std::move(finalize_cell));
+    return [chunk_reader = std::move(chunk_reader), shared_finalizer](
+               milvus::OpContext* op_ctx, StorageV3ReadTask task)
+               -> folly::SemiFuture<StorageV3LoadResult> {
+        constexpr const char* cancellation_scope = "LoadStorageV3CellsAsync";
+        std::vector<int64_t> rg_indices(task.rg_count);
+        std::iota(rg_indices.begin(), rg_indices.end(), task.rg_offset);
+
+        milvus_storage::api::AsyncReadOptions options;
+        options.read_parallelism = 1;
+        options.materialize_executor = StorageV3HighPriorityExecutor();
 
         try {
-            return chunk_reader->get_chunks_async(rg_indices, /*parallelism=*/1)
-                .deferValue(
-                    [](arrow::Result<
-                        std::vector<std::shared_ptr<arrow::RecordBatch>>>&&
-                           batches_result) -> StorageV3ReadResult {
-                        if (!batches_result.ok()) {
-                            return batches_result.status();
-                        }
-                        return RecordBatchesToTables(
-                            std::move(batches_result).ValueOrDie());
-                    });
+            return milvus_storage::api::get_chunks_async_then(
+                chunk_reader,
+                std::move(rg_indices),
+                options,
+                [op_ctx, task = std::move(task), shared_finalizer](
+                    milvus_storage::api::RecordBatchVector&& batches) mutable
+                -> StorageV3LoadResult {
+                    return FinalizeStorageV3ReadTask(op_ctx,
+                                                     std::move(task),
+                                                     std::move(batches),
+                                                     shared_finalizer,
+                                                     cancellation_scope);
+                });
         } catch (...) {
-            return folly::makeSemiFuture<StorageV3ReadResult>(
+            return folly::makeSemiFuture<StorageV3LoadResult>(
                 folly::exception_wrapper(std::current_exception()));
         }
     };
@@ -267,8 +337,7 @@ MakeStorageV3ChunkReadFn(
 folly::coro::Task<StorageV3LoadedCells>
 LoadStorageV3CellsAsync(milvus::OpContext* op_ctx,
                         std::vector<StorageV3LoadUnit> units,
-                        StorageV3AsyncReadFn read,
-                        milvus::segcore::CellFinalizeFunc finalize_cell,
+                        StorageV3AsyncLoadFn load,
                         int64_t read_task_target_bytes,
                         milvus::proto::common::LoadPriority priority,
                         StorageV3AdmissionScheduler& scheduler) {
@@ -284,20 +353,14 @@ LoadStorageV3CellsAsync(milvus::OpContext* op_ctx,
 
     auto read_tasks =
         BuildStorageV3ReadTasks(std::move(units), read_task_target_bytes);
-    auto shared_reader =
-        std::make_shared<StorageV3AsyncReadFn>(std::move(read));
-    auto shared_finalizer = std::make_shared<milvus::segcore::CellFinalizeFunc>(
-        std::move(finalize_cell));
+    auto shared_loader =
+        std::make_shared<StorageV3AsyncLoadFn>(std::move(load));
 
     std::vector<folly::coro::Task<StorageV3LoadedCellsPtr>> tasks;
     tasks.reserve(read_tasks.size());
     for (auto& read_task : read_tasks) {
-        tasks.push_back(ReadAndFinalizeStorageV3TaskAsync(op_ctx,
-                                                          std::move(read_task),
-                                                          shared_reader,
-                                                          shared_finalizer,
-                                                          priority,
-                                                          scheduler));
+        tasks.push_back(ReadAndFinalizeStorageV3TaskAsync(
+            op_ctx, std::move(read_task), shared_loader, priority, scheduler));
     }
 
     auto task_results = co_await folly::coro::collectAllRange(std::move(tasks));
@@ -379,11 +442,15 @@ StorageV3AdmissionScheduler::StorageV3AdmissionScheduler(
 
 void
 StorageV3AdmissionScheduler::UpdateConfig(StorageV3AdmissionConfig config) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    config.high_reserved_bytes =
-        std::min(config.high_reserved_bytes, config.total_bytes);
-    config_ = config;
-    TryScheduleLocked();
+    std::vector<PendingAdmission> admitted;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        config.high_reserved_bytes =
+            std::min(config.high_reserved_bytes, config.total_bytes);
+        config_ = config;
+        admitted = TakeAdmittedLocked();
+    }
+    FulfillAdmissions(std::move(admitted));
 }
 
 folly::SemiFuture<StorageV3LoadBudgetLease>
@@ -392,38 +459,50 @@ StorageV3AdmissionScheduler::Admit(milvus::proto::common::LoadPriority priority,
     folly::Promise<StorageV3LoadBudgetLease> promise;
     auto future = promise.getSemiFuture();
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (CanAdmitLocked(priority, bytes)) {
-        MarkAdmittedLocked(priority, bytes);
-        promise.setValue(StorageV3LoadBudgetLease(this, priority, bytes));
-        return future;
+    bool admitted = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (CanAdmitLocked(priority, bytes)) {
+            MarkAdmittedLocked(priority, bytes);
+            admitted = true;
+        } else {
+            auto& queue =
+                IsHighPriority(priority) ? high_pending_ : low_pending_;
+            queue.push_back(
+                PendingAdmission{priority, bytes, std::move(promise)});
+        }
     }
 
-    auto& queue = IsHighPriority(priority) ? high_pending_ : low_pending_;
-    queue.push_back(PendingAdmission{priority, bytes, std::move(promise)});
+    if (admitted) {
+        promise.setValue(StorageV3LoadBudgetLease(this, priority, bytes));
+    }
     return future;
 }
 
 void
 StorageV3AdmissionScheduler::Release(
     milvus::proto::common::LoadPriority priority, size_t bytes) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto& used_bytes =
-        IsHighPriority(priority) ? used_high_bytes_ : used_low_bytes_;
-    used_bytes = bytes > used_bytes ? 0 : used_bytes - bytes;
-    TryScheduleLocked();
+    std::vector<PendingAdmission> admitted;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto& used_bytes =
+            IsHighPriority(priority) ? used_high_bytes_ : used_low_bytes_;
+        used_bytes = bytes > used_bytes ? 0 : used_bytes - bytes;
+        admitted = TakeAdmittedLocked();
+    }
+    FulfillAdmissions(std::move(admitted));
 }
 
-void
-StorageV3AdmissionScheduler::TryScheduleLocked() {
+std::vector<StorageV3AdmissionScheduler::PendingAdmission>
+StorageV3AdmissionScheduler::TakeAdmittedLocked() {
+    std::vector<PendingAdmission> admitted;
     while (!high_pending_.empty() &&
            CanAdmitLocked(high_pending_.front().priority,
                           high_pending_.front().bytes)) {
         auto pending = std::move(high_pending_.front());
         high_pending_.pop_front();
         MarkAdmittedLocked(pending.priority, pending.bytes);
-        pending.promise.setValue(
-            StorageV3LoadBudgetLease(this, pending.priority, pending.bytes));
+        admitted.push_back(std::move(pending));
     }
 
     while (!low_pending_.empty() &&
@@ -432,8 +511,17 @@ StorageV3AdmissionScheduler::TryScheduleLocked() {
         auto pending = std::move(low_pending_.front());
         low_pending_.pop_front();
         MarkAdmittedLocked(pending.priority, pending.bytes);
-        pending.promise.setValue(
-            StorageV3LoadBudgetLease(this, pending.priority, pending.bytes));
+        admitted.push_back(std::move(pending));
+    }
+    return admitted;
+}
+
+void
+StorageV3AdmissionScheduler::FulfillAdmissions(
+    std::vector<PendingAdmission> admissions) {
+    for (auto& admission : admissions) {
+        admission.promise.setValue(StorageV3LoadBudgetLease(
+            this, admission.priority, admission.bytes));
     }
 }
 
