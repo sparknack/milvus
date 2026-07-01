@@ -32,6 +32,7 @@
 #include "pb/common.pb.h"
 #include "segcore/storagev2translator/AsyncLoadPipeline.h"
 #include "segcore/storagev2translator/ManifestGroupTranslator.h"
+#include "segcore/storagev2translator/StorageV2Config.h"
 #include "storage/EntryStreamUtils.h"
 #include "test_utils/Constants.h"
 #include "test_utils/DataGen.h"
@@ -40,6 +41,20 @@
 using namespace milvus;
 using namespace milvus::segcore;
 using namespace milvus::segcore::storagev2translator;
+
+TEST(StorageV2ConfigTest, AsyncLoadDefaultsToEnabledAndCanBeToggled) {
+    const bool old_enabled = StorageV2AsyncLoadEnabled();
+    auto restore_enabled = folly::makeGuard(
+        [old_enabled]() { SetStorageV2AsyncLoadEnabled(old_enabled); });
+
+    EXPECT_TRUE(StorageV2AsyncLoadEnabled());
+
+    SetStorageV2AsyncLoadEnabled(false);
+    EXPECT_FALSE(StorageV2AsyncLoadEnabled());
+
+    SetStorageV2AsyncLoadEnabled(true);
+    EXPECT_TRUE(StorageV2AsyncLoadEnabled());
+}
 
 class ManifestGroupTranslatorV2ParityTest
     : public ::testing::TestWithParam<bool> {

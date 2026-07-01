@@ -120,6 +120,11 @@ UpdateArrowIOThreadPoolMetrics();
 void
 SetStorageV2CellTargetSizeBytes(int64_t bytes);
 
+// Enable the storage v3 async column-group load translator. Disable to compare
+// with the original synchronous translator.
+void
+SetStorageV2AsyncLoadEnabled(bool enabled);
+
 #ifdef __cplusplus
 };
 #endif

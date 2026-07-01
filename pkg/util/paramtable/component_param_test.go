@@ -64,6 +64,16 @@ func TestComponentParam(t *testing.T) {
 		assert.Equal(t, "queryNode.search.enableResultZeroCopy", params.QueryNodeCfg.EnableResultZeroCopy.Key)
 	})
 
+	t.Run("query node storage v2 async load config", func(t *testing.T) {
+		asyncLoad := params.QueryNodeCfg.StorageV2EnableAsyncLoad
+		assert.Equal(t, "queryNode.segcore.storageV2.enableAsyncLoad", asyncLoad.Key)
+		assert.True(t, asyncLoad.GetAsBool())
+
+		params.Save(asyncLoad.Key, "false")
+		defer params.Reset(asyncLoad.Key)
+		assert.False(t, asyncLoad.GetAsBool())
+	})
+
 	t.Run("test commonConfig", func(t *testing.T) {
 		Params := &params.CommonCfg
 
