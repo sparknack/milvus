@@ -155,6 +155,16 @@ class MockTakeReader : public milvus_storage::api::Reader {
         return arrow::Status::NotImplemented("mock");
     }
 
+    folly::SemiFuture<
+        arrow::Result<std::unique_ptr<milvus_storage::api::ChunkReader>>>
+    get_chunk_reader_async(
+        int64_t,
+        const std::shared_ptr<std::vector<std::string>>&) const override {
+        return folly::makeSemiFuture(
+            arrow::Result<std::unique_ptr<milvus_storage::api::ChunkReader>>(
+                arrow::Status::NotImplemented("mock")));
+    }
+
     arrow::Result<std::shared_ptr<arrow::Table>>
     take(const std::vector<int64_t>& row_indices,
          size_t,
@@ -180,6 +190,15 @@ class MockTakeReader : public milvus_storage::api::Reader {
             return SelectRows(filtered, row_indices);
         }
         return SelectRows(table_, row_indices);
+    }
+
+    folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>>
+    take_async(const std::vector<int64_t>& row_indices,
+               size_t parallelism,
+               const std::shared_ptr<std::vector<std::string>>& needed_columns)
+        override {
+        return folly::makeSemiFuture(
+            take(row_indices, parallelism, needed_columns));
     }
 
     void
@@ -1022,11 +1041,28 @@ class ErrorMockTakeReader : public milvus_storage::api::Reader {
         const override {
         return arrow::Status::NotImplemented("mock");
     }
+    folly::SemiFuture<
+        arrow::Result<std::unique_ptr<milvus_storage::api::ChunkReader>>>
+    get_chunk_reader_async(
+        int64_t,
+        const std::shared_ptr<std::vector<std::string>>&) const override {
+        return folly::makeSemiFuture(
+            arrow::Result<std::unique_ptr<milvus_storage::api::ChunkReader>>(
+                arrow::Status::NotImplemented("mock")));
+    }
     arrow::Result<std::shared_ptr<arrow::Table>>
     take(const std::vector<int64_t>&,
          size_t,
          const std::shared_ptr<std::vector<std::string>>&) override {
         return arrow::Status::Invalid("simulated take failure");
+    }
+    folly::SemiFuture<arrow::Result<std::shared_ptr<arrow::Table>>>
+    take_async(const std::vector<int64_t>& row_indices,
+               size_t parallelism,
+               const std::shared_ptr<std::vector<std::string>>& needed_columns)
+        override {
+        return folly::makeSemiFuture(
+            take(row_indices, parallelism, needed_columns));
     }
     void
     set_keyretriever(

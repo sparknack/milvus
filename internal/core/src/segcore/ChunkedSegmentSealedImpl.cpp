@@ -133,6 +133,7 @@
 #include "segcore/storagev1translator/TextMatchIndexTranslator.h"
 #include "segcore/storagev2translator/GroupChunkTranslator.h"
 #include "segcore/storagev2translator/ManifestGroupTranslator.h"
+#include "segcore/storagev2translator/ManifestGroupTranslatorV2.h"
 #include "segcore/TextColumnCache.h"
 #include "storage/FileManager.h"
 #include "storage/KeyRetriever.h"
@@ -5471,7 +5472,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
     }
 
     auto translator =
-        std::make_unique<storagev2translator::ManifestGroupTranslator>(
+        std::make_unique<storagev2translator::ManifestGroupTranslatorV2>(
             get_segment_id(),
             GroupChunkType::DEFAULT,
             index,

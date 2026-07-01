@@ -295,19 +295,18 @@ ManifestGroupTranslatorV2::get_cells(
             return loading_overhead_bytes(memory_size);
         });
 
-    // Create factory using ChunkReader — reads a batch of row groups at once
-    auto factory = milvus::segcore::MakeChunkReaderFactory(chunk_reader_);
+    auto read = MakeStorageV3ChunkReadFn(chunk_reader_);
 
     auto loaded_cells = folly::coro::blockingWait(LoadStorageV3CellsAsync(
         ctx,
         std::move(load_units),
-        std::move(factory),
+        std::move(read),
         [this](const std::vector<std::shared_ptr<arrow::Table>>& tables,
                int64_t cid) {
             return load_group_chunk(
                 tables, static_cast<milvus::cachinglayer::cid_t>(cid));
         },
-        FieldDataLoadBatchSplitTargetBytes(),
+        FieldDataReadWindowBytes(),
         load_priority_,
         GetStorageV3LoadAdmissionScheduler()));
 

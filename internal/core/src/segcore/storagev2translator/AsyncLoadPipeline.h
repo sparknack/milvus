@@ -27,9 +27,11 @@
 #include <utility>
 #include <vector>
 
+#include "arrow/table.h"
 #include "cachinglayer/Utils.h"
 #include "common/GroupChunk.h"
 #include "common/OpContext.h"
+#include "milvus-storage/reader.h"
 #include "pb/common.pb.h"
 #include "segcore/memory_planner.h"
 #include "segcore/storagev2translator/GroupCTMeta.h"
@@ -50,10 +52,10 @@ struct StorageV3LoadUnit {
     int64_t loading_overhead_size = 0;
 };
 
-struct StorageV3LoadBatch {
+struct StorageV3ReadTask {
     int64_t rg_offset;
     int64_t rg_count;
-    int64_t batch_memory = 0;
+    int64_t task_memory = 0;
     std::vector<StorageV3LoadUnit> units;
 };
 
@@ -64,12 +66,12 @@ struct StorageV3LoadedCell {
 
 using StorageV3LoadedCells = std::vector<StorageV3LoadedCell>;
 
-std::vector<StorageV3LoadBatch>
-BuildStorageV3LoadBatches(std::vector<StorageV3LoadUnit> units,
-                          int64_t split_target_bytes);
+std::vector<StorageV3ReadTask>
+BuildStorageV3ReadTasks(std::vector<StorageV3LoadUnit> units,
+                        int64_t read_task_target_bytes);
 
 size_t
-StorageV3LoadBatchBudgetBytes(const StorageV3LoadBatch& batch);
+StorageV3ReadTaskBudgetBytes(const StorageV3ReadTask& task);
 
 using StorageV3LoadingOverheadFunc = std::function<int64_t(int64_t)>;
 
@@ -78,6 +80,17 @@ BuildStorageV3LoadUnitsForCells(
     const GroupCTMeta& meta,
     const std::vector<milvus::cachinglayer::cid_t>& cids,
     const StorageV3LoadingOverheadFunc& loading_overhead_bytes);
+
+using StorageV3ReadResult =
+    arrow::Result<std::vector<std::shared_ptr<arrow::Table>>>;
+
+using StorageV3AsyncReadFn =
+    std::function<folly::SemiFuture<StorageV3ReadResult>(int64_t rg_offset,
+                                                         int64_t rg_count)>;
+
+StorageV3AsyncReadFn
+MakeStorageV3ChunkReadFn(
+    std::shared_ptr<milvus_storage::api::ChunkReader> chunk_reader);
 
 template <typename Func>
 auto
@@ -201,9 +214,9 @@ GetStorageV3LoadAdmissionScheduler();
 folly::coro::Task<StorageV3LoadedCells>
 LoadStorageV3CellsAsync(milvus::OpContext* op_ctx,
                         std::vector<StorageV3LoadUnit> units,
-                        milvus::segcore::BatchReaderFactory reader_factory,
+                        StorageV3AsyncReadFn read,
                         milvus::segcore::CellFinalizeFunc finalize_cell,
-                        int64_t split_target_bytes,
+                        int64_t read_task_target_bytes,
                         milvus::proto::common::LoadPriority priority,
                         StorageV3AdmissionScheduler& scheduler);
 

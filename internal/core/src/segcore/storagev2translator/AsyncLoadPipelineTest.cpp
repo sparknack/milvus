@@ -16,11 +16,13 @@
 
 #include "segcore/storagev2translator/AsyncLoadPipeline.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <tuple>
 #include <utility>
@@ -114,7 +116,7 @@ TEST(ManifestGroupTranslatorAsyncPipelineTest,
 }
 
 TEST(ManifestGroupTranslatorAsyncPipelineTest,
-     BuildBatchesSortsAndMergesContiguousRowGroups) {
+     BuildReadTasksSortsAndMergesContiguousRowGroups) {
     constexpr int64_t MB = 1 << 20;
     std::vector<StorageV3LoadUnit> units = {
         {/*cid=*/2, /*rg_offset=*/2, /*rg_count=*/1, /*memory_size=*/16 * MB},
@@ -123,51 +125,51 @@ TEST(ManifestGroupTranslatorAsyncPipelineTest,
         {/*cid=*/3, /*rg_offset=*/4, /*rg_count=*/1, /*memory_size=*/16 * MB},
     };
 
-    auto batches = BuildStorageV3LoadBatches(std::move(units), 64 * MB);
+    auto tasks = BuildStorageV3ReadTasks(std::move(units), 64 * MB);
 
-    ASSERT_EQ(batches.size(), 2);
-    EXPECT_EQ(batches[0].rg_offset, 0);
-    EXPECT_EQ(batches[0].rg_count, 3);
-    EXPECT_EQ(batches[0].batch_memory, 48 * MB);
-    ASSERT_EQ(batches[0].units.size(), 3);
-    EXPECT_EQ(batches[0].units[0].cid, 0);
-    EXPECT_EQ(batches[0].units[1].cid, 1);
-    EXPECT_EQ(batches[0].units[2].cid, 2);
+    ASSERT_EQ(tasks.size(), 2);
+    EXPECT_EQ(tasks[0].rg_offset, 0);
+    EXPECT_EQ(tasks[0].rg_count, 3);
+    EXPECT_EQ(tasks[0].task_memory, 48 * MB);
+    ASSERT_EQ(tasks[0].units.size(), 3);
+    EXPECT_EQ(tasks[0].units[0].cid, 0);
+    EXPECT_EQ(tasks[0].units[1].cid, 1);
+    EXPECT_EQ(tasks[0].units[2].cid, 2);
 
-    EXPECT_EQ(batches[1].rg_offset, 4);
-    EXPECT_EQ(batches[1].rg_count, 1);
-    ASSERT_EQ(batches[1].units.size(), 1);
-    EXPECT_EQ(batches[1].units[0].cid, 3);
+    EXPECT_EQ(tasks[1].rg_offset, 4);
+    EXPECT_EQ(tasks[1].rg_count, 1);
+    ASSERT_EQ(tasks[1].units.size(), 1);
+    EXPECT_EQ(tasks[1].units[0].cid, 3);
 }
 
 TEST(ManifestGroupTranslatorAsyncPipelineTest,
-     BuildBatchesSplitsWhenTargetWouldBeExceeded) {
+     BuildReadTasksSplitsWhenReadWindowTargetWouldBeExceeded) {
     constexpr int64_t MB = 1 << 20;
     std::vector<StorageV3LoadUnit> units = {
-        {/*cid=*/0, /*rg_offset=*/0, /*rg_count=*/1, /*memory_size=*/24 * MB},
-        {/*cid=*/1, /*rg_offset=*/1, /*rg_count=*/1, /*memory_size=*/24 * MB},
-        {/*cid=*/2, /*rg_offset=*/2, /*rg_count=*/1, /*memory_size=*/24 * MB},
+        {/*cid=*/0, /*rg_offset=*/0, /*rg_count=*/1, /*memory_size=*/8 * MB},
+        {/*cid=*/1, /*rg_offset=*/1, /*rg_count=*/1, /*memory_size=*/8 * MB},
+        {/*cid=*/2, /*rg_offset=*/2, /*rg_count=*/1, /*memory_size=*/8 * MB},
     };
 
-    auto batches = BuildStorageV3LoadBatches(std::move(units), 48 * MB);
+    auto tasks = BuildStorageV3ReadTasks(std::move(units), 16 * MB);
 
-    ASSERT_EQ(batches.size(), 2);
-    EXPECT_EQ(batches[0].rg_offset, 0);
-    EXPECT_EQ(batches[0].rg_count, 2);
-    EXPECT_EQ(batches[0].batch_memory, 48 * MB);
-    ASSERT_EQ(batches[0].units.size(), 2);
-    EXPECT_EQ(batches[0].units[0].cid, 0);
-    EXPECT_EQ(batches[0].units[1].cid, 1);
+    ASSERT_EQ(tasks.size(), 2);
+    EXPECT_EQ(tasks[0].rg_offset, 0);
+    EXPECT_EQ(tasks[0].rg_count, 2);
+    EXPECT_EQ(tasks[0].task_memory, 16 * MB);
+    ASSERT_EQ(tasks[0].units.size(), 2);
+    EXPECT_EQ(tasks[0].units[0].cid, 0);
+    EXPECT_EQ(tasks[0].units[1].cid, 1);
 
-    EXPECT_EQ(batches[1].rg_offset, 2);
-    EXPECT_EQ(batches[1].rg_count, 1);
-    EXPECT_EQ(batches[1].batch_memory, 24 * MB);
-    ASSERT_EQ(batches[1].units.size(), 1);
-    EXPECT_EQ(batches[1].units[0].cid, 2);
+    EXPECT_EQ(tasks[1].rg_offset, 2);
+    EXPECT_EQ(tasks[1].rg_count, 1);
+    EXPECT_EQ(tasks[1].task_memory, 8 * MB);
+    ASSERT_EQ(tasks[1].units.size(), 1);
+    EXPECT_EQ(tasks[1].units[0].cid, 2);
 }
 
 TEST(ManifestGroupTranslatorAsyncPipelineTest,
-     LoadCellsAsyncMergesIoBatchesAndReturnsRequestedOrder) {
+     LoadCellsAsyncSchedulesReadWindowTasksAndReturnsRequestedOrder) {
     constexpr int64_t MB = 1 << 20;
     std::vector<StorageV3LoadUnit> units = {
         {/*cid=*/2,
@@ -187,20 +189,26 @@ TEST(ManifestGroupTranslatorAsyncPipelineTest,
          /*loading_overhead_size=*/16 * MB},
     };
     std::vector<std::tuple<int64_t, int64_t>> reads;
+    std::mutex reads_mutex;
     std::vector<int64_t> finalized_cids;
-    auto reader =
-        [&](size_t, int64_t rg_offset, int64_t rg_count, int64_t, uint64_t)
-        -> arrow::Result<std::vector<std::shared_ptr<arrow::Table>>> {
-        reads.emplace_back(rg_offset, rg_count);
-        return std::vector<std::shared_ptr<arrow::Table>>(
-            static_cast<size_t>(rg_count));
+    std::mutex finalized_cids_mutex;
+    StorageV3AsyncReadFn reader =
+        [&](int64_t rg_offset,
+            int64_t rg_count) -> folly::SemiFuture<StorageV3ReadResult> {
+        {
+            std::lock_guard<std::mutex> lock(reads_mutex);
+            reads.emplace_back(rg_offset, rg_count);
+        }
+        return folly::makeSemiFuture(
+            StorageV3ReadResult(std::vector<std::shared_ptr<arrow::Table>>(
+                static_cast<size_t>(rg_count))));
     };
     auto finalizer =
         [&](const std::vector<std::shared_ptr<arrow::Table>>& tables,
             int64_t cid) {
+            std::lock_guard<std::mutex> lock(finalized_cids_mutex);
             finalized_cids.push_back(cid);
-            reads.emplace_back(/*rg_offset=*/-1,
-                               static_cast<int64_t>(tables.size()));
+            EXPECT_EQ(tables.size(), 1);
             return std::make_unique<milvus::GroupChunk>();
         };
     StorageV3AdmissionScheduler scheduler(
@@ -211,15 +219,15 @@ TEST(ManifestGroupTranslatorAsyncPipelineTest,
                                                           std::move(units),
                                                           std::move(reader),
                                                           std::move(finalizer),
-                                                          64 * MB,
+                                                          16 * MB,
                                                           LoadPriority::HIGH,
                                                           scheduler));
 
-    ASSERT_EQ(reads.size(), 4);
-    EXPECT_EQ(reads[0], (std::tuple<int64_t, int64_t>{0, 3}));
-    EXPECT_EQ(reads[1], (std::tuple<int64_t, int64_t>{-1, 1}));
-    EXPECT_EQ(reads[2], (std::tuple<int64_t, int64_t>{-1, 1}));
-    EXPECT_EQ(reads[3], (std::tuple<int64_t, int64_t>{-1, 1}));
+    ASSERT_EQ(reads.size(), 3);
+    EXPECT_EQ(reads[0], (std::tuple<int64_t, int64_t>{0, 1}));
+    EXPECT_EQ(reads[1], (std::tuple<int64_t, int64_t>{1, 1}));
+    EXPECT_EQ(reads[2], (std::tuple<int64_t, int64_t>{2, 1}));
+    std::sort(finalized_cids.begin(), finalized_cids.end());
     EXPECT_EQ(finalized_cids, std::vector<int64_t>({0, 1, 2}));
     ASSERT_EQ(cells.size(), 3);
     EXPECT_EQ(cells[0].cid, 2);
@@ -228,6 +236,66 @@ TEST(ManifestGroupTranslatorAsyncPipelineTest,
     EXPECT_NE(cells[0].chunk, nullptr);
     EXPECT_NE(cells[1].chunk, nullptr);
     EXPECT_NE(cells[2].chunk, nullptr);
+}
+
+TEST(ManifestGroupTranslatorAsyncPipelineTest,
+     LoadCellsAsyncWaitsForAsyncReadBeforeFinalizing) {
+    constexpr int64_t MB = 1 << 20;
+    std::vector<StorageV3LoadUnit> units = {
+        {/*cid=*/0,
+         /*rg_offset=*/0,
+         /*rg_count=*/1,
+         /*memory_size=*/16 * MB,
+         /*loading_overhead_size=*/16 * MB},
+    };
+
+    using TablesResult =
+        arrow::Result<std::vector<std::shared_ptr<arrow::Table>>>;
+    folly::Promise<TablesResult> read_promise;
+    auto read_future = read_promise.getSemiFuture();
+    std::promise<void> read_started;
+    std::atomic<int> finalize_calls{0};
+
+    StorageV3AsyncReadFn read =
+        [&](int64_t, int64_t) -> folly::SemiFuture<TablesResult> {
+        read_started.set_value();
+        return std::move(read_future);
+    };
+    auto finalizer =
+        [&](const std::vector<std::shared_ptr<arrow::Table>>& tables,
+            int64_t cid) {
+            EXPECT_EQ(cid, 0);
+            EXPECT_EQ(tables.size(), 1);
+            finalize_calls.fetch_add(1);
+            return std::make_unique<milvus::GroupChunk>();
+        };
+    StorageV3AdmissionScheduler scheduler(
+        {/*total_bytes=*/64 * MB, /*high_reserved_bytes=*/0});
+
+    auto result = std::async(std::launch::async, [&] {
+        return folly::coro::blockingWait(
+            LoadStorageV3CellsAsync(nullptr,
+                                    std::move(units),
+                                    std::move(read),
+                                    std::move(finalizer),
+                                    16 * MB,
+                                    LoadPriority::HIGH,
+                                    scheduler));
+    });
+
+    ASSERT_EQ(read_started.get_future().wait_for(5s),
+              std::future_status::ready);
+    EXPECT_EQ(result.wait_for(50ms), std::future_status::timeout);
+    EXPECT_EQ(finalize_calls.load(), 0);
+
+    read_promise.setValue(
+        std::vector<std::shared_ptr<arrow::Table>>(1, nullptr));
+
+    auto cells = result.get();
+    ASSERT_EQ(cells.size(), 1);
+    EXPECT_EQ(cells[0].cid, 0);
+    EXPECT_NE(cells[0].chunk, nullptr);
+    EXPECT_EQ(finalize_calls.load(), 1);
 }
 
 TEST(ManifestGroupTranslatorAsyncPipelineTest,
@@ -314,7 +382,7 @@ TEST(ManifestGroupTranslatorAsyncPipelineTest,
 }
 
 TEST(ManifestGroupTranslatorAsyncPipelineTest,
-     AdmissionAllowsOversizedBatchToRunExclusivelyWhenIdle) {
+     AdmissionAllowsOversizedRequestToRunExclusivelyWhenIdle) {
     StorageV3AdmissionScheduler scheduler(
         {/*total_bytes=*/10, /*high_reserved_bytes=*/4});
 
