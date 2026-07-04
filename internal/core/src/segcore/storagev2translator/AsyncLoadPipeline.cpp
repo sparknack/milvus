@@ -17,6 +17,7 @@
 #include "segcore/storagev2translator/AsyncLoadPipeline.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <exception>
 #include <limits>
@@ -45,6 +46,8 @@ IsHighPriority(milvus::proto::common::LoadPriority priority) {
 }
 
 using StorageV3TraceClock = std::chrono::steady_clock;
+
+std::atomic<uint64_t> storage_v3_load_trace_seq{0};
 
 int64_t
 ElapsedMs(StorageV3TraceClock::time_point start) {
@@ -383,6 +386,9 @@ ReadAndFinalizeStorageV3TaskAsync(
     auto budget_bytes = StorageV3ReadTaskBudgetBytes(task);
     auto rg_offset = task.rg_offset;
     auto rg_count = task.rg_count;
+    auto load_trace_id = task.load_trace_id;
+    auto read_task_index = task.read_task_index;
+    auto read_task_count = task.read_task_count;
     auto task_memory = task.task_memory;
     auto unit_count = task.units.size();
     auto first_cid = task.units.empty() ? milvus::cachinglayer::cid_t{-1}
@@ -391,10 +397,14 @@ ReadAndFinalizeStorageV3TaskAsync(
                                        : task.units.back().cid;
     auto admit_start = StorageV3TraceClock::now();
     LOG_TRACE(
-        "[StorageV3] read task admission start: trace_label={}, priority={}, "
-        "budget_bytes={}, rg_offset={}, rg_count={}, task_memory={}, "
-        "unit_count={}, first_cid={}, last_cid={}",
+        "[StorageV3] read task admission start: trace_label={}, "
+        "load_trace_id={}, read_task_index={}, read_task_count={}, "
+        "priority={}, budget_bytes={}, rg_offset={}, rg_count={}, "
+        "task_memory={}, unit_count={}, first_cid={}, last_cid={}",
         *trace_label,
+        load_trace_id,
+        read_task_index,
+        read_task_count,
         static_cast<int>(priority),
         budget_bytes,
         rg_offset,
@@ -409,10 +419,14 @@ ReadAndFinalizeStorageV3TaskAsync(
     auto admit_wait_ms = ElapsedMs(admit_start);
     LOG_TRACE(
         "[StorageV3] read task admission granted: trace_label={}, "
+        "load_trace_id={}, read_task_index={}, read_task_count={}, "
         "priority={}, budget_bytes={}, admit_wait_ms={}, rg_offset={}, "
         "rg_count={}, task_memory={}, unit_count={}, first_cid={}, "
         "last_cid={}",
         *trace_label,
+        load_trace_id,
+        read_task_index,
+        read_task_count,
         static_cast<int>(priority),
         budget_bytes,
         admit_wait_ms,
@@ -431,10 +445,14 @@ ReadAndFinalizeStorageV3TaskAsync(
     if (!loaded_cells_result.ok()) {
         LOG_TRACE(
             "[StorageV3] read task load failed: trace_label={}, "
+            "load_trace_id={}, read_task_index={}, read_task_count={}, "
             "priority={}, budget_bytes={}, admit_wait_ms={}, load_ms={}, "
             "rg_offset={}, rg_count={}, task_memory={}, unit_count={}, "
             "first_cid={}, last_cid={}, status={}",
             *trace_label,
+            load_trace_id,
+            read_task_index,
+            read_task_count,
             static_cast<int>(priority),
             budget_bytes,
             admit_wait_ms,
@@ -448,11 +466,15 @@ ReadAndFinalizeStorageV3TaskAsync(
             loaded_cells_result.status().ToString());
     } else {
         LOG_TRACE(
-            "[StorageV3] read task load done: trace_label={}, priority={}, "
-            "budget_bytes={}, admit_wait_ms={}, load_ms={}, rg_offset={}, "
-            "rg_count={}, task_memory={}, unit_count={}, first_cid={}, "
-            "last_cid={}, loaded_cell_count={}",
+            "[StorageV3] read task load done: trace_label={}, "
+            "load_trace_id={}, read_task_index={}, read_task_count={}, "
+            "priority={}, budget_bytes={}, admit_wait_ms={}, load_ms={}, "
+            "rg_offset={}, rg_count={}, task_memory={}, unit_count={}, "
+            "first_cid={}, last_cid={}, loaded_cell_count={}",
             *trace_label,
+            load_trace_id,
+            read_task_index,
+            read_task_count,
             static_cast<int>(priority),
             budget_bytes,
             admit_wait_ms,
@@ -532,6 +554,9 @@ MakeStorageV3ChunkLoadFn(
         std::iota(rg_indices.begin(), rg_indices.end(), task.rg_offset);
         auto rg_offset = task.rg_offset;
         auto rg_count = task.rg_count;
+        auto load_trace_id = task.load_trace_id;
+        auto read_task_index = task.read_task_index;
+        auto read_task_count = task.read_task_count;
         auto task_memory = task.task_memory;
         auto unit_count = task.units.size();
         auto localize_executor_name = LocalizeExecutorName(localize_executor);
@@ -544,10 +569,14 @@ MakeStorageV3ChunkLoadFn(
         try {
             LOG_TRACE(
                 "[StorageV3] milvus-storage async read submit: "
-                "trace_label={}, localize_executor={}, rg_offset={}, "
+                "trace_label={}, load_trace_id={}, read_task_index={}, "
+                "read_task_count={}, localize_executor={}, rg_offset={}, "
                 "rg_count={}, task_memory={}, unit_count={}, "
                 "read_parallelism={}",
                 *trace_label_ptr,
+                load_trace_id,
+                read_task_index,
+                read_task_count,
                 localize_executor_name,
                 rg_offset,
                 rg_count,
@@ -566,6 +595,9 @@ MakeStorageV3ChunkLoadFn(
                      read_start,
                      rg_offset,
                      rg_count,
+                     load_trace_id,
+                     read_task_index,
+                     read_task_count,
                      task_memory,
                      unit_count](milvus_storage::api::RecordBatchVector&&
                                      batches) mutable -> StorageV3LoadResult {
@@ -573,10 +605,15 @@ MakeStorageV3ChunkLoadFn(
                         auto batch_count = batches.size();
                         LOG_TRACE(
                             "[StorageV3] milvus-storage async read done: "
-                            "trace_label={}, localize_executor=materialize, "
-                            "read_ms={}, rg_offset={}, rg_count={}, "
-                            "task_memory={}, unit_count={}, batch_count={}",
+                            "trace_label={}, load_trace_id={}, "
+                            "read_task_index={}, read_task_count={}, "
+                            "localize_executor=materialize, read_ms={}, "
+                            "rg_offset={}, rg_count={}, task_memory={}, "
+                            "unit_count={}, batch_count={}",
                             *trace_label_ptr,
+                            load_trace_id,
+                            read_task_index,
+                            read_task_count,
                             read_ms,
                             rg_offset,
                             rg_count,
@@ -592,11 +629,15 @@ MakeStorageV3ChunkLoadFn(
                                                       cancellation_scope);
                         LOG_TRACE(
                             "[StorageV3] read task finalizer done: "
-                            "trace_label={}, localize_executor=materialize, "
-                            "finalize_ms={}, rg_offset={}, rg_count={}, "
-                            "task_memory={}, unit_count={}, batch_count={}, "
-                            "ok={}",
+                            "trace_label={}, load_trace_id={}, "
+                            "read_task_index={}, read_task_count={}, "
+                            "localize_executor=materialize, finalize_ms={}, "
+                            "rg_offset={}, rg_count={}, task_memory={}, "
+                            "unit_count={}, batch_count={}, ok={}",
                             *trace_label_ptr,
+                            load_trace_id,
+                            read_task_index,
+                            read_task_count,
                             ElapsedMs(finalize_start),
                             rg_offset,
                             rg_count,
@@ -620,6 +661,9 @@ MakeStorageV3ChunkLoadFn(
                      read_start,
                      rg_offset,
                      rg_count,
+                     load_trace_id,
+                     read_task_index,
+                     read_task_count,
                      task_memory,
                      unit_count](
                         arrow::Result<milvus_storage::api::RecordBatchVector>&&
@@ -630,11 +674,15 @@ MakeStorageV3ChunkLoadFn(
                         if (!read_result.ok()) {
                             LOG_TRACE(
                                 "[StorageV3] milvus-storage async read "
-                                "failed: trace_label={}, "
+                                "failed: trace_label={}, load_trace_id={}, "
+                                "read_task_index={}, read_task_count={}, "
                                 "localize_executor=disk, read_ms={}, "
                                 "rg_offset={}, rg_count={}, task_memory={}, "
                                 "unit_count={}, status={}",
                                 *trace_label_ptr,
+                                load_trace_id,
+                                read_task_index,
+                                read_task_count,
                                 read_ms,
                                 rg_offset,
                                 rg_count,
@@ -649,16 +697,22 @@ MakeStorageV3ChunkLoadFn(
                         auto batch_count = batches.size();
                         LOG_TRACE(
                             "[StorageV3] milvus-storage async read done: "
-                            "trace_label={}, localize_executor=disk, "
-                            "read_ms={}, rg_offset={}, rg_count={}, "
-                            "task_memory={}, unit_count={}, batch_count={}",
+                            "trace_label={}, load_trace_id={}, "
+                            "read_task_index={}, read_task_count={}, "
+                            "localize_executor=disk, read_ms={}, "
+                            "rg_offset={}, rg_count={}, task_memory={}, "
+                            "unit_count={}, batch_count={}",
                             *trace_label_ptr,
+                            load_trace_id,
+                            read_task_index,
+                            read_task_count,
                             read_ms,
                             rg_offset,
                             rg_count,
                             task_memory,
                             unit_count,
                             batch_count);
+                        auto disk_submit_time = StorageV3TraceClock::now();
                         return SubmitStorageV3ArrowExecutorTask<
                             StorageV3LoadResult>(
                             StorageV3DiskExecutor(),
@@ -667,11 +721,35 @@ MakeStorageV3ChunkLoadFn(
                              batches = std::move(batches),
                              shared_finalizer,
                              trace_label_ptr,
+                             disk_submit_time,
                              rg_offset,
                              rg_count,
+                             load_trace_id,
+                             read_task_index,
+                             read_task_count,
                              task_memory,
                              unit_count,
                              batch_count]() mutable -> StorageV3LoadResult {
+                                auto disk_queue_wait_ms =
+                                    ElapsedMs(disk_submit_time);
+                                LOG_TRACE(
+                                    "[StorageV3] disk executor task start: "
+                                    "trace_label={}, load_trace_id={}, "
+                                    "read_task_index={}, read_task_count={}, "
+                                    "localize_executor=disk, "
+                                    "disk_queue_wait_ms={}, rg_offset={}, "
+                                    "rg_count={}, task_memory={}, "
+                                    "unit_count={}, batch_count={}",
+                                    *trace_label_ptr,
+                                    load_trace_id,
+                                    read_task_index,
+                                    read_task_count,
+                                    disk_queue_wait_ms,
+                                    rg_offset,
+                                    rg_count,
+                                    task_memory,
+                                    unit_count,
+                                    batch_count);
                                 auto finalize_start =
                                     StorageV3TraceClock::now();
                                 auto result = FinalizeStorageV3ReadTask(
@@ -682,12 +760,18 @@ MakeStorageV3ChunkLoadFn(
                                     cancellation_scope);
                                 LOG_TRACE(
                                     "[StorageV3] read task finalizer done: "
-                                    "trace_label={}, "
-                                    "localize_executor=disk, finalize_ms={}, "
+                                    "trace_label={}, load_trace_id={}, "
+                                    "read_task_index={}, read_task_count={}, "
+                                    "localize_executor=disk, "
+                                    "disk_queue_wait_ms={}, finalize_ms={}, "
                                     "rg_offset={}, rg_count={}, "
                                     "task_memory={}, unit_count={}, "
                                     "batch_count={}, ok={}",
                                     *trace_label_ptr,
+                                    load_trace_id,
+                                    read_task_index,
+                                    read_task_count,
+                                    disk_queue_wait_ms,
                                     ElapsedMs(finalize_start),
                                     rg_offset,
                                     rg_count,
@@ -702,10 +786,14 @@ MakeStorageV3ChunkLoadFn(
             auto ew = folly::exception_wrapper(std::current_exception());
             LOG_TRACE(
                 "[StorageV3] milvus-storage async read submit failed: "
-                "trace_label={}, localize_executor={}, elapsed_ms={}, "
+                "trace_label={}, load_trace_id={}, read_task_index={}, "
+                "read_task_count={}, localize_executor={}, elapsed_ms={}, "
                 "rg_offset={}, rg_count={}, task_memory={}, unit_count={}, "
                 "error={}",
                 *trace_label_ptr,
+                load_trace_id,
+                read_task_index,
+                read_task_count,
                 localize_executor_name,
                 ElapsedMs(read_start),
                 rg_offset,
@@ -750,19 +838,28 @@ LoadStorageV3CellsAsync(milvus::OpContext* op_ctx,
 
     auto read_tasks =
         BuildStorageV3ReadTasks(std::move(units), read_task_target_bytes);
+    auto load_trace_id =
+        storage_v3_load_trace_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    auto read_task_count = static_cast<int64_t>(read_tasks.size());
+    for (int64_t i = 0; i < read_task_count; ++i) {
+        read_tasks[i].load_trace_id = load_trace_id;
+        read_tasks[i].read_task_index = i;
+        read_tasks[i].read_task_count = read_task_count;
+    }
     auto shared_loader =
         std::make_shared<StorageV3AsyncLoadFn>(std::move(load));
     auto trace_label_ptr =
         std::make_shared<const std::string>(std::move(trace_label));
     LOG_TRACE(
-        "[StorageV3] load cells scheduled: trace_label={}, priority={}, "
-        "cell_count={}, rg_count={}, read_task_count={}, "
+        "[StorageV3] load cells scheduled: trace_label={}, load_trace_id={}, "
+        "priority={}, cell_count={}, rg_count={}, read_task_count={}, "
         "read_task_target_bytes={}, total_memory={}, total_budget_bytes={}",
         *trace_label_ptr,
+        load_trace_id,
         static_cast<int>(priority),
         requested_cids.size(),
         total_rg_count,
-        read_tasks.size(),
+        read_task_count,
         read_task_target_bytes,
         total_memory,
         total_budget_bytes);

@@ -61,6 +61,9 @@ struct StorageV3LoadUnit {
 struct StorageV3ReadTask {
     int64_t rg_offset;
     int64_t rg_count;
+    uint64_t load_trace_id = 0;
+    int64_t read_task_index = -1;
+    int64_t read_task_count = 0;
     int64_t task_memory = 0;
     std::vector<StorageV3LoadUnit> units;
 };
