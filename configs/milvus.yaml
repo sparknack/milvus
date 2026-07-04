@@ -582,6 +582,7 @@ queryNode:
     storageV2:
       cellTargetSizeBytes: 4194304 # Target average byte size per storage v2 cache cell. Parquet row groups are greedily packed so that rgs_per_cell * avg_row_group_size ≈ this target. Each cell always contains at least one row group and cells never cross file boundaries. Tune larger for bigger batch IO (fewer cells) or smaller to get finer cache granularity. Default 4 MiB.
       enableAsyncLoad: true # Enable the storage v3 async column-group load translator. Disable to compare with the original synchronous translator.
+      diskExecutorNumThreads: 0 # Number of threads in the Storage V3 disk localize executor used by async column-group load. 0 keeps the default CPUNum-sized executor. Set a smaller positive value to reduce concurrent mmap-localized field-data writes.
     deleteDumpBatchSize: 10000 # Batch size for delete snapshot dump in segcore.
   loadMemoryUsageFactor: 1 # The multiply factor of calculating the memory usage while loading segments
   enableDisk: false # enable querynode load disk index, and search on disk index

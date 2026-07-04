@@ -48,6 +48,17 @@ IsHighPriority(milvus::proto::common::LoadPriority priority) {
 using StorageV3TraceClock = std::chrono::steady_clock;
 
 std::atomic<uint64_t> storage_v3_load_trace_seq{0};
+std::atomic<int> storage_v3_disk_executor_num_threads{0};
+
+size_t
+ResolveStorageV3DiskExecutorNumThreads() {
+    auto configured =
+        storage_v3_disk_executor_num_threads.load(std::memory_order_acquire);
+    if (configured <= 0) {
+        return static_cast<size_t>(std::max(1, milvus::CPU_NUM));
+    }
+    return static_cast<size_t>(configured);
+}
 
 int64_t
 ElapsedMs(StorageV3TraceClock::time_point start) {
@@ -142,20 +153,32 @@ StorageV3HighPriorityExecutor() {
 class StorageV3DiskArrowExecutor final : public arrow::internal::Executor {
  public:
     StorageV3DiskArrowExecutor()
-        : thread_count_(std::max(1, milvus::CPU_NUM)),
+        : thread_count_(ResolveStorageV3DiskExecutorNumThreads()),
           executor_(
-              thread_count_,
+              thread_count_.load(std::memory_order_acquire),
               std::make_shared<folly::NamedThreadFactory>("STORAGEV3_DISK_")) {
     }
 
     int
     GetCapacity() override {
-        return static_cast<int>(thread_count_);
+        return static_cast<int>(thread_count_.load(std::memory_order_acquire));
     }
 
     bool
     OwnsThisThread() override {
         return current_executor_ == this;
+    }
+
+    void
+    Resize(size_t thread_count) {
+        thread_count = std::max<size_t>(1, thread_count);
+        auto current = thread_count_.load(std::memory_order_acquire);
+        if (current == thread_count) {
+            return;
+        }
+        executor_.setNumThreads(thread_count);
+        thread_count_.store(thread_count, std::memory_order_release);
+        LOG_INFO("StorageV3 disk executor resized to {} threads", thread_count);
     }
 
  protected:
@@ -199,13 +222,19 @@ class StorageV3DiskArrowExecutor final : public arrow::internal::Executor {
     }
 
  private:
-    size_t thread_count_;
+    std::atomic<size_t> thread_count_;
     folly::CPUThreadPoolExecutor executor_;
     static thread_local StorageV3DiskArrowExecutor* current_executor_;
 };
 
 thread_local StorageV3DiskArrowExecutor*
     StorageV3DiskArrowExecutor::current_executor_ = nullptr;
+
+StorageV3DiskArrowExecutor&
+StorageV3DiskExecutorInstance() {
+    static StorageV3DiskArrowExecutor executor;
+    return executor;
+}
 
 template <typename Result, typename Func>
 folly::SemiFuture<Result>
@@ -250,8 +279,21 @@ SubmitStorageV3ArrowExecutorTask(arrow::internal::Executor* executor,
 
 arrow::internal::Executor*
 StorageV3DiskExecutor() {
-    static StorageV3DiskArrowExecutor executor;
-    return &executor;
+    return &StorageV3DiskExecutorInstance();
+}
+
+void
+SetStorageV3DiskExecutorNumThreads(int threads) {
+    if (threads < 0) {
+        LOG_WARN(
+            "Invalid StorageV3 disk executor thread count {}, using default",
+            threads);
+        threads = 0;
+    }
+    storage_v3_disk_executor_num_threads.store(threads,
+                                               std::memory_order_release);
+    StorageV3DiskExecutorInstance().Resize(
+        ResolveStorageV3DiskExecutorNumThreads());
 }
 
 std::vector<StorageV3ReadTask>

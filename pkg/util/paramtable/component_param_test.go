@@ -74,6 +74,19 @@ func TestComponentParam(t *testing.T) {
 		assert.False(t, asyncLoad.GetAsBool())
 	})
 
+	t.Run("query node storage v2 disk executor threads config", func(t *testing.T) {
+		diskThreads := params.QueryNodeCfg.StorageV2DiskExecutorNumThreads
+		assert.Equal(t, "queryNode.segcore.storageV2.diskExecutorNumThreads", diskThreads.Key)
+		assert.Equal(t, 0, diskThreads.GetAsInt())
+
+		params.Save(diskThreads.Key, "2")
+		assert.Equal(t, 2, diskThreads.GetAsInt())
+
+		params.Save(diskThreads.Key, "-1")
+		defer params.Reset(diskThreads.Key)
+		assert.Equal(t, 0, diskThreads.GetAsInt())
+	})
+
 	t.Run("test commonConfig", func(t *testing.T) {
 		Params := &params.CommonCfg
 

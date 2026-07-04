@@ -33,6 +33,7 @@
 #include "exec/expression/ExprCache.h"
 #include "log/Log.h"
 #include "segcore/memory_planner.h"
+#include "segcore/storagev2translator/AsyncLoadPipeline.h"
 #include "segcore/storagev2translator/GroupCTMeta.h"
 #include "segcore/storagev2translator/StorageV2Config.h"
 #include "storage/EntryStreamUtils.h"
@@ -221,6 +222,12 @@ SetStorageV2CellTargetSizeBytes(int64_t bytes) {
 void
 SetStorageV2AsyncLoadEnabled(bool enabled) {
     milvus::segcore::storagev2translator::SetStorageV2AsyncLoadEnabled(enabled);
+}
+
+void
+SetStorageV3DiskExecutorNumThreads(int threads) {
+    milvus::segcore::storagev2translator::SetStorageV3DiskExecutorNumThreads(
+        threads);
 }
 
 void

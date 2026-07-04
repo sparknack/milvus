@@ -168,6 +168,8 @@ func doInitQueryNodeOnce(ctx context.Context) error {
 	C.SetStorageV2CellTargetSizeBytes(cStorageV2CellTargetSizeBytes)
 	cStorageV2EnableAsyncLoad := C.bool(paramtable.Get().QueryNodeCfg.StorageV2EnableAsyncLoad.GetAsBool())
 	C.SetStorageV2AsyncLoadEnabled(cStorageV2EnableAsyncLoad)
+	cStorageV2DiskExecutorNumThreads := C.int(paramtable.Get().QueryNodeCfg.StorageV2DiskExecutorNumThreads.GetAsInt())
+	C.SetStorageV3DiskExecutorNumThreads(cStorageV2DiskExecutorNumThreads)
 	enableParquetStatsSkipIndex := paramtable.Get().CommonCfg.ParquetStatsSkipIndex.GetAsBool()
 	C.SetDefaultEnableParquetStatsSkipIndex(C.bool(enableParquetStatsSkipIndex))
 

@@ -296,6 +296,16 @@ func (node *QueryNode) RegisterSegcoreConfigWatcher() {
 			mlog.Info(node.ctx, "queryNode.segcore.storageV2.enableAsyncLoad updated",
 				mlog.Bool("enabled", enabled))
 		}))
+	pt.Watch(pt.QueryNodeCfg.StorageV2DiskExecutorNumThreads.Key,
+		config.NewHandler("queryNode.segcore.storageV2.diskExecutorNumThreads", func(evt *config.Event) {
+			if !evt.HasUpdated {
+				return
+			}
+			threads := paramtable.Get().QueryNodeCfg.StorageV2DiskExecutorNumThreads.GetAsInt()
+			initcore.UpdateStorageV2DiskExecutorNumThreads(threads)
+			mlog.Info(node.ctx, "queryNode.segcore.storageV2.diskExecutorNumThreads updated",
+				mlog.Int("threads", threads))
+		}))
 	initcore.RegisterArrowReaderConfigWatchers(pt, "querynode")
 }
 

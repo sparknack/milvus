@@ -3671,8 +3671,9 @@ type queryNodeConfig struct {
 
 	// Target average byte size per storage v2 cache cell. Parquet row groups
 	// are packed into cells so rgs_per_cell * avg_rg_size ≈ this value.
-	StorageV2CellTargetSizeBytes ParamItem `refreshable:"true"`
-	StorageV2EnableAsyncLoad     ParamItem `refreshable:"true"`
+	StorageV2CellTargetSizeBytes    ParamItem `refreshable:"true"`
+	StorageV2EnableAsyncLoad        ParamItem `refreshable:"true"`
+	StorageV2DiskExecutorNumThreads ParamItem `refreshable:"true"`
 
 	EnableWorkerSQCostMetrics ParamItem `refreshable:"true"`
 
@@ -4908,6 +4909,24 @@ user-task-polling:
 		Export:       true,
 	}
 	p.StorageV2EnableAsyncLoad.Init(base.mgr)
+
+	p.StorageV2DiskExecutorNumThreads = ParamItem{
+		Key:          "queryNode.segcore.storageV2.diskExecutorNumThreads",
+		Version:      "3.0.0",
+		DefaultValue: "0",
+		Doc: `Number of threads in the Storage V3 disk localize executor used by the async storage v3 column-group load translator.
+0 keeps the default CPUNum-sized executor. Set a smaller positive value to reduce concurrent mmap-localized field-data writes.`,
+		Export: true,
+		Formatter: func(v string) string {
+			if getAsInt64(v) < 0 {
+				mlog.Warn(context.TODO(), "queryNode.segcore.storageV2.diskExecutorNumThreads must be non-negative, using default 0",
+					mlog.String("configured", v))
+				return "0"
+			}
+			return v
+		},
+	}
+	p.StorageV2DiskExecutorNumThreads.Init(base.mgr)
 
 	p.EnableWorkerSQCostMetrics = ParamItem{
 		Key:          "queryNode.enableWorkerSQCostMetrics",

@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "arrow/util/thread_pool.h"
+#include "folly/ScopeGuard.h"
 #include "folly/coro/BlockingWait.h"
 #include "folly/coro/FutureUtil.h"
 #include "gtest/gtest.h"
@@ -549,6 +550,21 @@ TEST(ManifestGroupTranslatorAsyncPipelineTest,
     EXPECT_NE(cells[0].chunk, nullptr);
     EXPECT_FALSE(finalizer_on_materialize_executor.load());
     EXPECT_TRUE(finalizer_on_disk_executor.load());
+}
+
+TEST(ManifestGroupTranslatorAsyncPipelineTest,
+     DiskExecutorNumThreadsCanBeConfigured) {
+    auto reset =
+        folly::makeGuard([] { SetStorageV3DiskExecutorNumThreads(0); });
+
+    SetStorageV3DiskExecutorNumThreads(1);
+    EXPECT_EQ(StorageV3DiskExecutor()->GetCapacity(), 1);
+
+    SetStorageV3DiskExecutorNumThreads(2);
+    EXPECT_EQ(StorageV3DiskExecutor()->GetCapacity(), 2);
+
+    SetStorageV3DiskExecutorNumThreads(0);
+    EXPECT_GE(StorageV3DiskExecutor()->GetCapacity(), 1);
 }
 
 TEST(ManifestGroupTranslatorAsyncPipelineTest,

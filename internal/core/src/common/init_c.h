@@ -125,6 +125,11 @@ SetStorageV2CellTargetSizeBytes(int64_t bytes);
 void
 SetStorageV2AsyncLoadEnabled(bool enabled);
 
+// Number of threads in the storage v3 disk localize executor. Values <= 0 keep
+// the CPUNum-sized default.
+void
+SetStorageV3DiskExecutorNumThreads(int threads);
+
 #ifdef __cplusplus
 };
 #endif

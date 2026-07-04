@@ -193,6 +193,10 @@ func UpdateStorageV2AsyncLoadEnabled(enabled bool) {
 	C.SetStorageV2AsyncLoadEnabled(C.bool(enabled))
 }
 
+func UpdateStorageV2DiskExecutorNumThreads(threads int) {
+	C.SetStorageV3DiskExecutorNumThreads(C.int(threads))
+}
+
 func UpdateDefaultGrowingJSONKeyStatsEnable(enable bool) {
 	C.SetDefaultGrowingJSONKeyStatsEnable(C.bool(enable))
 }

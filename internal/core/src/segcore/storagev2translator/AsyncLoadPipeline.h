@@ -105,6 +105,9 @@ enum class StorageV3LocalizeExecutor {
 arrow::internal::Executor*
 StorageV3DiskExecutor();
 
+void
+SetStorageV3DiskExecutorNumThreads(int threads);
+
 StorageV3AsyncLoadFn
 MakeStorageV3ChunkLoadFn(
     std::shared_ptr<milvus_storage::api::ChunkReader> chunk_reader,
