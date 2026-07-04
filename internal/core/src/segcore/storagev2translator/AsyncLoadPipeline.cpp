@@ -17,9 +17,11 @@
 #include "segcore/storagev2translator/AsyncLoadPipeline.h"
 
 #include <algorithm>
+#include <chrono>
 #include <exception>
 #include <limits>
 #include <numeric>
+#include <string>
 #include <unordered_map>
 #include <utility>
 
@@ -29,6 +31,7 @@
 #include "folly/coro/FutureUtil.h"
 #include "folly/executors/CPUThreadPoolExecutor.h"
 #include "folly/executors/thread_factory/NamedThreadFactory.h"
+#include "log/Log.h"
 #include "segcore/Utils.h"
 #include "storage/EntryStreamUtils.h"
 
@@ -39,6 +42,26 @@ namespace {
 bool
 IsHighPriority(milvus::proto::common::LoadPriority priority) {
     return priority == milvus::proto::common::LoadPriority::HIGH;
+}
+
+using StorageV3TraceClock = std::chrono::steady_clock;
+
+int64_t
+ElapsedMs(StorageV3TraceClock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               StorageV3TraceClock::now() - start)
+        .count();
+}
+
+const char*
+LocalizeExecutorName(StorageV3LocalizeExecutor localize_executor) {
+    switch (localize_executor) {
+        case StorageV3LocalizeExecutor::Materialize:
+            return "materialize";
+        case StorageV3LocalizeExecutor::Disk:
+            return "disk";
+    }
+    return "unknown";
 }
 
 class MilvusThreadPoolArrowExecutor final : public arrow::internal::Executor {
@@ -352,18 +375,96 @@ ReadAndFinalizeStorageV3TaskAsync(
     StorageV3ReadTask task,
     const std::shared_ptr<StorageV3AsyncLoadFn>& load,
     milvus::proto::common::LoadPriority priority,
-    StorageV3AdmissionScheduler& scheduler) {
+    StorageV3AdmissionScheduler& scheduler,
+    std::shared_ptr<const std::string> trace_label) {
     constexpr const char* cancellation_scope = "LoadStorageV3CellsAsync";
     CheckCancellation(op_ctx, -1, cancellation_scope);
 
     auto budget_bytes = StorageV3ReadTaskBudgetBytes(task);
+    auto rg_offset = task.rg_offset;
+    auto rg_count = task.rg_count;
+    auto task_memory = task.task_memory;
+    auto unit_count = task.units.size();
+    auto first_cid = task.units.empty() ? milvus::cachinglayer::cid_t{-1}
+                                        : task.units.front().cid;
+    auto last_cid = task.units.empty() ? milvus::cachinglayer::cid_t{-1}
+                                       : task.units.back().cid;
+    auto admit_start = StorageV3TraceClock::now();
+    LOG_TRACE(
+        "[StorageV3] read task admission start: trace_label={}, priority={}, "
+        "budget_bytes={}, rg_offset={}, rg_count={}, task_memory={}, "
+        "unit_count={}, first_cid={}, last_cid={}",
+        *trace_label,
+        static_cast<int>(priority),
+        budget_bytes,
+        rg_offset,
+        rg_count,
+        task_memory,
+        unit_count,
+        first_cid,
+        last_cid);
     auto lease =
         co_await folly::coro::toTask(scheduler.Admit(priority, budget_bytes));
     (void)lease;
+    auto admit_wait_ms = ElapsedMs(admit_start);
+    LOG_TRACE(
+        "[StorageV3] read task admission granted: trace_label={}, "
+        "priority={}, budget_bytes={}, admit_wait_ms={}, rg_offset={}, "
+        "rg_count={}, task_memory={}, unit_count={}, first_cid={}, "
+        "last_cid={}",
+        *trace_label,
+        static_cast<int>(priority),
+        budget_bytes,
+        admit_wait_ms,
+        rg_offset,
+        rg_count,
+        task_memory,
+        unit_count,
+        first_cid,
+        last_cid);
 
     CheckCancellation(op_ctx, -1, cancellation_scope);
+    auto load_start = StorageV3TraceClock::now();
     auto loaded_cells_result =
         co_await folly::coro::toTask((*load)(op_ctx, std::move(task)));
+    auto load_ms = ElapsedMs(load_start);
+    if (!loaded_cells_result.ok()) {
+        LOG_TRACE(
+            "[StorageV3] read task load failed: trace_label={}, "
+            "priority={}, budget_bytes={}, admit_wait_ms={}, load_ms={}, "
+            "rg_offset={}, rg_count={}, task_memory={}, unit_count={}, "
+            "first_cid={}, last_cid={}, status={}",
+            *trace_label,
+            static_cast<int>(priority),
+            budget_bytes,
+            admit_wait_ms,
+            load_ms,
+            rg_offset,
+            rg_count,
+            task_memory,
+            unit_count,
+            first_cid,
+            last_cid,
+            loaded_cells_result.status().ToString());
+    } else {
+        LOG_TRACE(
+            "[StorageV3] read task load done: trace_label={}, priority={}, "
+            "budget_bytes={}, admit_wait_ms={}, load_ms={}, rg_offset={}, "
+            "rg_count={}, task_memory={}, unit_count={}, first_cid={}, "
+            "last_cid={}, loaded_cell_count={}",
+            *trace_label,
+            static_cast<int>(priority),
+            budget_bytes,
+            admit_wait_ms,
+            load_ms,
+            rg_offset,
+            rg_count,
+            task_memory,
+            unit_count,
+            first_cid,
+            last_cid,
+            loaded_cells_result.ValueOrDie()->size());
+    }
     AssertInfo(loaded_cells_result.ok(),
                "[StorageV3] Failed to load task: {}",
                loaded_cells_result.status().ToString());
@@ -415,36 +516,95 @@ StorageV3AsyncLoadFn
 MakeStorageV3ChunkLoadFn(
     std::shared_ptr<milvus_storage::api::ChunkReader> chunk_reader,
     milvus::segcore::CellFinalizeFunc finalize_cell,
-    StorageV3LocalizeExecutor localize_executor) {
+    StorageV3LocalizeExecutor localize_executor,
+    std::string trace_label) {
     auto shared_finalizer = std::make_shared<milvus::segcore::CellFinalizeFunc>(
         std::move(finalize_cell));
+    auto trace_label_ptr =
+        std::make_shared<const std::string>(std::move(trace_label));
     return [chunk_reader = std::move(chunk_reader),
             shared_finalizer,
-            localize_executor](milvus::OpContext* op_ctx,
-                               StorageV3ReadTask task)
+            localize_executor,
+            trace_label_ptr](milvus::OpContext* op_ctx, StorageV3ReadTask task)
                -> folly::SemiFuture<StorageV3LoadResult> {
         constexpr const char* cancellation_scope = "LoadStorageV3CellsAsync";
         std::vector<int64_t> rg_indices(task.rg_count);
         std::iota(rg_indices.begin(), rg_indices.end(), task.rg_offset);
+        auto rg_offset = task.rg_offset;
+        auto rg_count = task.rg_count;
+        auto task_memory = task.task_memory;
+        auto unit_count = task.units.size();
+        auto localize_executor_name = LocalizeExecutorName(localize_executor);
 
         milvus_storage::api::AsyncReadOptions options;
         options.read_parallelism = 1;
         options.materialize_executor = StorageV3HighPriorityExecutor();
 
+        auto read_start = StorageV3TraceClock::now();
         try {
+            LOG_TRACE(
+                "[StorageV3] milvus-storage async read submit: "
+                "trace_label={}, localize_executor={}, rg_offset={}, "
+                "rg_count={}, task_memory={}, unit_count={}, "
+                "read_parallelism={}",
+                *trace_label_ptr,
+                localize_executor_name,
+                rg_offset,
+                rg_count,
+                task_memory,
+                unit_count,
+                options.read_parallelism);
             if (localize_executor == StorageV3LocalizeExecutor::Materialize) {
                 return milvus_storage::api::get_chunks_async_then(
                     chunk_reader,
                     std::move(rg_indices),
                     options,
-                    [op_ctx, task = std::move(task), shared_finalizer](
-                        milvus_storage::api::RecordBatchVector&&
-                            batches) mutable -> StorageV3LoadResult {
-                        return FinalizeStorageV3ReadTask(op_ctx,
-                                                         std::move(task),
-                                                         std::move(batches),
-                                                         shared_finalizer,
-                                                         cancellation_scope);
+                    [op_ctx,
+                     task = std::move(task),
+                     shared_finalizer,
+                     trace_label_ptr,
+                     read_start,
+                     rg_offset,
+                     rg_count,
+                     task_memory,
+                     unit_count](milvus_storage::api::RecordBatchVector&&
+                                     batches) mutable -> StorageV3LoadResult {
+                        auto read_ms = ElapsedMs(read_start);
+                        auto batch_count = batches.size();
+                        LOG_TRACE(
+                            "[StorageV3] milvus-storage async read done: "
+                            "trace_label={}, localize_executor=materialize, "
+                            "read_ms={}, rg_offset={}, rg_count={}, "
+                            "task_memory={}, unit_count={}, batch_count={}",
+                            *trace_label_ptr,
+                            read_ms,
+                            rg_offset,
+                            rg_count,
+                            task_memory,
+                            unit_count,
+                            batch_count);
+                        auto finalize_start = StorageV3TraceClock::now();
+                        auto result =
+                            FinalizeStorageV3ReadTask(op_ctx,
+                                                      std::move(task),
+                                                      std::move(batches),
+                                                      shared_finalizer,
+                                                      cancellation_scope);
+                        LOG_TRACE(
+                            "[StorageV3] read task finalizer done: "
+                            "trace_label={}, localize_executor=materialize, "
+                            "finalize_ms={}, rg_offset={}, rg_count={}, "
+                            "task_memory={}, unit_count={}, batch_count={}, "
+                            "ok={}",
+                            *trace_label_ptr,
+                            ElapsedMs(finalize_start),
+                            rg_offset,
+                            rg_count,
+                            task_memory,
+                            unit_count,
+                            batch_count,
+                            result.ok());
+                        return result;
                     });
             }
 
@@ -455,36 +615,105 @@ MakeStorageV3ChunkLoadFn(
                     [chunk_reader,
                      op_ctx,
                      task = std::move(task),
-                     shared_finalizer](
+                     shared_finalizer,
+                     trace_label_ptr,
+                     read_start,
+                     rg_offset,
+                     rg_count,
+                     task_memory,
+                     unit_count](
                         arrow::Result<milvus_storage::api::RecordBatchVector>&&
                             read_result) mutable
                     -> folly::SemiFuture<StorageV3LoadResult> {
                         (void)chunk_reader;
+                        auto read_ms = ElapsedMs(read_start);
                         if (!read_result.ok()) {
+                            LOG_TRACE(
+                                "[StorageV3] milvus-storage async read "
+                                "failed: trace_label={}, "
+                                "localize_executor=disk, read_ms={}, "
+                                "rg_offset={}, rg_count={}, task_memory={}, "
+                                "unit_count={}, status={}",
+                                *trace_label_ptr,
+                                read_ms,
+                                rg_offset,
+                                rg_count,
+                                task_memory,
+                                unit_count,
+                                read_result.status().ToString());
                             return folly::makeSemiFuture(
                                 StorageV3LoadResult(read_result.status()));
                         }
 
                         auto batches = read_result.MoveValueUnsafe();
+                        auto batch_count = batches.size();
+                        LOG_TRACE(
+                            "[StorageV3] milvus-storage async read done: "
+                            "trace_label={}, localize_executor=disk, "
+                            "read_ms={}, rg_offset={}, rg_count={}, "
+                            "task_memory={}, unit_count={}, batch_count={}",
+                            *trace_label_ptr,
+                            read_ms,
+                            rg_offset,
+                            rg_count,
+                            task_memory,
+                            unit_count,
+                            batch_count);
                         return SubmitStorageV3ArrowExecutorTask<
                             StorageV3LoadResult>(
                             StorageV3DiskExecutor(),
                             [op_ctx,
                              task = std::move(task),
                              batches = std::move(batches),
-                             shared_finalizer]() mutable
-                            -> StorageV3LoadResult {
-                                return FinalizeStorageV3ReadTask(
+                             shared_finalizer,
+                             trace_label_ptr,
+                             rg_offset,
+                             rg_count,
+                             task_memory,
+                             unit_count,
+                             batch_count]() mutable -> StorageV3LoadResult {
+                                auto finalize_start =
+                                    StorageV3TraceClock::now();
+                                auto result = FinalizeStorageV3ReadTask(
                                     op_ctx,
                                     std::move(task),
                                     std::move(batches),
                                     shared_finalizer,
                                     cancellation_scope);
+                                LOG_TRACE(
+                                    "[StorageV3] read task finalizer done: "
+                                    "trace_label={}, "
+                                    "localize_executor=disk, finalize_ms={}, "
+                                    "rg_offset={}, rg_count={}, "
+                                    "task_memory={}, unit_count={}, "
+                                    "batch_count={}, ok={}",
+                                    *trace_label_ptr,
+                                    ElapsedMs(finalize_start),
+                                    rg_offset,
+                                    rg_count,
+                                    task_memory,
+                                    unit_count,
+                                    batch_count,
+                                    result.ok());
+                                return result;
                             });
                     });
         } catch (...) {
-            return folly::makeSemiFuture<StorageV3LoadResult>(
-                folly::exception_wrapper(std::current_exception()));
+            auto ew = folly::exception_wrapper(std::current_exception());
+            LOG_TRACE(
+                "[StorageV3] milvus-storage async read submit failed: "
+                "trace_label={}, localize_executor={}, elapsed_ms={}, "
+                "rg_offset={}, rg_count={}, task_memory={}, unit_count={}, "
+                "error={}",
+                *trace_label_ptr,
+                localize_executor_name,
+                ElapsedMs(read_start),
+                rg_offset,
+                rg_count,
+                task_memory,
+                unit_count,
+                ew.what());
+            return folly::makeSemiFuture<StorageV3LoadResult>(std::move(ew));
         }
     };
 }
@@ -495,27 +724,58 @@ LoadStorageV3CellsAsync(milvus::OpContext* op_ctx,
                         StorageV3AsyncLoadFn load,
                         int64_t read_task_target_bytes,
                         milvus::proto::common::LoadPriority priority,
-                        StorageV3AdmissionScheduler& scheduler) {
+                        StorageV3AdmissionScheduler& scheduler,
+                        std::string trace_label) {
     if (units.empty()) {
         co_return StorageV3LoadedCells{};
     }
 
+    size_t total_budget_bytes = 0;
+    int64_t total_memory = 0;
+    int64_t total_rg_count = 0;
     std::vector<milvus::cachinglayer::cid_t> requested_cids;
     requested_cids.reserve(units.size());
     for (const auto& unit : units) {
         requested_cids.push_back(unit.cid);
+        auto unit_budget_bytes = StorageV3LoadUnitBudgetBytes(unit);
+        if (unit_budget_bytes >
+            std::numeric_limits<size_t>::max() - total_budget_bytes) {
+            total_budget_bytes = std::numeric_limits<size_t>::max();
+        } else {
+            total_budget_bytes += unit_budget_bytes;
+        }
+        total_memory += unit.memory_size;
+        total_rg_count += unit.rg_count;
     }
 
     auto read_tasks =
         BuildStorageV3ReadTasks(std::move(units), read_task_target_bytes);
     auto shared_loader =
         std::make_shared<StorageV3AsyncLoadFn>(std::move(load));
+    auto trace_label_ptr =
+        std::make_shared<const std::string>(std::move(trace_label));
+    LOG_TRACE(
+        "[StorageV3] load cells scheduled: trace_label={}, priority={}, "
+        "cell_count={}, rg_count={}, read_task_count={}, "
+        "read_task_target_bytes={}, total_memory={}, total_budget_bytes={}",
+        *trace_label_ptr,
+        static_cast<int>(priority),
+        requested_cids.size(),
+        total_rg_count,
+        read_tasks.size(),
+        read_task_target_bytes,
+        total_memory,
+        total_budget_bytes);
 
     std::vector<folly::coro::Task<StorageV3LoadedCellsPtr>> tasks;
     tasks.reserve(read_tasks.size());
     for (auto& read_task : read_tasks) {
-        tasks.push_back(ReadAndFinalizeStorageV3TaskAsync(
-            op_ctx, std::move(read_task), shared_loader, priority, scheduler));
+        tasks.push_back(ReadAndFinalizeStorageV3TaskAsync(op_ctx,
+                                                          std::move(read_task),
+                                                          shared_loader,
+                                                          priority,
+                                                          scheduler,
+                                                          trace_label_ptr));
     }
 
     auto task_results = co_await folly::coro::collectAllRange(std::move(tasks));

@@ -303,7 +303,8 @@ ManifestGroupTranslatorV2::get_cells(
                 tables, static_cast<milvus::cachinglayer::cid_t>(cid));
         },
         use_mmap_ ? StorageV3LocalizeExecutor::Disk
-                  : StorageV3LocalizeExecutor::Materialize);
+                  : StorageV3LocalizeExecutor::Materialize,
+        key_);
 
     auto loaded_cells = folly::coro::blockingWait(
         LoadStorageV3CellsAsync(ctx,
@@ -311,7 +312,8 @@ ManifestGroupTranslatorV2::get_cells(
                                 std::move(load),
                                 FieldDataReadWindowBytes(),
                                 load_priority_,
-                                GetStorageV3LoadAdmissionScheduler()));
+                                GetStorageV3LoadAdmissionScheduler(),
+                                key_));
 
     LOG_INFO(
         "[StorageV3] translator {} loaded {} cells for manifest "

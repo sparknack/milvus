@@ -23,6 +23,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -106,7 +107,8 @@ MakeStorageV3ChunkLoadFn(
     std::shared_ptr<milvus_storage::api::ChunkReader> chunk_reader,
     milvus::segcore::CellFinalizeFunc finalize_cell,
     StorageV3LocalizeExecutor localize_executor =
-        StorageV3LocalizeExecutor::Materialize);
+        StorageV3LocalizeExecutor::Materialize,
+    std::string trace_label = {});
 
 template <typename Func>
 auto
@@ -236,7 +238,8 @@ LoadStorageV3CellsAsync(milvus::OpContext* op_ctx,
                         StorageV3AsyncLoadFn load,
                         int64_t read_task_target_bytes,
                         milvus::proto::common::LoadPriority priority,
-                        StorageV3AdmissionScheduler& scheduler);
+                        StorageV3AdmissionScheduler& scheduler,
+                        std::string trace_label = {});
 
 template <typename Func>
 auto
