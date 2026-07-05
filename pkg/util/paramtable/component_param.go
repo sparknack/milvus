@@ -3673,6 +3673,7 @@ type queryNodeConfig struct {
 	// are packed into cells so rgs_per_cell * avg_rg_size ≈ this value.
 	StorageV2CellTargetSizeBytes ParamItem `refreshable:"true"`
 	StorageV2EnableAsyncLoad     ParamItem `refreshable:"true"`
+	ScalarIndexV3EnableAsyncLoad ParamItem `refreshable:"true"`
 
 	EnableWorkerSQCostMetrics ParamItem `refreshable:"true"`
 
@@ -4908,6 +4909,15 @@ user-task-polling:
 		Export:       true,
 	}
 	p.StorageV2EnableAsyncLoad.Init(base.mgr)
+
+	p.ScalarIndexV3EnableAsyncLoad = ParamItem{
+		Key:          "queryNode.segcore.scalarIndexV3.enableAsyncLoad",
+		Version:      "3.0.0",
+		DefaultValue: "false",
+		Doc:          "Whether to use async entry loading for scalar packed-index v3 files.",
+		Export:       true,
+	}
+	p.ScalarIndexV3EnableAsyncLoad.Init(base.mgr)
 
 	p.EnableWorkerSQCostMetrics = ParamItem{
 		Key:          "queryNode.enableWorkerSQCostMetrics",

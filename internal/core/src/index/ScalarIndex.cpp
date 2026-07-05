@@ -27,10 +27,12 @@
 #include "index/IndexStats.h"
 #include "index/Meta.h"
 #include "index/ScalarIndex.h"
+#include "index/ScalarIndexV3Config.h"
 #include "index/Utils.h"
 #include "knowhere/dataset.h"
 #include "log/Log.h"
 #include "pb/schema.pb.h"
+#include "segcore/async_load/AsyncLoadScheduler.h"
 #include "storage/FileManager.h"
 #include "storage/IndexEntryReader.h"
 #include "storage/IndexEntryWriter.h"
@@ -256,7 +258,16 @@ ScalarIndex<T>::LoadUnified(const Config& config, milvus::OpContext* op_ctx) {
                                         cancellation_token);
     AssertInfo(reader != nullptr, "failed to create IndexEntryReader");
 
-    LoadEntries(*reader, config);
+    if (ScalarIndexV3AsyncLoadEnabled()) {
+        ScalarIndexV3AsyncLoadContext async_ctx{
+            op_ctx,
+            load_priority,
+            milvus::segcore::async_load::GetLoadAdmissionScheduler(),
+            fmt::format("scalar_index_v3_{}", index_type_)};
+        LoadEntriesWithAsyncRead(*reader, config, async_ctx);
+    } else {
+        LoadEntries(*reader, config);
+    }
 
     LOG_INFO("LoadUnified completed for index type: {}", index_type_);
 }

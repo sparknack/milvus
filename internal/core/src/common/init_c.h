@@ -125,6 +125,10 @@ SetStorageV2CellTargetSizeBytes(int64_t bytes);
 void
 SetStorageV2AsyncLoadEnabled(bool enabled);
 
+// Enable async entry loading for scalar packed-index v3 files.
+void
+SetScalarIndexV3AsyncLoadEnabled(bool enabled);
+
 #ifdef __cplusplus
 };
 #endif

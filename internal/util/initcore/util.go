@@ -193,6 +193,10 @@ func UpdateStorageV2AsyncLoadEnabled(enabled bool) {
 	C.SetStorageV2AsyncLoadEnabled(C.bool(enabled))
 }
 
+func UpdateScalarIndexV3AsyncLoadEnabled(enabled bool) {
+	C.SetScalarIndexV3AsyncLoadEnabled(C.bool(enabled))
+}
+
 func UpdateDefaultGrowingJSONKeyStatsEnable(enable bool) {
 	C.SetDefaultGrowingJSONKeyStatsEnable(C.bool(enable))
 }

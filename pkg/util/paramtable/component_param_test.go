@@ -74,6 +74,16 @@ func TestComponentParam(t *testing.T) {
 		assert.False(t, asyncLoad.GetAsBool())
 	})
 
+	t.Run("query node scalar index v3 async load config", func(t *testing.T) {
+		asyncLoad := params.QueryNodeCfg.ScalarIndexV3EnableAsyncLoad
+		assert.Equal(t, "queryNode.segcore.scalarIndexV3.enableAsyncLoad", asyncLoad.Key)
+		assert.False(t, asyncLoad.GetAsBool())
+
+		params.Save(asyncLoad.Key, "true")
+		defer params.Reset(asyncLoad.Key)
+		assert.True(t, asyncLoad.GetAsBool())
+	})
+
 	t.Run("test commonConfig", func(t *testing.T) {
 		Params := &params.CommonCfg
 

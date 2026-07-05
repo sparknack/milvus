@@ -26,6 +26,15 @@
 #include "index/Index.h"
 #include "fmt/format.h"
 #include "index/Meta.h"
+#include "pb/common.pb.h"
+
+namespace milvus {
+class OpContext;
+}
+
+namespace milvus::segcore::async_load {
+class LoadAdmissionScheduler;
+}
 
 namespace milvus::storage {
 class IndexEntryWriter;
@@ -35,6 +44,13 @@ using MemFileManagerImplPtr = std::shared_ptr<MemFileManagerImpl>;
 }  // namespace milvus::storage
 
 namespace milvus::index {
+
+struct ScalarIndexV3AsyncLoadContext {
+    milvus::OpContext* op_ctx;
+    milvus::proto::common::LoadPriority load_priority;
+    milvus::segcore::async_load::LoadAdmissionScheduler& scheduler;
+    std::string trace_label;
+};
 
 enum class ScalarIndexType {
     NONE = 0,
@@ -249,6 +265,14 @@ class ScalarIndex : public IndexBase {
     }
 
  protected:
+    virtual void
+    LoadEntriesWithAsyncRead(storage::IndexEntryReader& reader,
+                             const Config& config,
+                             ScalarIndexV3AsyncLoadContext& async_ctx) {
+        (void)async_ctx;
+        LoadEntries(reader, config);
+    }
+
     // Execute a LIKE-pattern query inside PatternMatch implementations.
     // @param pattern: a raw SQL LIKE pattern (e.g. "%hello%", "abc_def"),
     //   NOT a regex. Implementations must convert internally if needed
