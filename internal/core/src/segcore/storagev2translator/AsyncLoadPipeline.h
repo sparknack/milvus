@@ -18,11 +18,8 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <deque>
-#include <exception>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -35,6 +32,8 @@
 #include "common/OpContext.h"
 #include "milvus-storage/reader.h"
 #include "pb/common.pb.h"
+#include "segcore/async_load/AsyncLoadExecutor.h"
+#include "segcore/async_load/AsyncLoadScheduler.h"
 #include "segcore/memory_planner.h"
 #include "segcore/storagev2translator/GroupCTMeta.h"
 #include "storage/ThreadPools.h"
@@ -118,116 +117,15 @@ auto
 SubmitStorageV3LoadTask(milvus::proto::common::LoadPriority priority,
                         Func&& func)
     -> folly::SemiFuture<std::invoke_result_t<std::decay_t<Func>&>> {
-    using TaskFunc = std::decay_t<Func>;
-    using Result = std::invoke_result_t<TaskFunc&>;
-
-    folly::Promise<Result> promise;
-    auto future = promise.getSemiFuture();
-    auto shared_promise =
-        std::make_shared<folly::Promise<Result>>(std::move(promise));
-    auto shared_func = std::make_shared<TaskFunc>(std::forward<Func>(func));
-
-    try {
-        auto& pool = milvus::ThreadPools::GetThreadPool(
-            milvus::PriorityForLoad(priority));
-        pool.Submit([shared_promise, shared_func]() mutable {
-            try {
-                if constexpr (std::is_void_v<Result>) {
-                    std::invoke(*shared_func);
-                    shared_promise->setValue();
-                } else {
-                    shared_promise->setValue(std::invoke(*shared_func));
-                }
-            } catch (...) {
-                shared_promise->setException(
-                    folly::exception_wrapper(std::current_exception()));
-            }
-        });
-    } catch (...) {
-        shared_promise->setException(
-            folly::exception_wrapper(std::current_exception()));
-    }
-
-    return future;
+    return milvus::segcore::async_load::SubmitPriorityLoadTask(
+        priority, std::forward<Func>(func));
 }
 
-struct StorageV3AdmissionConfig {
-    size_t total_bytes;
-    size_t high_reserved_bytes = 0;
-};
-
-class StorageV3AdmissionScheduler;
-
-class StorageV3LoadBudgetLease {
- public:
-    StorageV3LoadBudgetLease() = default;
-    StorageV3LoadBudgetLease(const StorageV3LoadBudgetLease&) = delete;
-    StorageV3LoadBudgetLease&
-    operator=(const StorageV3LoadBudgetLease&) = delete;
-    StorageV3LoadBudgetLease(StorageV3LoadBudgetLease&& other) noexcept;
-    StorageV3LoadBudgetLease&
-    operator=(StorageV3LoadBudgetLease&& other) noexcept;
-    ~StorageV3LoadBudgetLease();
-
-    void
-    Release();
-
- private:
-    friend class StorageV3AdmissionScheduler;
-
-    StorageV3LoadBudgetLease(StorageV3AdmissionScheduler* scheduler,
-                             milvus::proto::common::LoadPriority priority,
-                             size_t bytes);
-
-    StorageV3AdmissionScheduler* scheduler_{nullptr};
-    milvus::proto::common::LoadPriority priority_{
-        milvus::proto::common::LoadPriority::LOW};
-    size_t bytes_{0};
-};
-
-class StorageV3AdmissionScheduler {
- public:
-    explicit StorageV3AdmissionScheduler(StorageV3AdmissionConfig config);
-
-    void
-    UpdateConfig(StorageV3AdmissionConfig config);
-
-    folly::SemiFuture<StorageV3LoadBudgetLease>
-    Admit(milvus::proto::common::LoadPriority priority, size_t bytes);
-
- private:
-    friend class StorageV3LoadBudgetLease;
-
-    struct PendingAdmission {
-        milvus::proto::common::LoadPriority priority;
-        size_t bytes;
-        folly::Promise<StorageV3LoadBudgetLease> promise;
-    };
-
-    void
-    Release(milvus::proto::common::LoadPriority priority, size_t bytes);
-
-    std::vector<PendingAdmission>
-    TakeAdmittedLocked();
-
-    void
-    FulfillAdmissions(std::vector<PendingAdmission> admissions);
-
-    bool
-    CanAdmitLocked(milvus::proto::common::LoadPriority priority,
-                   size_t bytes) const;
-
-    void
-    MarkAdmittedLocked(milvus::proto::common::LoadPriority priority,
-                       size_t bytes);
-
-    StorageV3AdmissionConfig config_;
-    size_t used_high_bytes_{0};
-    size_t used_low_bytes_{0};
-    std::deque<PendingAdmission> high_pending_;
-    std::deque<PendingAdmission> low_pending_;
-    mutable std::mutex mutex_;
-};
+using StorageV3AdmissionConfig =
+    milvus::segcore::async_load::LoadAdmissionConfig;
+using StorageV3LoadBudgetLease = milvus::segcore::async_load::LoadBudgetLease;
+using StorageV3AdmissionScheduler =
+    milvus::segcore::async_load::LoadAdmissionScheduler;
 
 StorageV3AdmissionConfig
 StorageV3AdmissionConfigFromLoadBudget();

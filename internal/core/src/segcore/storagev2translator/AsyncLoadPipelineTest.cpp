@@ -36,8 +36,11 @@
 #include "common/GroupChunk.h"
 #include "milvus-storage/async_read_options.h"
 #include "pb/common.pb.h"
+#include "segcore/async_load/AsyncLoadExecutor.h"
+#include "segcore/async_load/AsyncLoadScheduler.h"
 
 using namespace milvus::segcore::storagev2translator;
+using namespace milvus::segcore::async_load;
 using milvus::proto::common::LoadPriority;
 using namespace std::chrono_literals;
 
@@ -128,6 +131,51 @@ class AsyncTestChunkReader final : public milvus_storage::api::ChunkReader {
 TEST(ManifestGroupTranslatorAsyncPipelineTest, CoroSmoke) {
     auto value = folly::coro::blockingWait(StorageV3AsyncLoadCoroSmokeTest());
     EXPECT_EQ(value, 1);
+}
+
+TEST(AsyncLoadSchedulerTest, AdmissionPrefersQueuedHighPriorityAfterRelease) {
+    LoadAdmissionScheduler scheduler(
+        {/*total_bytes=*/1, /*high_reserved_bytes=*/0});
+
+    auto low_running = scheduler.Admit(LoadPriority::LOW, 1);
+    ASSERT_TRUE(low_running.isReady());
+    auto low_lease = std::move(low_running).get();
+
+    auto low_waiting = scheduler.Admit(LoadPriority::LOW, 1);
+    EXPECT_FALSE(low_waiting.isReady());
+    auto high_waiting = scheduler.Admit(LoadPriority::HIGH, 1);
+    EXPECT_FALSE(high_waiting.isReady());
+
+    low_lease.Release();
+    EXPECT_TRUE(high_waiting.isReady());
+    EXPECT_FALSE(low_waiting.isReady());
+
+    auto high_lease = std::move(high_waiting).get();
+    high_lease.Release();
+    EXPECT_TRUE(low_waiting.isReady());
+}
+
+TEST(AsyncLoadExecutorTest, DiskAndMaterializeExecutorsAreDistinct) {
+    auto* disk_executor = AsyncLoadDiskExecutor();
+    auto* materialize_executor = AsyncLoadMaterializeExecutor();
+
+    ASSERT_NE(disk_executor, nullptr);
+    ASSERT_NE(materialize_executor, nullptr);
+    EXPECT_NE(disk_executor, materialize_executor);
+
+    auto disk_future = SubmitAsyncLoadExecutorTask<bool>(
+        disk_executor, [disk_executor, materialize_executor] {
+            return disk_executor->OwnsThisThread() &&
+                   !materialize_executor->OwnsThisThread();
+        });
+    auto materialize_future = SubmitAsyncLoadExecutorTask<bool>(
+        materialize_executor, [disk_executor, materialize_executor] {
+            return materialize_executor->OwnsThisThread() &&
+                   !disk_executor->OwnsThisThread();
+        });
+
+    EXPECT_TRUE(std::move(disk_future).get());
+    EXPECT_TRUE(std::move(materialize_future).get());
 }
 
 TEST(ManifestGroupTranslatorAsyncPipelineTest,
