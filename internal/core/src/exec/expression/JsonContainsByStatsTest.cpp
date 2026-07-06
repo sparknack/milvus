@@ -550,7 +550,13 @@ TEST(JsonStatsAsyncLoadTest, LoadsMultipleShreddingParquetFilesInFileIdOrder) {
                                 built_index.index_files.end());
     SetIndexFiles(built_index, std::move(shuffled_index_files));
 
+#ifdef MILVUS_UNIT_TEST
+    ResetJsonStatsParquetMetadataReadCountForTest();
+#endif
     auto stats = LoadBuiltJsonStatsIndex(built_index);
+#ifdef MILVUS_UNIT_TEST
+    EXPECT_EQ(GetJsonStatsParquetMetadataReadCountForTest(), 2);
+#endif
     auto result = ReadJsonStatsInt64Equal(
         *stats, JsonKey("/a", JSONType::INT64).ToColumnName(), 1, 5);
 

@@ -16,6 +16,7 @@
 
 #include <nlohmann/json.hpp>
 #include <string.h>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <exception>
@@ -78,6 +79,10 @@ namespace milvus::index {
 
 namespace {
 
+#ifdef WITHOUT_GO_LOGGING
+std::atomic<int64_t> g_json_stats_parquet_metadata_read_count{0};
+#endif
+
 struct JsonStatsParquetMetadata {
     std::shared_ptr<arrow::Schema> schema;
     int64_t num_rows;
@@ -100,6 +105,10 @@ NoopParquetKeyRetriever(const std::string&) {
 
 JsonStatsParquetMetadata
 ReadJsonStatsParquetMetadata(const std::string& file) {
+#ifdef WITHOUT_GO_LOGGING
+    g_json_stats_parquet_metadata_read_count.fetch_add(
+        1, std::memory_order_relaxed);
+#endif
     auto fs = milvus::segcore::GetDefaultArrowFileSystem();
     auto properties = GetJsonStatsReadProperties();
     milvus_storage::parquet::ParquetFormatReader reader(
@@ -162,6 +171,20 @@ GetJsonStatsFieldsFromSchema(const std::shared_ptr<arrow::Schema>& schema) {
 }
 
 }  // namespace
+
+#ifdef WITHOUT_GO_LOGGING
+void
+ResetJsonStatsParquetMetadataReadCountForTest() {
+    g_json_stats_parquet_metadata_read_count.store(0,
+                                                   std::memory_order_relaxed);
+}
+
+int64_t
+GetJsonStatsParquetMetadataReadCountForTest() {
+    return g_json_stats_parquet_metadata_read_count.load(
+        std::memory_order_relaxed);
+}
+#endif
 
 JsonKeyStats::JsonKeyStats(const storage::FileManagerContext& ctx,
                            bool is_load,
@@ -884,8 +907,14 @@ JsonKeyStats::BuildWithFieldData(const std::vector<FieldDataPtr>& field_datas,
 void
 JsonKeyStats::GetColumnSchemaFromParquet(int64_t column_group_id,
                                          const std::string& file) {
-    auto parquet_metadata = ReadJsonStatsParquetMetadata(file);
-    std::shared_ptr<arrow::Schema> file_schema = parquet_metadata.schema;
+    std::shared_ptr<arrow::Schema> file_schema;
+    auto schema_it = shredding_parquet_schema_by_file_.find(file);
+    if (schema_it != shredding_parquet_schema_by_file_.end()) {
+        file_schema = schema_it->second;
+    } else {
+        auto parquet_metadata = ReadJsonStatsParquetMetadata(file);
+        file_schema = parquet_metadata.schema;
+    }
     LOG_DEBUG("get column schema: [{}] for segment {}",
               file_schema->ToString(true),
               segment_id_);
@@ -1049,25 +1078,45 @@ JsonKeyStats::LoadColumnGroup(int64_t column_group_id,
             remote_prefix, column_group_id, file_id));
     }
 
-    auto first_file_metadata = ReadJsonStatsParquetMetadata(files[0]);
+    std::optional<JsonStatsParquetMetadata> first_file_metadata;
+    std::shared_ptr<arrow::Schema> first_file_schema;
+    auto first_schema_it = shredding_parquet_schema_by_file_.find(files[0]);
+    if (first_schema_it != shredding_parquet_schema_by_file_.end()) {
+        first_file_schema = first_schema_it->second;
+    } else {
+        first_file_metadata = ReadJsonStatsParquetMetadata(files[0]);
+        first_file_schema = first_file_metadata->schema;
+    }
     auto [milvus_field_ids, column_names] =
-        GetJsonStatsFieldsFromSchema(first_file_metadata.schema);
+        GetJsonStatsFieldsFromSchema(first_file_schema);
 
     // Fetch row group metadata from all files in parallel using HIGH POOL
     // to avoid blocking the caller thread with serial S3 I/O
     auto& pool = ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::HIGH);
-    std::vector<std::future<int64_t>> futures;
+    std::vector<std::pair<size_t, std::future<int64_t>>> futures;
     futures.reserve(files.size());
-    for (const auto& file : files) {
-        futures.push_back(pool.Submit(
-            [file]() { return ReadJsonStatsParquetMetadata(file).num_rows; }));
+    std::vector<int64_t> file_num_rows(files.size(), 0);
+    for (size_t i = 0; i < files.size(); ++i) {
+        const auto& file = files[i];
+        auto num_rows_it = shredding_parquet_num_rows_by_file_.find(file);
+        if (num_rows_it != shredding_parquet_num_rows_by_file_.end()) {
+            auto file_rows = num_rows_it->second;
+            file_num_rows[i] = file_rows;
+            num_rows += file_rows;
+        } else if (i == 0 && first_file_metadata.has_value()) {
+            auto file_rows = first_file_metadata->num_rows;
+            file_num_rows[i] = file_rows;
+            num_rows += file_rows;
+        } else {
+            futures.emplace_back(i, pool.Submit([file]() {
+                return ReadJsonStatsParquetMetadata(file).num_rows;
+            }));
+        }
     }
-    std::vector<int64_t> file_num_rows;
-    file_num_rows.reserve(files.size());
     // Ensure all futures are awaited even if one throws, to prevent
     // use-after-free on captured references in background tasks.
     auto futures_guard = folly::makeGuard([&futures]() {
-        for (auto& f : futures) {
+        for (auto& [_, f] : futures) {
             if (f.valid()) {
                 try {
                     f.get();
@@ -1076,9 +1125,9 @@ JsonKeyStats::LoadColumnGroup(int64_t column_group_id,
             }
         }
     });
-    for (auto& f : futures) {
+    for (auto& [i, f] : futures) {
         auto file_rows = f.get();
-        file_num_rows.push_back(file_rows);
+        file_num_rows[i] = file_rows;
         num_rows += file_rows;
     }
 
@@ -1203,6 +1252,45 @@ JsonKeyStats::LoadShreddingData(const std::vector<std::string>& index_files,
             shredding_prefix = index_files[0].substr(
                 0, pos + strlen(JSON_STATS_SHREDDING_DATA_PATH));
         }
+    }
+
+    shredding_parquet_schema_by_file_.clear();
+    shredding_parquet_num_rows_by_file_.clear();
+    auto metadata_cache_guard = folly::makeGuard([this]() {
+        shredding_parquet_schema_by_file_.clear();
+        shredding_parquet_num_rows_by_file_.clear();
+    });
+
+    auto& pool = ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::HIGH);
+    std::vector<std::pair<std::string, std::future<JsonStatsParquetMetadata>>>
+        futures;
+    std::unordered_set<std::string> scheduled_files;
+    for (const auto& [column_group_id, file_ids] : sorted_files) {
+        for (const auto& file_id : file_ids) {
+            auto file = CreateColumnGroupParquetPath(
+                shredding_prefix, column_group_id, file_id);
+            if (!scheduled_files.insert(file).second) {
+                continue;
+            }
+            futures.emplace_back(file, pool.Submit([file]() {
+                return ReadJsonStatsParquetMetadata(file);
+            }));
+        }
+    }
+    auto futures_guard = folly::makeGuard([&futures]() {
+        for (auto& [_, f] : futures) {
+            if (f.valid()) {
+                try {
+                    f.get();
+                } catch (...) {
+                }
+            }
+        }
+    });
+    for (auto& [file, f] : futures) {
+        auto metadata = f.get();
+        shredding_parquet_num_rows_by_file_[file] = metadata.num_rows;
+        shredding_parquet_schema_by_file_[file] = std::move(metadata.schema);
     }
 
     // load shredding meta

@@ -72,6 +72,15 @@ class CollectSingleJsonStatsInfoAccessor;
 class TraverseJsonForBuildStatsAccessor;
 
 namespace milvus::index {
+
+#ifdef MILVUS_UNIT_TEST
+void
+ResetJsonStatsParquetMetadataReadCountForTest();
+
+int64_t
+GetJsonStatsParquetMetadataReadCountForTest();
+#endif
+
 class JsonKeyStats : public ScalarIndex<std::string> {
  public:
     explicit JsonKeyStats(
@@ -701,6 +710,12 @@ class JsonKeyStats : public ScalarIndex<std::string> {
     std::unordered_map<std::string, int64_t> field_name_to_id_map_;
     // field_id -> field_name, such as 1001 -> json_path_int
     std::unordered_map<int64_t, std::string> field_id_to_name_map_;
+    // Per LoadShreddingData() cache to avoid reading the same parquet footer
+    // multiple times before handing files to milvus-storage ChunkReader.
+    std::unordered_map<std::string, std::shared_ptr<arrow::Schema>>
+        shredding_parquet_schema_by_file_;
+    std::unordered_map<std::string, int64_t>
+        shredding_parquet_num_rows_by_file_;
     // field_name vector, the sequece is the same as the order of files
     std::vector<std::string> field_names_;
     // field_name -> column
