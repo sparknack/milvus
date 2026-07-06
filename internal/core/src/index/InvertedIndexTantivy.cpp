@@ -46,6 +46,7 @@
 #include "nlohmann/detail/iterators/iter_impl.hpp"
 #include "nlohmann/json.hpp"
 #include "pb/common.pb.h"
+#include "segcore/async_load/AsyncLoadExecutor.h"
 #include "storage/FileWriter.h"
 #include "storage/IndexEntryReader.h"
 #include "storage/DataCodec.h"
@@ -960,6 +961,68 @@ InvertedIndexTantivy<T>::LoadEntries(storage::IndexEntryReader& reader,
     LOG_INFO(
         "LoadEntries InvertedIndexTantivy done, file_count: {}, has_null: "
         "{}, mmap: {}",
+        file_names.size(),
+        has_null,
+        load_in_mmap);
+}
+
+template <typename T>
+void
+InvertedIndexTantivy<T>::LoadEntriesWithAsyncRead(
+    storage::IndexEntryReader& reader,
+    const Config& config,
+    ScalarIndexV3AsyncLoadContext& async_ctx) {
+    auto file_names = reader.GetMeta<std::vector<std::string>>("file_names");
+    bool has_null = reader.GetMeta<bool>("has_null");
+
+    path_ = disk_file_manager_->GetLocalIndexObjectPrefix();
+    boost::filesystem::create_directories(path_);
+
+    std::vector<std::pair<std::string, std::string>> pairs;
+    pairs.reserve(file_names.size());
+    for (const auto& fn : file_names) {
+        pairs.emplace_back(fn, path_ + "/" + fn);
+    }
+
+    auto load_priority =
+        GetValueFromConfig<milvus::proto::common::LoadPriority>(
+            config, milvus::LOAD_PRIORITY)
+            .value_or(async_ctx.load_priority);
+    auto write_priority =
+        storage::io::GetPriorityFromLoadPriority(load_priority);
+
+    storage::EntryStreamAsyncOptions read_options;
+    read_options.priority = load_priority;
+    read_options.scheduler = &async_ctx.scheduler;
+    read_options.localize_disk_executor =
+        milvus::segcore::async_load::AsyncLoadDiskExecutor();
+    read_options.trace_label = async_ctx.trace_label;
+
+    reader.ReadEntriesStreamToFilesAsync(pairs, read_options, write_priority);
+
+    if (has_null) {
+        auto null_entry = reader.ReadEntryToMemoryAsync(
+            INDEX_NULL_OFFSET_FILE_NAME, read_options);
+        null_offset_.resize(null_entry.data.size() / sizeof(size_t));
+        milvus::fastmem::FastMemcpy(null_offset_.data(),
+                                    null_entry.data.data(),
+                                    null_entry.data.size());
+    }
+
+    auto load_in_mmap =
+        GetValueFromConfig<bool>(config, ENABLE_MMAP).value_or(true);
+    wrapper_ = std::make_shared<TantivyIndexWrapper>(
+        path_.c_str(), load_in_mmap, milvus::index::SetBitsetSealed);
+
+    if (!load_in_mmap) {
+        disk_file_manager_->RemoveIndexFiles();
+    }
+
+    ComputeByteSize();
+
+    LOG_INFO(
+        "LoadEntriesWithAsyncRead InvertedIndexTantivy done, file_count: {}, "
+        "has_null: {}, mmap: {}",
         file_names.size(),
         has_null,
         load_in_mmap);

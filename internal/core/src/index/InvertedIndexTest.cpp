@@ -58,6 +58,7 @@
 #include "pb/common.pb.h"
 #include "pb/plan.pb.h"
 #include "pb/schema.pb.h"
+#include "segcore/async_load/AsyncLoadScheduler.h"
 #include "segcore/Collection.h"
 #include "storage/ChunkManager.h"
 #include "storage/FileManager.h"
@@ -67,6 +68,7 @@
 #include "storage/Types.h"
 #include "storage/Util.h"
 #include "test_utils/Constants.h"
+#include "test_utils/AsyncLoadTestUtils.h"
 #include "test_utils/DataGen.h"
 #include "test_utils/indexbuilder_test_utils.h"
 #include "test_utils/storage_test_utils.h"
@@ -130,6 +132,101 @@ struct FileSliceSizeGuard {
 
     int64_t old_slice_size_;
 };
+
+class ExposedInvertedIndexTantivy
+    : public index::InvertedIndexTantivy<std::string> {
+ public:
+    using index::InvertedIndexTantivy<std::string>::InvertedIndexTantivy;
+
+    void
+    LoadEntriesWithAsyncReadForTest(
+        storage::IndexEntryReader& reader,
+        const Config& config,
+        index::ScalarIndexV3AsyncLoadContext& async_ctx) {
+        LoadEntriesWithAsyncRead(reader, config, async_ctx);
+    }
+};
+
+struct TantivyAsyncLoadFixture {
+    explicit TantivyAsyncLoadFixture(std::string test_name)
+        : root_path(TestLocalPath + "/" + std::move(test_name)) {
+        boost::filesystem::remove_all(root_path);
+        storage::StorageConfig storage_config;
+        storage_config.storage_type = "local";
+        storage_config.root_path = root_path;
+        auto chunk_manager = storage::CreateChunkManager(storage_config);
+        auto fs = storage::InitArrowFileSystem(storage_config);
+
+        storage::FieldDataMeta field_meta{1, 2, 3, 101};
+        field_meta.field_schema.set_data_type(proto::schema::DataType::VarChar);
+        storage::IndexMeta index_meta{3, 101, 1000, 10000};
+        ctx = storage::FileManagerContext(
+            field_meta, index_meta, chunk_manager, fs);
+    }
+
+    ~TantivyAsyncLoadFixture() {
+        boost::filesystem::remove_all(root_path);
+    }
+
+    std::string root_path;
+    storage::FileManagerContext ctx;
+};
+
+void
+AssertTantivyAsyncLoadUsesAsyncEntryReads(bool enable_mmap,
+                                          const std::string& test_name) {
+    TantivyAsyncLoadFixture fixture(test_name);
+    std::vector<std::string> data{"delta", "alpha", "charlie", "bravo"};
+
+    ExposedInvertedIndexTantivy build_index(index::TANTIVY_INDEX_LATEST_VERSION,
+                                            fixture.ctx);
+    build_index.BuildWithRawDataForUT(data.size(), data.data(), Config());
+    auto stats = build_index.UploadUnified({});
+
+    milvus::test::AsyncTrackingRandomAccessFile* remote_file = nullptr;
+    auto reader = milvus::test::OpenAsyncIndexEntryReader(
+        milvus::test::ReadPackedIndexBytes(fixture.ctx, stats->GetIndexFiles()),
+        &remote_file);
+    auto read_at_calls_after_open = remote_file->ReadAtCalls();
+
+    auto load_ctx = fixture.ctx;
+    load_ctx.set_for_loading_index(true);
+    ExposedInvertedIndexTantivy load_index(index::TANTIVY_INDEX_LATEST_VERSION,
+                                           load_ctx);
+    Config config;
+    config[milvus::index::ENABLE_MMAP] = enable_mmap;
+    config[milvus::LOAD_PRIORITY] = milvus::proto::common::LoadPriority::HIGH;
+    milvus::segcore::async_load::LoadAdmissionScheduler scheduler(
+        {/*total_bytes=*/0, /*high_reserved_bytes=*/0});
+    milvus::index::ScalarIndexV3AsyncLoadContext async_ctx{
+        nullptr,
+        milvus::proto::common::LoadPriority::HIGH,
+        scheduler,
+        test_name};
+
+    load_index.LoadEntriesWithAsyncReadForTest(*reader, config, async_ctx);
+
+    EXPECT_GT(remote_file->AsyncReadCalls(), 0);
+    EXPECT_EQ(remote_file->ReadAtCalls(), read_at_calls_after_open);
+    ASSERT_EQ(load_index.Count(), data.size());
+
+    std::vector<std::string> values{"alpha", "delta"};
+    auto bitset = load_index.In(values.size(), values.data());
+    EXPECT_TRUE(bitset[0]);
+    EXPECT_TRUE(bitset[1]);
+    EXPECT_FALSE(bitset[2]);
+    EXPECT_FALSE(bitset[3]);
+}
+
+TEST(InvertedIndexTantivyV3AsyncLoadTest, MemoryPathUsesAsyncEntryReads) {
+    AssertTantivyAsyncLoadUsesAsyncEntryReads(
+        /*enable_mmap=*/false, "tantivy_async_memory");
+}
+
+TEST(InvertedIndexTantivyV3AsyncLoadTest, MmapPathUsesAsyncEntryReads) {
+    AssertTantivyAsyncLoadUsesAsyncEntryReads(
+        /*enable_mmap=*/true, "tantivy_async_mmap");
+}
 }  // namespace milvus::test
 
 template <typename T,

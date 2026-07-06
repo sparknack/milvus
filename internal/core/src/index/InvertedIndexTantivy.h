@@ -321,6 +321,11 @@ class InvertedIndexTantivy : public ScalarIndex<T> {
                 const Config& config) override;
 
  protected:
+    void
+    LoadEntriesWithAsyncRead(storage::IndexEntryReader& reader,
+                             const Config& config,
+                             ScalarIndexV3AsyncLoadContext& async_ctx) override;
+
     const TargetBitmap
     PatternQuery(const std::string& pattern) override;
 

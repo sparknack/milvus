@@ -91,6 +91,12 @@ class IndexEntryReader {
         const std::vector<std::pair<std::string, std::string>>& name_path_pairs,
         io::Priority write_priority = io::Priority::MIDDLE);
 
+    void
+    ReadEntriesStreamToFilesAsync(
+        const std::vector<std::pair<std::string, std::string>>& name_path_pairs,
+        EntryStreamAsyncOptions options = EntryStreamAsyncOptions{},
+        io::Priority write_priority = io::Priority::MIDDLE);
+
     /// Stream entry data via transient memory budget.
     /// Downloads are concurrent (full bandwidth). Slices are delivered in entry
     /// order to `slice_consumer`; the data pointer is valid only for the

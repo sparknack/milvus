@@ -1433,6 +1433,66 @@ IndexEntryReader::ReadEntryStreamAsync(
     }
 }
 
+void
+IndexEntryReader::ReadEntriesStreamToFilesAsync(
+    const std::vector<std::pair<std::string, std::string>>& name_path_pairs,
+    EntryStreamAsyncOptions options,
+    io::Priority write_priority) {
+    CheckCancelled("IndexEntryReader::ReadEntriesStreamToFilesAsync");
+    if (name_path_pairs.empty()) {
+        return;
+    }
+
+    if (options.scheduler == nullptr) {
+        options.scheduler =
+            &milvus::segcore::async_load::GetLoadAdmissionScheduler();
+    }
+    if (options.localize_disk_executor == nullptr) {
+        options.localize_disk_executor =
+            milvus::segcore::async_load::AsyncLoadDiskExecutor();
+    }
+
+    std::vector<folly::SemiFuture<arrow::Status>> futures;
+    futures.reserve(name_path_pairs.size());
+
+    std::exception_ptr first_error = nullptr;
+    for (const auto& [name, path] : name_path_pairs) {
+        try {
+            AssertInfo(HasEntry(name), "Entry not found: {}", name);
+            futures.emplace_back(
+                milvus::segcore::async_load::SubmitAsyncLoadExecutorTask<
+                    arrow::Status>(
+                    options.localize_disk_executor,
+                    [this, name, path, options, write_priority]() mutable {
+                        ReadEntryToFileAsync(
+                            name, path, std::move(options), write_priority);
+                        return arrow::Status::OK();
+                    }));
+        } catch (...) {
+            if (first_error == nullptr) {
+                first_error = std::current_exception();
+            }
+        }
+    }
+
+    for (auto& future : futures) {
+        try {
+            auto status = std::move(future).get();
+            AssertInfo(status.ok(),
+                       "Failed to write async entry file: {}",
+                       status.ToString());
+        } catch (...) {
+            if (first_error == nullptr) {
+                first_error = std::current_exception();
+            }
+        }
+    }
+
+    if (first_error) {
+        std::rethrow_exception(first_error);
+    }
+}
+
 Entry
 IndexEntryReader::ReadEntryToMemoryAsync(const std::string& name,
                                          EntryStreamAsyncOptions options) {
