@@ -23,6 +23,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -59,6 +60,27 @@
 #include <atomic>
 
 namespace milvus::segcore::storagev2translator {
+
+namespace {
+
+std::optional<FieldId>
+ResolveFieldIdFromArrowMetadata(const std::shared_ptr<arrow::Field>& field) {
+    const auto& metadata = field->metadata();
+    if (metadata == nullptr ||
+        !metadata->Contains(milvus_storage::ARROW_FIELD_ID_KEY)) {
+        return std::nullopt;
+    }
+
+    auto result = metadata->Get(milvus_storage::ARROW_FIELD_ID_KEY);
+    AssertInfo(result.ok(),
+               "[StorageV2] failed to get field id from metadata for field "
+               "{}: {}",
+               field->name(),
+               result.status().ToString());
+    return FieldId(std::stoll(result.ValueOrDie()));
+}
+
+}  // namespace
 
 // See GroupChunkTranslator.cpp for explanation of g_mmap_path_generation.
 static std::atomic<uint64_t> g_mmap_path_generation{0};
@@ -350,13 +372,18 @@ ManifestGroupTranslatorV2::load_group_chunk(
     array_vecs.reserve(schema->num_fields());
 
     // Iterate through fields to get field_id and create chunk.
+    // Json stats and legacy group chunks store field IDs in Arrow metadata.
     // Normal collections and Milvus-generated columns store field IDs as
     // column names. Other external columns use external_field names.
     for (int i = 0; i < schema->num_fields(); ++i) {
-        auto column_name = schema->field(i)->name();
+        auto field = schema->field(i);
+        auto column_name = field->name();
         int64_t field_id = -1;
-        if (auto parsed_fid = ParseFieldIdColumnName(column_name);
-            parsed_fid.has_value()) {
+        if (auto metadata_fid = ResolveFieldIdFromArrowMetadata(field);
+            metadata_fid.has_value()) {
+            field_id = metadata_fid->get();
+        } else if (auto parsed_fid = ParseFieldIdColumnName(column_name);
+                   parsed_fid.has_value()) {
             field_id = parsed_fid->get();
         } else {
             // External collection fallback: column_name is non-numeric, so it
@@ -375,7 +402,7 @@ ManifestGroupTranslatorV2::load_group_chunk(
             AssertInfo(
                 false,
                 "[StorageV2] translator {} field {} not a numeric field ID "
-                "and not found as external field",
+                "and has no field ID metadata or external field mapping",
                 key_,
                 column_name);
         }

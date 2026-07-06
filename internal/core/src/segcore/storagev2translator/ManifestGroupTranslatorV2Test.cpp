@@ -20,15 +20,21 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <unordered_map>
 #include <vector>
 
 #include "segcore/storagev2translator/ManifestGroupTranslatorV2.h"
 
+#include "arrow/api.h"
 #include "cachinglayer/Utils.h"
+#include "common/Consts.h"
+#include "common/FieldMeta.h"
 #include "common/GroupChunk.h"
 #include "common/Schema.h"
 #include "folly/ScopeGuard.h"
 #include "gtest/gtest.h"
+#include "milvus-storage/common/constants.h"
+#include "milvus-storage/async_read_options.h"
 #include "pb/common.pb.h"
 #include "segcore/storagev2translator/AsyncLoadPipeline.h"
 #include "segcore/storagev2translator/ManifestGroupTranslator.h"
@@ -42,6 +48,78 @@ using namespace milvus;
 using namespace milvus::segcore;
 using namespace milvus::segcore::storagev2translator;
 
+namespace {
+
+class MetadataFieldChunkReader final : public milvus_storage::api::ChunkReader {
+ public:
+    explicit MetadataFieldChunkReader(std::shared_ptr<arrow::RecordBatch> batch)
+        : batch_(std::move(batch)) {
+    }
+
+    size_t
+    total_number_of_chunks() const override {
+        return 1;
+    }
+
+    arrow::Result<std::vector<int64_t>>
+    get_chunk_indices(const std::vector<int64_t>& row_indices) override {
+        return row_indices;
+    }
+
+    arrow::Result<std::shared_ptr<arrow::RecordBatch>>
+    get_chunk(int64_t) override {
+        return batch_;
+    }
+
+    arrow::Result<std::vector<std::shared_ptr<arrow::RecordBatch>>>
+    get_chunks(const std::vector<int64_t>& chunk_indices,
+               size_t /*parallelism*/) override {
+        return std::vector<std::shared_ptr<arrow::RecordBatch>>(
+            chunk_indices.size(), batch_);
+    }
+
+    folly::SemiFuture<arrow::Result<milvus_storage::api::RecordBatchVector>>
+    get_chunks_async(
+        const std::vector<int64_t>& chunk_indices,
+        const milvus_storage::api::AsyncReadOptions& /*options*/) override {
+        return folly::makeSemiFuture(
+            arrow::Result<milvus_storage::api::RecordBatchVector>(
+                milvus_storage::api::RecordBatchVector(chunk_indices.size(),
+                                                       batch_)));
+    }
+
+    arrow::Result<std::vector<uint64_t>>
+    get_chunk_size() override {
+        return std::vector<uint64_t>{64};
+    }
+
+    arrow::Result<std::vector<uint64_t>>
+    get_chunk_rows() override {
+        return std::vector<uint64_t>{static_cast<uint64_t>(batch_->num_rows())};
+    }
+
+ private:
+    std::shared_ptr<arrow::RecordBatch> batch_;
+};
+
+std::shared_ptr<arrow::RecordBatch>
+MakeMetadataFieldRecordBatch(FieldId field_id) {
+    arrow::Int64Builder builder;
+    AssertInfo(builder.Append(10).ok(), "append failed");
+    AssertInfo(builder.Append(20).ok(), "append failed");
+    std::shared_ptr<arrow::Array> values;
+    AssertInfo(builder.Finish(&values).ok(), "finish failed");
+
+    auto metadata = std::make_shared<arrow::KeyValueMetadata>();
+    metadata->Append(milvus_storage::ARROW_FIELD_ID_KEY,
+                     std::to_string(field_id.get()));
+    auto schema = arrow::schema({arrow::field(
+        "json_path_int64", arrow::int64(), true, std::move(metadata))});
+    return arrow::RecordBatch::Make(schema, values->length(), {values});
+}
+
+}  // namespace
+
 TEST(StorageV2ConfigTest, AsyncLoadDefaultsToEnabledAndCanBeToggled) {
     const bool old_enabled = StorageV2AsyncLoadEnabled();
     auto restore_enabled = folly::makeGuard(
@@ -54,6 +132,43 @@ TEST(StorageV2ConfigTest, AsyncLoadDefaultsToEnabledAndCanBeToggled) {
 
     SetStorageV2AsyncLoadEnabled(true);
     EXPECT_TRUE(StorageV2AsyncLoadEnabled());
+}
+
+TEST(ManifestGroupTranslatorV2Test, ResolvesFieldIdFromArrowMetadata) {
+    constexpr int64_t kSegmentId = 77;
+    auto field_id = FieldId(START_JSON_STATS_FIELD_ID);
+    auto reader = std::make_shared<MetadataFieldChunkReader>(
+        MakeMetadataFieldRecordBatch(field_id));
+
+    std::unordered_map<FieldId, FieldMeta> field_metas;
+    field_metas.emplace(field_id,
+                        FieldMeta(FieldName("json_path_int64"),
+                                  field_id,
+                                  DataType::INT64,
+                                  true,
+                                  std::nullopt));
+
+    ManifestGroupTranslatorV2 translator(
+        kSegmentId,
+        GroupChunkType::JSON_KEY_STATS,
+        /*column_group_index=*/0,
+        std::move(reader),
+        field_metas,
+        /*use_mmap=*/false,
+        /*mmap_populate=*/false,
+        /*mmap_dir_path=*/"",
+        /*num_fields=*/1,
+        milvus::proto::common::LoadPriority::LOW,
+        /*eager_load=*/true,
+        /*warmup_policy=*/"",
+        /*cache_key_suffix=*/std::to_string(field_id.get()));
+
+    auto cells = translator.get_cells(nullptr, {0});
+
+    ASSERT_EQ(cells.size(), 1);
+    ASSERT_NE(cells[0].second, nullptr);
+    EXPECT_TRUE(cells[0].second->HasChunk(field_id));
+    EXPECT_EQ(cells[0].second->RowNums(), 2);
 }
 
 class ManifestGroupTranslatorV2ParityTest
