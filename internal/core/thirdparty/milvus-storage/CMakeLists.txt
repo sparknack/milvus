@@ -29,6 +29,25 @@ else ()
 endif ()
 
 set( CMAKE_PREFIX_PATH ${CONAN_BOOST_ROOT} )
+
+# Conan 1 cmake_find_package uses legacy package names and can generate
+# Findarrow.cmake for newer recipes that only set Conan 2 properties. The
+# milvus-storage project calls find_package(Arrow), so provide the expected
+# casing when needed.
+set(ARROW_CONAN_MODULE_DIR "${CMAKE_BINARY_DIR}/conan")
+if (EXISTS "${ARROW_CONAN_MODULE_DIR}/Findarrow.cmake" AND
+    NOT EXISTS "${ARROW_CONAN_MODULE_DIR}/FindArrow.cmake")
+    file(WRITE "${ARROW_CONAN_MODULE_DIR}/FindArrow.cmake" [=[
+include("${CMAKE_CURRENT_LIST_DIR}/Findarrow.cmake")
+set(Arrow_FOUND "${arrow_FOUND}")
+set(Arrow_VERSION "${arrow_VERSION}")
+set(Arrow_INCLUDE_DIRS "${arrow_INCLUDE_DIRS}")
+set(Arrow_INCLUDE_DIR "${arrow_INCLUDE_DIR}")
+set(Arrow_LIBRARIES "${arrow_LIBRARIES}")
+set(Arrow_LIBS "${arrow_LIBS}")
+]=])
+endif()
+list(APPEND CMAKE_MODULE_PATH "${ARROW_CONAN_MODULE_DIR}")
 FetchContent_Declare(
         milvus-storage
         GIT_REPOSITORY  ${GIT_REPOSITORY}
