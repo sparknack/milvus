@@ -23,6 +23,7 @@
 
 const uint32_t SYS_PAGE_SIZE = sysconf(_SC_PAGE_SIZE);
 namespace milvus {
+
 void
 MemChunkTarget::write(const void* data, size_t size) {
     AssertInfo(size + size_ <= cap_, "can not exceed target capacity");

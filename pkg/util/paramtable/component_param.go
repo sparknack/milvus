@@ -3601,6 +3601,7 @@ type queryNodeConfig struct {
 	MmapScalarField                     ParamItem `refreshable:"false"`
 	MmapScalarIndex                     ParamItem `refreshable:"false"`
 	MmapPopulate                        ParamItem `refreshable:"false"`
+	MmapWriteback                       ParamItem `refreshable:"false"`
 	MmapJSONStats                       ParamItem `refreshable:"false"`
 	GrowingMmapEnabled                  ParamItem `refreshable:"false"`
 	FixedFileSizeForMmapManager         ParamItem `refreshable:"false"`
@@ -4445,6 +4446,15 @@ This defaults to true, indicating that Milvus creates temporary index for growin
 		Export:       false,
 	}
 	p.MmapPopulate.Init(base.mgr)
+
+	p.MmapWriteback = ParamItem{
+		Key:          "queryNode.mmap.writeback",
+		Version:      "2.6.18",
+		DefaultValue: "false",
+		Doc:          "Enable fdatasync after writing each mmap field data file.",
+		Export:       false,
+	}
+	p.MmapWriteback.Init(base.mgr)
 
 	p.MmapJSONStats = ParamItem{
 		Key:          "queryNode.mmap.jsonShredding",
