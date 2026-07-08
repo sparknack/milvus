@@ -129,12 +129,13 @@ export CONAN_REVISIONS_ENABLED=1
 export CXXFLAGS="-Wno-error=address -Wno-error=deprecated-declarations"
 export CFLAGS="-Wno-error=address -Wno-error=deprecated-declarations"
 
-# Determine the Conan remote URL, using the environment variable if set, otherwise defaulting
+# Determine the Conan remote URLs, using environment variables if set,
+# otherwise defaulting to the Milvus Artifactory repositories.
 CONAN_ARTIFACTORY_URL="${CONAN_ARTIFACTORY_URL:-https://milvus01.jfrog.io/artifactory/api/conan/default-conan-local}"
+CONAN_ARTIFACTORY_URL2="${CONAN_ARTIFACTORY_URL2:-https://milvus01.jfrog.io/artifactory/api/conan/default-conan-local2}"
 
-if [[ ! `"$CONAN" remote list` == *default-conan-local* ]]; then
-    "$CONAN" remote add default-conan-local $CONAN_ARTIFACTORY_URL
-fi
+"$CONAN" remote add default-conan-local "$CONAN_ARTIFACTORY_URL" --insert 0 --force
+"$CONAN" remote add default-conan-local2 "$CONAN_ARTIFACTORY_URL2" --insert 1 --force
 
 unameOut="$(uname -s)"
 case "${unameOut}" in
@@ -144,7 +145,7 @@ case "${unameOut}" in
     export CMAKE_CXX_COMPILER_LAUNCHER=ccache
     echo "Using CXX: $CXX"
     echo "Using CC: $CC"
-    "$CONAN" install ${CPP_SRC_DIR} --install-folder conan --build=missing -s build_type=${BUILD_TYPE} -s compiler=clang -s compiler.version=${llvm_version} -s compiler.libcxx=libc++ -s compiler.cppstd=17 -r default-conan-local -u || { echo 'conan install failed'; exit 1; }
+    "$CONAN" install ${CPP_SRC_DIR} --install-folder conan --build=missing -s build_type=${BUILD_TYPE} -s compiler=clang -s compiler.version=${llvm_version} -s compiler.libcxx=libc++ -s compiler.cppstd=17 -u || { echo 'conan install failed'; exit 1; }
     ;;
   Linux*)
     if [ -f /etc/os-release ]; then
@@ -156,9 +157,9 @@ case "${unameOut}" in
     export CPU_TARGET=avx
     GCC_VERSION=`gcc -dumpversion`
     if [[ `gcc -v 2>&1 | sed -n 's/.*\(--with-default-libstdcxx-abi\)=\(\w*\).*/\2/p'` == "gcc4" ]]; then
-      "$CONAN" install ${CPP_SRC_DIR} --install-folder conan --build=missing -s build_type=${BUILD_TYPE} -s compiler.version=${GCC_VERSION} -r default-conan-local -u || { echo 'conan install failed'; exit 1; }
+      "$CONAN" install ${CPP_SRC_DIR} --install-folder conan --build=missing -s build_type=${BUILD_TYPE} -s compiler.version=${GCC_VERSION} -u || { echo 'conan install failed'; exit 1; }
     else
-      "$CONAN" install ${CPP_SRC_DIR} --install-folder conan --build=missing -s build_type=${BUILD_TYPE} -s compiler.version=${GCC_VERSION} -s compiler.libcxx=libstdc++11 -r default-conan-local -u || { echo 'conan install failed'; exit 1; }
+      "$CONAN" install ${CPP_SRC_DIR} --install-folder conan --build=missing -s build_type=${BUILD_TYPE} -s compiler.version=${GCC_VERSION} -s compiler.libcxx=libstdc++11 -u || { echo 'conan install failed'; exit 1; }
     fi
     ;;
   *)
