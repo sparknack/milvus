@@ -134,6 +134,7 @@
 #include "segcore/storagev1translator/TextMatchIndexTranslator.h"
 #include "segcore/storagev2translator/GroupChunkTranslator.h"
 #include "segcore/storagev2translator/ManifestGroupTranslator.h"
+#include "segcore/storagev2translator/StorageV2Config.h"
 #include "segcore/TextColumnCache.h"
 #include "storage/FileManager.h"
 #include "storage/KeyRetriever.h"
@@ -8292,7 +8293,8 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
             cache_key_suffix,
             segment_load_info.GetEstimatedBytesPerRow(),
             segment_load_info.GetInsertChannel(),
-            writeback_config);
+            writeback_config,
+            storagev2translator::StorageV2AsyncLoadEnabled());
     auto chunked_column_group =
         std::make_shared<ChunkedColumnGroup>(std::move(translator));
 
@@ -8374,6 +8376,7 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
     }
 
     auto& mmap_config = storage::MmapManager::GetInstance().GetMmapConfig();
+    auto writeback_config = CreateMmapChunkWritebackConfig(mmap_config);
     bool global_use_mmap = is_vector ? mmap_config.GetVectorFieldEnableMmap()
                                      : mmap_config.GetScalarFieldEnableMmap();
     auto use_mmap = has_mmap_setting ? mmap_enabled : global_use_mmap;
@@ -8438,7 +8441,9 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
             warmup_policy,
             cache_key_suffix,
             segment_load_info.GetEstimatedBytesPerRow(),
-            segment_load_info.GetInsertChannel());
+            segment_load_info.GetInsertChannel(),
+            writeback_config,
+            storagev2translator::StorageV2AsyncLoadEnabled());
     auto chunked_column_group =
         std::make_shared<ChunkedColumnGroup>(std::move(translator));
 
