@@ -21,8 +21,10 @@
 #include <utility>
 
 #include "folly/CancellationToken.h"
+#include "folly/ScopeGuard.h"
 #include "folly/futures/Future.h"
 #include "gtest/gtest.h"
+#include "storage/ThreadPools.h"
 
 namespace milvus::storage {
 namespace {
@@ -233,6 +235,20 @@ TEST_F(TransientMemoryBudgetAsyncTest,
     waiting_lease.Release();
     EXPECT_TRUE(budget_.TryAcquire(1));
     budget_.Release(1);
+}
+
+TEST(EntryStreamResourceEstimateTest,
+     PoolBoundUsesEncryptedFootprintAndActualCapacity) {
+    auto& pool = ThreadPools::GetThreadPool(ThreadPoolPriority::HIGH);
+    auto old_max_threads = pool.GetMaxThreadNum();
+    pool.Resize(1);
+    auto restore_pool = folly::makeGuard(
+        [&pool, old_max_threads] { pool.Resize(old_max_threads); });
+
+    auto slice_size = DefaultStreamSliceSize();
+    ASSERT_LE(slice_size, std::numeric_limits<size_t>::max() / 3);
+    EXPECT_EQ(EntryStreamPoolBoundTransientBytes(),
+              3 * slice_size + kTailMergeGrace);
 }
 
 }  // namespace

@@ -33,6 +33,7 @@
 #include "common/EasyAssert.h"
 #include "folly/CancellationToken.h"
 #include "folly/futures/Future.h"
+#include "storage/ThreadPools.h"
 
 namespace milvus::storage {
 
@@ -48,6 +49,15 @@ IsStreamSliceSizeAligned(size_t slice_size) {
 inline size_t
 DefaultStreamSliceSize() {
     return DEFAULT_INDEX_FILE_SLICE_SIZE;
+}
+
+inline size_t
+EncryptedStreamBudgetBytes(size_t cipher_len, size_t plain_len) {
+    AssertInfo(
+        plain_len <= (std::numeric_limits<size_t>::max() / 2) &&
+            cipher_len <= std::numeric_limits<size_t>::max() - 2 * plain_len,
+        "Encrypted stream budget size overflow");
+    return cipher_len + 2 * plain_len;
 }
 
 inline void
@@ -460,15 +470,16 @@ TransientBudgetLease::Release() {
 
 inline size_t
 EntryStreamPoolBoundTransientBytes() {
-    auto max_threads = milvus::ComputeThreadPoolMaxThreads(
-        milvus::HIGH_PRIORITY_THREAD_CORE_COEFFICIENT.load());
-    auto max_tasks = static_cast<size_t>(max_threads);
+    auto& pool =
+        milvus::ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::HIGH);
+    auto max_tasks = std::max<size_t>(1, pool.GetMaxThreadNum());
     auto slice_size = DefaultStreamSliceSize();
-    if (slice_size >
+    auto per_task_bytes = EncryptedStreamBudgetBytes(slice_size, slice_size);
+    if (per_task_bytes >
         (std::numeric_limits<size_t>::max() - kTailMergeGrace) / max_tasks) {
         return std::numeric_limits<size_t>::max();
     }
-    return max_tasks * slice_size + kTailMergeGrace;
+    return max_tasks * per_task_bytes + kTailMergeGrace;
 }
 
 inline size_t

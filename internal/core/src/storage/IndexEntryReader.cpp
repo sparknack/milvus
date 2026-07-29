@@ -111,15 +111,6 @@ PlainStreamSliceBytes(size_t entry_size,
     return std::min(slice_size, entry_size - off);
 }
 
-size_t
-EncryptedStreamBudgetBytes(size_t cipher_len, size_t plain_len) {
-    AssertInfo(
-        plain_len <= (std::numeric_limits<size_t>::max() / 2) &&
-            cipher_len <= std::numeric_limits<size_t>::max() - 2 * plain_len,
-        "Encrypted stream budget size overflow");
-    return cipher_len + 2 * plain_len;
-}
-
 constexpr size_t kEntryDownloadRangeSize = 16 * 1024 * 1024;
 
 void

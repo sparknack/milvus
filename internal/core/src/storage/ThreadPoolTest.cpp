@@ -14,9 +14,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <gtest/gtest.h>
+#include <chrono>
+#include <future>
 #include <string>
+#include <system_error>
 
+#include "folly/ScopeGuard.h"
 #include "gtest/gtest.h"
 #include "storage/ThreadPool.h"
 
@@ -136,6 +139,57 @@ TEST_F(ThreadPoolTest, DynamicMaxThreadsSizeUpdate) {
     SetThreadPoolMaxThreadsSize(8);
     pool.Resize(20);
     EXPECT_EQ(pool.GetMaxThreadNum(), 8);
+}
+
+TEST_F(ThreadPoolTest, DoesNotThrowAfterQueuedWorkerCreationFailure) {
+    ThreadPool pool(1.0, "worker_creation_failure_pool");
+    pool.Resize(1);
+
+    std::promise<void> blocker_started;
+    auto blocker_started_future = blocker_started.get_future();
+    std::promise<void> release_blocker;
+    auto release_blocker_future = release_blocker.get_future().share();
+    bool blocker_released = false;
+    auto release_blocker_guard = folly::makeGuard([&] {
+        if (!blocker_released) {
+            release_blocker.set_value();
+        }
+    });
+    auto blocker = pool.Submit([&] {
+        blocker_started.set_value();
+        release_blocker_future.wait();
+    });
+    ASSERT_EQ(blocker_started_future.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+
+    pool.Resize(2);
+    pool.SetWorkerCreationHookForTest([] {
+        throw std::system_error(
+            std::make_error_code(std::errc::resource_unavailable_try_again));
+    });
+
+    std::promise<void> queued_task_ran;
+    auto queued_task_ran_future = queued_task_ran.get_future();
+    std::future<int> queued;
+    bool submit_threw = false;
+    try {
+        queued = pool.Submit([&] {
+            queued_task_ran.set_value();
+            return 42;
+        });
+    } catch (const std::system_error&) {
+        submit_threw = true;
+    }
+
+    release_blocker.set_value();
+    blocker_released = true;
+    blocker.get();
+    ASSERT_EQ(queued_task_ran_future.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    EXPECT_FALSE(submit_threw);
+    if (!submit_threw) {
+        EXPECT_EQ(queued.get(), 42);
+    }
 }
 
 }  // namespace milvus

@@ -30,6 +30,7 @@
 #include <mutex>
 #include <ostream>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -140,6 +141,7 @@ class ThreadPool {
             std::bind(std::forward<F>(f), std::forward<Args>(args)...);
         auto task_ptr =
             std::make_shared<std::packaged_task<decltype(f(args...))()>>(func);
+        auto future = task_ptr->get_future();
 
         auto enqueue_time = std::chrono::steady_clock::now();
         auto* queue_metric = metric_queue_duration_;
@@ -187,13 +189,26 @@ class ThreadPool {
         if (work_queue_.size() > static_cast<size_t>(idle_threads_size_) &&
             current_threads_size_ < max_threads_size_.load()) {
             // Dynamic increase thread number
-            std::thread t(&ThreadPool::Worker, this);
-            assert(threads_.find(t.get_id()) == threads_.end());
-            threads_[t.get_id()] = std::move(t);
-            current_threads_size_++;
+            try {
+#ifdef MILVUS_UNIT_TEST
+                if (worker_creation_hook_) {
+                    worker_creation_hook_();
+                }
+#endif
+                std::thread t(&ThreadPool::Worker, this);
+                assert(threads_.find(t.get_id()) == threads_.end());
+                threads_[t.get_id()] = std::move(t);
+                current_threads_size_++;
+            } catch (const std::system_error& e) {
+                LOG_WARN(
+                    "Failed to grow thread pool {}, queued task will use "
+                    "existing workers: {}",
+                    name_,
+                    e.what());
+            }
         }
 
-        return task_ptr->get_future();
+        return future;
     }
 
     void
@@ -245,6 +260,14 @@ class ThreadPool {
         }
     }
 
+#ifdef MILVUS_UNIT_TEST
+    void
+    SetWorkerCreationHookForTest(std::function<void()> hook) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        worker_creation_hook_ = std::move(hook);
+    }
+#endif
+
  public:
     int min_threads_size_;
     int idle_threads_size_;
@@ -268,6 +291,9 @@ class ThreadPool {
     prometheus::Counter* metric_completed_{nullptr};
     prometheus::Histogram* metric_queue_duration_{nullptr};
     prometheus::Histogram* metric_execute_duration_{nullptr};
+#ifdef MILVUS_UNIT_TEST
+    std::function<void()> worker_creation_hook_;
+#endif
 };
 
 }  // namespace milvus

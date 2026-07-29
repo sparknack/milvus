@@ -133,7 +133,8 @@ TEST_P(GroupChunkTranslatorTest, TestWithMmap) {
         true,
         schema_->get_field_ids().size(),
         milvus::proto::common::LoadPriority::LOW,
-        /* warmup_policy */ "");
+        /* warmup_policy */ "",
+        MmapChunkWritebackMode::Disabled);
 
     // num cells - get the expected number from the file directly
     auto reader_result =
@@ -300,7 +301,8 @@ TEST_P(GroupChunkTranslatorTest, TestMultipleFiles) {
         true,
         schema_->get_field_ids().size(),
         milvus::proto::common::LoadPriority::LOW,
-        /* warmup_policy */ "");
+        /* warmup_policy */ "",
+        MmapChunkWritebackMode::Disabled);
 
     // Test total number of cells across all files
     // Cells never span files, so count per-file ceil. The cell-per-count is
