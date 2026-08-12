@@ -99,6 +99,7 @@ func TestComponentParam(t *testing.T) {
 		params.Save(item.Key, "33554432")
 		assert.EqualValues(t, 32*1024*1024, item.GetAsInt64())
 	})
+
 	t.Run("test commonConfig", func(t *testing.T) {
 		Params := &params.CommonCfg
 

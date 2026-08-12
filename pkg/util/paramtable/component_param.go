@@ -5097,7 +5097,7 @@ user-task-polling:
 		Key:          "queryNode.segcore.storageV2.enableAsyncLoad",
 		Version:      "3.0.0",
 		DefaultValue: "false",
-		Doc:          "Temporary rollout switch for async storage v2 field-data loading. Existing translators keep the mode captured at construction.",
+		Doc:          "Temporary rollout switch for async storage v2 field-data and scalar packed-index v3 loading. Translators capture the mode at construction; scalar indexes read it when loading starts.",
 		Export:       false,
 	}
 	p.StorageV2EnableAsyncLoad.Init(base.mgr)
