@@ -127,7 +127,9 @@ func GetResourceEstimate(estimate *C.LoadResourceRequest) ResourceEstimate {
 }
 
 type requestResourceResult struct {
-	Resource          LoadResource
+	Resource        LoadResource // Complete loading peak used by segment-loader admission.
+	ReserveResource LoadResource // Resource subset explicitly reserved through CGo.
+
 	LogicalResource   LoadResource
 	CommittedResource LoadResource
 	ConcurrencyLevel  int
@@ -534,7 +536,7 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 	// }
 
 	// then get physical resource usage for loading segments
-	mu, du, err := loader.checkSegmentSize(ctx, infos, totalMemory, physicalMemoryUsage, physicalDiskUsage)
+	mu, du, reserveResource, err := loader.checkSegmentSize(ctx, infos, totalMemory, physicalMemoryUsage, physicalDiskUsage)
 	if err != nil {
 		log.Warn("no sufficient physical resource to load segments", zap.Error(err))
 		return result, err
@@ -542,6 +544,7 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 
 	result.Resource.MemorySize = mu
 	result.Resource.DiskSize = du
+	result.ReserveResource = reserveResource
 	// result.LogicalResource.MemorySize = lmu
 	// result.LogicalResource.DiskSize = ldu
 
@@ -551,6 +554,8 @@ func (loader *segmentLoader) requestResource(ctx context.Context, infos ...*quer
 		zap.Float64("memory", logutil.ToMB(float64(result.Resource.MemorySize))),
 		zap.Float64("committedMemory", logutil.ToMB(float64(loader.committedResource.MemorySize))),
 		zap.Float64("disk", logutil.ToMB(float64(result.Resource.DiskSize))),
+		zap.Float64("reserveMemory", logutil.ToMB(float64(result.ReserveResource.MemorySize))),
+		zap.Float64("reserveDisk", logutil.ToMB(float64(result.ReserveResource.DiskSize))),
 		zap.Float64("committedDisk", logutil.ToMB(float64(loader.committedResource.DiskSize))),
 	)
 
@@ -567,8 +572,8 @@ func (loader *segmentLoader) freeRequestResource(requestResourceResult requestRe
 
 	if paramtable.Get().QueryNodeCfg.TieredEvictionEnabled.GetAsBool() {
 		C.ReleaseLoadingResource(C.CResourceUsage{
-			memory_bytes: C.int64_t(resource.MemorySize),
-			disk_bytes:   C.int64_t(resource.DiskSize),
+			memory_bytes: C.int64_t(requestResourceResult.ReserveResource.MemorySize),
+			disk_bytes:   C.int64_t(requestResourceResult.ReserveResource.DiskSize),
 		})
 	}
 
@@ -1612,12 +1617,11 @@ func (loader *segmentLoader) checkLogicalSegmentSize(ctx context.Context, segmen
 	return predictLogicalMemUsage - logicalMemUsage, predictLogicalDiskUsage - logicalDiskUsage, nil
 }
 
-// checkSegmentSize checks whether the memory & disk is sufficient to load the segments
-// returns the memory & disk usage while loading if possible to load,
-// otherwise, returns error
-func (loader *segmentLoader) checkSegmentSize(ctx context.Context, segmentLoadInfos []*querypb.SegmentLoadInfo, totalMem, memUsage uint64, localDiskUsage int64) (uint64, uint64, error) {
+// checkSegmentSize estimates the complete Resource for segment-loader admission
+// and the ReserveResource subset that must be explicitly reserved through CGo.
+func (loader *segmentLoader) checkSegmentSize(ctx context.Context, segmentLoadInfos []*querypb.SegmentLoadInfo, totalMem, memUsage uint64, localDiskUsage int64) (uint64, uint64, LoadResource, error) {
 	if len(segmentLoadInfos) == 0 {
-		return 0, 0, nil
+		return 0, 0, LoadResource{}, nil
 	}
 
 	log := log.Ctx(ctx).With(
@@ -1626,7 +1630,7 @@ func (loader *segmentLoader) checkSegmentSize(ctx context.Context, segmentLoadIn
 
 	memUsage = memUsage + loader.committedResource.MemorySize
 	if memUsage == 0 || totalMem == 0 {
-		return 0, 0, merr.WrapErrServiceInternalMsg("get memory failed when checkSegmentSize")
+		return 0, 0, LoadResource{}, merr.WrapErrServiceInternalMsg("get memory failed when checkSegmentSize")
 	}
 
 	diskUsage := uint64(localDiskUsage) + loader.committedResource.DiskSize
@@ -1646,6 +1650,7 @@ func (loader *segmentLoader) checkSegmentSize(ctx context.Context, segmentLoadIn
 	predictDiskUsage := diskUsage
 	var predictGpuMemUsage []uint64
 	mmapFieldCount := 0
+	reserveResource := LoadResource{}
 	for _, loadInfo := range segmentLoadInfos {
 		collection := loader.manager.Collection.Get(loadInfo.GetCollectionID())
 		loadingUsage, err := estimateLoadingResourceUsageOfSegment(collection.Schema(), loadInfo, maxFactor)
@@ -1655,8 +1660,9 @@ func (loader *segmentLoader) checkSegmentSize(ctx context.Context, segmentLoadIn
 				zap.Int64("collectionID", loadInfo.GetCollectionID()),
 				zap.Int64("segmentID", loadInfo.GetSegmentID()),
 				zap.Error(err))
-			return 0, 0, err
+			return 0, 0, LoadResource{}, err
 		}
+		reserveResource.Add(loadingUsage.ReserveResource)
 
 		log.Debug("segment resource for loading",
 			zap.Int64("segmentID", loadInfo.GetSegmentID()),
@@ -1685,14 +1691,45 @@ func (loader *segmentLoader) checkSegmentSize(ctx context.Context, segmentLoadIn
 		zap.Int("mmapFieldCount", mmapFieldCount),
 	)
 
+	if predictMemUsage > uint64(float64(totalMem)*paramtable.Get().QueryNodeCfg.OverloadedMemoryThresholdPercentage.GetAsFloat()) {
+		log.Warn("load segment failed, OOM if load",
+			zap.String("resourceType", "Memory"),
+			zap.Float64("maxSegmentSizeMB", logutil.ToMB(float64(maxSegmentSize))),
+			zap.Float64("memUsageMB", logutil.ToMB(float64(memUsage))),
+			zap.Float64("predictMemUsageMB", logutil.ToMB(float64(predictMemUsage))),
+			zap.Float64("totalMemMB", logutil.ToMB(float64(totalMem))),
+			zap.Float64("thresholdFactor", paramtable.Get().QueryNodeCfg.OverloadedMemoryThresholdPercentage.GetAsFloat()),
+		)
+		return 0, 0, LoadResource{}, merr.WrapErrSegmentRequestResourceFailed("Memory")
+	}
+
+	if predictDiskUsage > uint64(float64(paramtable.Get().QueryNodeCfg.DiskCapacityLimit.GetAsInt64())*paramtable.Get().QueryNodeCfg.MaxDiskUsagePercentage.GetAsFloat()) {
+		log.Warn("load segment failed, disk space is not enough",
+			zap.String("resourceType", "Disk"),
+			zap.Float64("diskUsageMB", logutil.ToMB(float64(diskUsage))),
+			zap.Float64("predictDiskUsageMB", logutil.ToMB(float64(predictDiskUsage))),
+			zap.Float64("totalDiskMB", logutil.ToMB(float64(uint64(paramtable.Get().QueryNodeCfg.DiskCapacityLimit.GetAsInt64())))),
+			zap.Float64("thresholdFactor", paramtable.Get().QueryNodeCfg.MaxDiskUsagePercentage.GetAsFloat()),
+		)
+		return 0, 0, LoadResource{}, merr.WrapErrSegmentRequestResourceFailed("Disk")
+	}
+
+	err := checkSegmentGpuMemSize(predictGpuMemUsage, float32(paramtable.Get().GpuConfig.OverloadedMemoryThresholdPercentage.GetAsFloat()))
+	if err != nil {
+		return 0, 0, LoadResource{}, err
+	}
+
 	if paramtable.Get().QueryNodeCfg.TieredEvictionEnabled.GetAsBool() {
-		// try to reserve loading resource from caching layer
+		// Go admission tracks the complete loading peak. Reserve only the subset
+		// invisible to the caching layer through CGo.
 		if ok := C.TryReserveLoadingResourceWithTimeout(C.CResourceUsage{
-			memory_bytes: C.int64_t(predictMemUsage - memUsage),
-			disk_bytes:   C.int64_t(predictDiskUsage - diskUsage),
+			memory_bytes: C.int64_t(reserveResource.MemorySize),
+			disk_bytes:   C.int64_t(reserveResource.DiskSize),
 		}, 1000); !ok {
-			return 0, 0, merr.WrapErrSegmentRequestResourceFailed("memory/disk",
-				fmt.Sprintf("failed to reserve loading resource from caching layer, predictMemUsage = %v MB, predictDiskUsage = %v MB, memUsage = %v MB, diskUsage = %v MB, memoryThresholdFactor = %f, diskThresholdFactor = %f",
+			return 0, 0, LoadResource{}, merr.WrapErrSegmentRequestResourceFailed("memory/disk",
+				fmt.Sprintf("failed to reserve loading resource from caching layer, reserveMemory = %v MB, reserveDisk = %v MB, predictMemUsage = %v MB, predictDiskUsage = %v MB, memUsage = %v MB, diskUsage = %v MB, memoryThresholdFactor = %f, diskThresholdFactor = %f",
+					logutil.ToMB(float64(reserveResource.MemorySize)),
+					logutil.ToMB(float64(reserveResource.DiskSize)),
 					logutil.ToMB(float64(predictMemUsage)),
 					logutil.ToMB(float64(predictDiskUsage)),
 					logutil.ToMB(float64(memUsage)),
@@ -1701,38 +1738,9 @@ func (loader *segmentLoader) checkSegmentSize(ctx context.Context, segmentLoadIn
 					paramtable.Get().QueryNodeCfg.MaxDiskUsagePercentage.GetAsFloat(),
 				))
 		}
-	} else {
-		// fallback to original segment loading logic
-		if predictMemUsage > uint64(float64(totalMem)*paramtable.Get().QueryNodeCfg.OverloadedMemoryThresholdPercentage.GetAsFloat()) {
-			log.Warn("load segment failed, OOM if load",
-				zap.String("resourceType", "Memory"),
-				zap.Float64("maxSegmentSizeMB", logutil.ToMB(float64(maxSegmentSize))),
-				zap.Float64("memUsageMB", logutil.ToMB(float64(memUsage))),
-				zap.Float64("predictMemUsageMB", logutil.ToMB(float64(predictMemUsage))),
-				zap.Float64("totalMemMB", logutil.ToMB(float64(totalMem))),
-				zap.Float64("thresholdFactor", paramtable.Get().QueryNodeCfg.OverloadedMemoryThresholdPercentage.GetAsFloat()),
-			)
-			return 0, 0, merr.WrapErrSegmentRequestResourceFailed("Memory")
-		}
-
-		if predictDiskUsage > uint64(float64(paramtable.Get().QueryNodeCfg.DiskCapacityLimit.GetAsInt64())*paramtable.Get().QueryNodeCfg.MaxDiskUsagePercentage.GetAsFloat()) {
-			log.Warn("load segment failed, disk space is not enough",
-				zap.String("resourceType", "Disk"),
-				zap.Float64("diskUsageMB", logutil.ToMB(float64(diskUsage))),
-				zap.Float64("predictDiskUsageMB", logutil.ToMB(float64(predictDiskUsage))),
-				zap.Float64("totalDiskMB", logutil.ToMB(float64(uint64(paramtable.Get().QueryNodeCfg.DiskCapacityLimit.GetAsInt64())))),
-				zap.Float64("thresholdFactor", paramtable.Get().QueryNodeCfg.MaxDiskUsagePercentage.GetAsFloat()),
-			)
-			return 0, 0, merr.WrapErrSegmentRequestResourceFailed("Disk")
-		}
 	}
 
-	err := checkSegmentGpuMemSize(predictGpuMemUsage, float32(paramtable.Get().GpuConfig.OverloadedMemoryThresholdPercentage.GetAsFloat()))
-	if err != nil {
-		return 0, 0, err
-	}
-
-	return predictMemUsage - memUsage, predictDiskUsage - diskUsage, nil
+	return predictMemUsage - memUsage, predictDiskUsage - diskUsage, reserveResource, nil
 }
 
 // this function is used to estimate the logical resource usage of a segment, which should only be used when tiered eviction is enabled
@@ -1929,12 +1937,15 @@ func estimateLogicalResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 
 // estimateLoadingResourceUsageOfSegment estimates the resource usage of the segment when loading,
 // it will return two different results, depending on the value of tiered eviction parameter:
-//   - when tiered eviction is enabled, the result is the max resource usage of the segment that cannot be managed by caching layer,
-//     which should be a subset of the segment inevictable part
+//   - when tiered eviction is enabled, MemorySize and DiskSize describe the complete synchronous loading peak used by
+//     segment-loader admission, while ReserveResource is the subset that cannot be managed by the caching layer
 //   - when tiered eviction is disabled, the result is the max resource usage of both the segment evictable and inevictable part
 func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, loadInfo *querypb.SegmentLoadInfo, multiplyFactor resourceEstimateFactor) (usage *ResourceUsage, err error) {
+	// SegmentLoader and the caching layer keep independent loading ledgers.
+	// seg* is the complete synchronous loading peak used by Go admission;
+	// cacheManaged* is the subset that cache cells reserve for themselves.
 	var segMemoryLoadingSize, segDiskLoadingSize uint64
-	var indexMemorySize uint64
+	var cacheManagedMemorySize, cacheManagedDiskSize uint64
 	var mmapFieldCount int
 	var fieldGpuMemorySize []uint64
 
@@ -1978,9 +1989,13 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 					fieldIndexInfo.GetBuildID())
 			}
 
-			if !multiplyFactor.TieredEvictionEnabled {
-				indexMemorySize += estimateResult.MaxMemoryCost
+			if !multiplyFactor.TieredEvictionEnabled || getIndexWarmupPolicy(fieldSchema, fieldIndexInfo) == common.WarmupSync {
+				segMemoryLoadingSize += estimateResult.MaxMemoryCost
 				segDiskLoadingSize += estimateResult.MaxDiskCost
+				if multiplyFactor.TieredEvictionEnabled {
+					cacheManagedMemorySize += estimateResult.MaxMemoryCost
+					cacheManagedDiskSize += estimateResult.MaxDiskCost
+				}
 			}
 
 			if gpuIndexRequiresGpu(fieldIndexInfo.IndexParams) {
@@ -2029,6 +2044,7 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 		var legacyNilSchema bool
 		mmapEnabled := true
 		isVectorType := true
+		needWarmup := false
 		hasIndex := true
 
 		for _, fieldID := range fieldIDs {
@@ -2053,6 +2069,7 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 
 			supportInterimIndexDataType = supportInterimIndexDataType || SupportInterimIndexDataType(fieldSchema.GetDataType())
 			isVectorType = isVectorType && typeutil.IsVectorType(fieldSchema.GetDataType())
+			needWarmup = needWarmup || getFieldWarmupPolicy(fieldSchema) == common.WarmupSync
 			mmapEnabled = mmapEnabled && isDataMmapEnable(fieldSchema)
 			containsTimestampField = containsTimestampField || DoubleMemorySystemField(fieldSchema.GetFieldID())
 			doubleMomoryDataField = doubleMomoryDataField || DoubleMemoryDataType(fieldSchema.GetDataType())
@@ -2063,23 +2080,29 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 		}
 
 		if !hasIndex {
-			if !multiplyFactor.TieredEvictionEnabled {
-				interimIndexEnable := multiplyFactor.EnableInterminSegmentIndex && !isGrowingMmapEnable() && supportInterimIndexDataType
-				if interimIndexEnable {
-					segMemoryLoadingSize += uint64(float64(binlogSize) * multiplyFactor.tempSegmentIndexFactor)
+			interimIndexEnable := multiplyFactor.EnableInterminSegmentIndex && !isGrowingMmapEnable() && supportInterimIndexDataType
+			if interimIndexEnable && (!multiplyFactor.TieredEvictionEnabled || needWarmup) {
+				interimIndexSize := uint64(float64(binlogSize) * multiplyFactor.tempSegmentIndexFactor)
+				segMemoryLoadingSize += interimIndexSize
+				if multiplyFactor.TieredEvictionEnabled {
+					cacheManagedMemorySize += interimIndexSize
 				}
 			}
 		}
 
 		if isVectorType {
 			mmapVectorField := paramtable.Get().QueryNodeCfg.MmapVectorField.GetAsBool()
-			if mmapVectorField {
-				if !multiplyFactor.TieredEvictionEnabled {
+			if !multiplyFactor.TieredEvictionEnabled || needWarmup {
+				if mmapVectorField {
 					segDiskLoadingSize += binlogSize
-				}
-			} else {
-				if !multiplyFactor.TieredEvictionEnabled {
+					if multiplyFactor.TieredEvictionEnabled {
+						cacheManagedDiskSize += binlogSize
+					}
+				} else {
 					segMemoryLoadingSize += binlogSize
+					if multiplyFactor.TieredEvictionEnabled {
+						cacheManagedMemorySize += binlogSize
+					}
 				}
 			}
 			continue
@@ -2093,16 +2116,23 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 			segMemoryLoadingSize += 2 * uint64(timestampSize)
 		}
 
-		if !mmapEnabled {
-			if !multiplyFactor.TieredEvictionEnabled {
+		if !multiplyFactor.TieredEvictionEnabled || needWarmup {
+			if !mmapEnabled {
 				segMemoryLoadingSize += binlogSize
 				if doubleMomoryDataField {
 					segMemoryLoadingSize += binlogSize
 				}
-			}
-		} else {
-			if !multiplyFactor.TieredEvictionEnabled {
+				if multiplyFactor.TieredEvictionEnabled {
+					cacheManagedMemorySize += binlogSize
+					if doubleMomoryDataField {
+						cacheManagedMemorySize += binlogSize
+					}
+				}
+			} else {
 				segDiskLoadingSize += uint64(getBinlogDataMemorySize(fieldBinlog))
+				if multiplyFactor.TieredEvictionEnabled {
+					cacheManagedDiskSize += uint64(getBinlogDataMemorySize(fieldBinlog))
+				}
 			}
 		}
 	}
@@ -2135,39 +2165,74 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 	// PART 5: calculate size of json key stats data
 	jsonStatsMmapEnable := paramtable.Get().QueryNodeCfg.MmapJSONStats.GetAsBool()
 	for _, jsonKeyStats := range loadInfo.GetJsonKeyStatsLogs() {
-		if jsonStatsMmapEnable {
-			if !multiplyFactor.TieredEvictionEnabled {
-				segDiskLoadingSize += uint64(float64(jsonKeyStats.GetMemorySize()) * multiplyFactor.jsonKeyStatsExpansionFactor)
+		needWarmup := true
+		if multiplyFactor.TieredEvictionEnabled {
+			fieldSchema, err := schemaHelper.GetFieldFromID(jsonKeyStats.GetFieldID())
+			if err != nil {
+				return nil, err
 			}
-		} else {
-			if !multiplyFactor.TieredEvictionEnabled {
-				segMemoryLoadingSize += uint64(float64(jsonKeyStats.GetMemorySize()) * multiplyFactor.jsonKeyStatsExpansionFactor)
+			needWarmup = getScalarDataWarmupPolicy(fieldSchema) == common.WarmupSync
+		}
+		if needWarmup {
+			jsonStatsSize := uint64(float64(jsonKeyStats.GetMemorySize()) * multiplyFactor.jsonKeyStatsExpansionFactor)
+			if jsonStatsMmapEnable {
+				segDiskLoadingSize += jsonStatsSize
+				if multiplyFactor.TieredEvictionEnabled {
+					cacheManagedDiskSize += jsonStatsSize
+				}
+			} else {
+				segMemoryLoadingSize += jsonStatsSize
+				if multiplyFactor.TieredEvictionEnabled {
+					cacheManagedMemorySize += jsonStatsSize
+				}
 			}
 		}
 	}
 
 	// PART 6: calculate size of text index stats data
-	// text index data is managed by the caching layer when tiered eviction is enabled,
-	// so it only needs to be included when tiered eviction is disabled.
+	// With tiered eviction, text index data is excluded from ReserveResource because the
+	// caching layer manages it, but synchronous warmup still contributes to Resource.
 	// Text match index mmap is driven by scalar_field_enable_mmap (same as raw scalar data).
 	// memory_size = sum of Tantivy index file sizes (same value as C++ ByteSize() after load),
 	// so 1.0x is the baseline; textIndexExpansionFactor allows tuning if needed.
 	textIndexMmapEnable := paramtable.Get().QueryNodeCfg.MmapScalarField.GetAsBool()
 	for _, textStats := range loadInfo.GetTextStatsLogs() {
-		if textIndexMmapEnable {
-			if !multiplyFactor.TieredEvictionEnabled {
-				segDiskLoadingSize += uint64(float64(textStats.GetMemorySize()) * multiplyFactor.textIndexExpansionFactor)
+		needWarmup := true
+		if multiplyFactor.TieredEvictionEnabled {
+			fieldSchema, err := schemaHelper.GetFieldFromID(textStats.GetFieldID())
+			if err != nil {
+				return nil, err
 			}
-		} else {
-			if !multiplyFactor.TieredEvictionEnabled {
-				segMemoryLoadingSize += uint64(float64(textStats.GetMemorySize()) * multiplyFactor.textIndexExpansionFactor)
+			needWarmup = getScalarDataWarmupPolicy(fieldSchema) == common.WarmupSync
+		}
+		if needWarmup {
+			textIndexSize := uint64(float64(textStats.GetMemorySize()) * multiplyFactor.textIndexExpansionFactor)
+			if textIndexMmapEnable {
+				segDiskLoadingSize += textIndexSize
+				if multiplyFactor.TieredEvictionEnabled {
+					cacheManagedDiskSize += textIndexSize
+				}
+			} else {
+				segMemoryLoadingSize += textIndexSize
+				if multiplyFactor.TieredEvictionEnabled {
+					cacheManagedMemorySize += textIndexSize
+				}
 			}
 		}
 	}
 
+	reserveResource := LoadResource{}
+	if multiplyFactor.TieredEvictionEnabled {
+		// Cache cells reserve cacheManaged* internally. Explicitly reserve only
+		// the remainder that the caching layer cannot see.
+		reserveResource.MemorySize = segMemoryLoadingSize - cacheManagedMemorySize
+		reserveResource.DiskSize = segDiskLoadingSize - cacheManagedDiskSize
+	}
+
 	return &ResourceUsage{
-		MemorySize:         segMemoryLoadingSize + indexMemorySize,
+		MemorySize:         segMemoryLoadingSize,
 		DiskSize:           segDiskLoadingSize,
+		ReserveResource:    reserveResource,
 		MmapFieldCount:     mmapFieldCount,
 		FieldGpuMemorySize: fieldGpuMemorySize,
 	}, nil

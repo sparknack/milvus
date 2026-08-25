@@ -31,9 +31,12 @@ import (
 )
 
 // ResourceUsage is used to estimate the resource usage of a sealed segment.
+// For loading estimates, ReserveResource is the subset of MemorySize and
+// DiskSize that the caching layer cannot account for by itself.
 type ResourceUsage struct {
 	MemorySize         uint64
 	DiskSize           uint64
+	ReserveResource    LoadResource
 	MmapFieldCount     int
 	FieldGpuMemorySize []uint64
 }
