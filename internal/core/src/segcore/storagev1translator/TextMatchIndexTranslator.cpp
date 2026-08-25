@@ -16,9 +16,12 @@
 
 #include "segcore/storagev1translator/TextMatchIndexTranslator.h"
 
+#include <algorithm>
 #include <utility>
 
 #include "cachinglayer/CacheSlot.h"
+#include "common/Utils.h"
+#include "index/Utils.h"
 #include "segcore/Utils.h"
 #include "segcore/Utils.h"
 #include "monitor/Monitor.h"
@@ -64,15 +67,34 @@ TextMatchIndexTranslator::estimated_loading_usage(
         return {};
     }
     // ignore the cid checking, because there is only one cell
+    const auto index_size = std::max<int64_t>(load_info_.index_size, 0);
     if (load_info_.enable_mmap) {
-        return {{0, load_info_.index_size},
-                {load_info_.index_size, load_info_.index_size}};
+        const auto row_offsets_size =
+            load_info_.field_nullable && load_info_.num_rows > 0
+                ? SaturatingMultiply(load_info_.num_rows,
+                                     static_cast<int64_t>(sizeof(size_t)))
+                : 0;
+        const auto row_offsets_loading_peak =
+            SaturatingMultiply(int64_t{2}, row_offsets_size);
+        const auto load_priority =
+            milvus::index::GetValueFromConfig<
+                milvus::proto::common::LoadPriority>(config_, LOAD_PRIORITY)
+                .value_or(milvus::proto::common::LoadPriority::HIGH);
+        const auto stream_memory_peak =
+            static_cast<int64_t>(milvus::index::ScalarIndexStreamMemoryOverhead(
+                static_cast<uint64_t>(index_size),
+                load_info_.scalar_index_version,
+                load_priority));
+        return {{row_offsets_size, index_size},
+                {std::max(stream_memory_peak, row_offsets_loading_peak),
+                 index_size}};
     } else {
-        // The reason the maximum disk usage is not zero is that the text match index
-        // is first written to the disk, then loaded into memory. Only after that are
-        // the disk files deleted.
-        return {{load_info_.index_size, 0},
-                {load_info_.index_size, load_info_.index_size}};
+        // Tantivy first materializes the index on disk, then copies each file
+        // through a temporary buffer into RamDirectory. The largest file can
+        // approach the whole index size, and the disk files are removed only
+        // after the in-memory index has been opened.
+        return {{index_size, 0},
+                {SaturatingMultiply(int64_t{2}, index_size), index_size}};
     }
 }
 
