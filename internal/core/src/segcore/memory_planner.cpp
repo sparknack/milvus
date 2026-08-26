@@ -332,9 +332,6 @@ LoadCellBatchAsync(milvus::OpContext* op_ctx,
     }
 
     auto& pool = ThreadPools::GetThreadPool(milvus::PriorityForLoad(priority));
-    auto reader_memory_limit =
-        std::max<int64_t>(memory_limit / static_cast<int64_t>(batches.size()),
-                          FILE_SLICE_SIZE.load());
     auto shared_factory =
         std::make_shared<BatchReaderFactory>(std::move(reader_factory));
     auto shared_finalizer =
@@ -352,6 +349,8 @@ LoadCellBatchAsync(milvus::OpContext* op_ctx,
     };
 
     for (auto& batch : batches) {
+        const auto reader_memory_limit =
+            std::max<int64_t>(1, std::min(batch.batch_memory, memory_limit));
         try {
             futures.emplace_back(pool.Submit([batch = std::move(batch),
                                               shared_factory,

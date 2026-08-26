@@ -87,7 +87,6 @@ class SealedIndexTranslator
     Config config_;
     std::string index_key_;
     IndexLoadInfo index_load_info_;
-    LoadResourceRequest load_resource_request_{};
     milvus::cachinglayer::Meta meta_;
 };
 }  // namespace milvus::segcore::storagev1translator

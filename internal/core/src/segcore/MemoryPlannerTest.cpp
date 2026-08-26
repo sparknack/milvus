@@ -244,6 +244,47 @@ RunAndCountBatches(std::vector<CellSpec> cell_specs, int64_t memory_limit) {
 
 }  // namespace
 
+TEST(LoadCellBatchAsync, ReaderLimitFollowsEachBatchMemory) {
+    constexpr int64_t MB = 1 << 20;
+    constexpr int64_t kBatchTarget = 16 * MB;
+    std::vector<CellSpec> specs = {
+        {0, 0, 0, 1, 3 * MB},
+        {1, 0, 1, 1, 5 * MB},
+        {2, 1, 0, 1, 32 * MB},
+    };
+
+    std::atomic<int64_t> small_batch_reader_limit{-1};
+    std::atomic<int64_t> oversized_batch_reader_limit{-1};
+    auto delegate = MakeMockReaderFactory();
+    BatchReaderFactory reader_factory = [delegate = std::move(delegate),
+                                         &small_batch_reader_limit,
+                                         &oversized_batch_reader_limit](
+                                            size_t batch_key,
+                                            int64_t rg_offset,
+                                            int64_t total_rg_count,
+                                            int64_t reader_memory_limit) {
+        if (batch_key == 0) {
+            small_batch_reader_limit.store(reader_memory_limit);
+        } else if (batch_key == 1) {
+            oversized_batch_reader_limit.store(reader_memory_limit);
+        }
+        return delegate(
+            batch_key, rg_offset, total_rg_count, reader_memory_limit);
+    };
+
+    auto futures = LoadCellBatchAsync(nullptr,
+                                      std::move(specs),
+                                      std::move(reader_factory),
+                                      kBatchTarget,
+                                      milvus::proto::common::LoadPriority::HIGH,
+                                      MakeMockCellFinalizer());
+    CollectLoadedCells(futures);
+
+    ASSERT_EQ(futures.size(), 2);
+    EXPECT_EQ(small_batch_reader_limit.load(), 8 * MB);
+    EXPECT_EQ(oversized_batch_reader_limit.load(), kBatchTarget);
+}
+
 TEST(LoadCellBatchAsync, MemoryBasedSplit) {
     // 10 cells x 64MB each, limit=128MB -> 5 batches (2 cells each)
     constexpr int64_t MB = 1 << 20;

@@ -73,7 +73,6 @@ SealedIndexTranslator::SealedIndexTranslator(
           !(IsVectorDataType(load_index_info->field_type) &&
             knowhere::IndexFactory::Instance().FeatureCheck(
                 index_info_.index_type, knowhere::feature::LAZY_LOAD))) {
-    load_resource_request_ = EstimateLoadResource();
 }
 
 LoadResourceRequest
@@ -109,13 +108,14 @@ SealedIndexTranslator::estimated_loading_usage(
     if (cids.empty()) {
         return {};
     }
+    const auto load_resource_request = EstimateLoadResource();
     // this is an estimation, error could be up to 20%.
     const auto final_usage = milvus::cachinglayer::ResourceUsage(
-        load_resource_request_.final_memory_cost,
-        load_resource_request_.final_disk_cost);
+        load_resource_request.final_memory_cost,
+        load_resource_request.final_disk_cost);
     const auto peak_usage = milvus::cachinglayer::ResourceUsage(
-        load_resource_request_.max_memory_cost,
-        load_resource_request_.max_disk_cost * 2);
+        load_resource_request.max_memory_cost,
+        load_resource_request.max_disk_cost);
     LOG_INFO(
         "estimated index loading usage: index_id={}, segment_id={}, "
         "field_id={}, index_type={}, index_size={}, mmap={}, "
@@ -144,13 +144,14 @@ std::vector<std::pair<milvus::cachinglayer::cid_t,
 SealedIndexTranslator::get_cells(milvus::OpContext* ctx,
                                  const std::vector<cid_t>& cids) {
     int64_t segment_id = std::stoll(index_load_info_.segment_id);
+    const auto load_resource_request = EstimateLoadResource();
 
     std::unique_ptr<milvus::index::IndexBase> index =
         milvus::index::IndexFactory::GetInstance().CreateIndex(
             index_info_, file_manager_context_);
     index->SetCellSize(milvus::cachinglayer::ResourceUsage(
-        load_resource_request_.final_memory_cost,
-        load_resource_request_.final_disk_cost));
+        load_resource_request.final_memory_cost,
+        load_resource_request.final_disk_cost));
     if (index_load_info_.enable_mmap && index->IsMmapSupported()) {
         AssertInfo(!index_load_info_.mmap_dir_path.empty(),
                    "mmap directory path is empty");

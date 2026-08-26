@@ -30,7 +30,6 @@
 #include "cachinglayer/Utils.h"
 #include "common/Chunk.h"
 #include "common/ChunkWriter.h"
-#include "common/Common.h"
 #include "common/Consts.h"
 #include "common/EasyAssert.h"
 #include "common/FieldMeta.h"
