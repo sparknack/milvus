@@ -842,10 +842,6 @@ func (suite *SegmentLoaderDetailSuite) TestRequestResource() {
 
 		suite.NoError(err)
 		suite.EqualValues(1100000, resource.Resource.MemorySize)
-		suite.Zero(resource.ReserveResource.MemorySize)
-		suite.EqualValues(resource.Resource, suite.loader.committedResource)
-		suite.loader.freeRequestResource(resource)
-		suite.True(suite.loader.committedResource.IsZero())
 	})
 
 	suite.Run("request_resource_with_timeout", func() {
@@ -857,11 +853,10 @@ func (suite *SegmentLoaderDetailSuite) TestRequestResource() {
 		result, err := suite.loader.requestResourceWithTimeout(context.Background(), loadInfo)
 		suite.NoError(err)
 		suite.EqualValues(1100000, result.Resource.MemorySize)
-		suite.loader.freeRequestResource(result)
 
-		blocked := requestResourceResult{Resource: LoadResource{MemorySize: 1024 * 1024 * 1024 * 1024}}
-		suite.loader.committedResource.Add(blocked.Resource)
-		defer suite.loader.freeRequestResource(blocked)
+		suite.loader.committedResource.Add(LoadResource{
+			MemorySize: 1024 * 1024 * 1024 * 1024,
+		})
 
 		timeoutErr := errors.New("timeout")
 		ctx, cancel := contextutil.WithTimeoutCause(context.Background(), 1000*time.Millisecond, timeoutErr)
@@ -926,7 +921,7 @@ func (suite *SegmentLoaderDetailSuite) TestCheckSegmentSizeWithDiskLimit() {
 	totalMem := uint64(1024 * 1024 * 1024) // 1GB
 	localDiskUsage := int64(100 * 1024)    // 100KB
 
-	_, _, _, err = suite.loader.checkSegmentSize(ctx, []*querypb.SegmentLoadInfo{loadInfo}, totalMem, memUsage, localDiskUsage)
+	_, _, err = suite.loader.checkSegmentSize(ctx, []*querypb.SegmentLoadInfo{loadInfo}, memUsage, totalMem, localDiskUsage)
 	suite.Error(err)
 	suite.True(errors.Is(err, merr.ErrSegmentRequestResourceFailed))
 }
@@ -961,7 +956,7 @@ func (suite *SegmentLoaderDetailSuite) TestCheckSegmentSizeWithMemoryLimit() {
 	// Set memory threshold to 80%
 	paramtable.Get().Save("queryNode.overloadedMemoryThresholdPercentage", "0.8")
 
-	_, _, _, err := suite.loader.checkSegmentSize(ctx, []*querypb.SegmentLoadInfo{loadInfo}, totalMem, memUsage, localDiskUsage)
+	_, _, err := suite.loader.checkSegmentSize(ctx, []*querypb.SegmentLoadInfo{loadInfo}, memUsage, totalMem, localDiskUsage)
 	suite.Error(err)
 	suite.True(errors.Is(err, merr.ErrSegmentRequestResourceFailed))
 }
@@ -985,7 +980,6 @@ func (suite *SegmentLoaderTextIndexEstimateSuite) SetupSuite() {
 			{FieldID: 100, Name: "id", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
 			{FieldID: 101, Name: "text", DataType: schemapb.DataType_VarChar},
 			{FieldID: 102, Name: "text2", DataType: schemapb.DataType_VarChar},
-			{FieldID: 103, Name: "json", DataType: schemapb.DataType_JSON},
 		},
 	}
 }
@@ -1043,9 +1037,9 @@ func (suite *SegmentLoaderTextIndexEstimateSuite) TestLoadingEstimate_Mmap_NoTie
 	suite.EqualValues(textIndexSize, usage.DiskSize, "mmap text index must be counted in disk")
 }
 
-func (suite *SegmentLoaderTextIndexEstimateSuite) TestLoadingEstimate_TieredEvictionEnabled_TextIndexResource() {
-	// Resource keeps the complete synchronous loading estimate for segment-loader
-	// admission even when the caching layer manages the loaded data.
+func (suite *SegmentLoaderTextIndexEstimateSuite) TestLoadingEstimate_TieredEvictionEnabled_TextIndexSkipped() {
+	// When tiered eviction is enabled the caching layer manages text indexes,
+	// so they must NOT be added to the physical loading estimate.
 	paramtable.Get().Save(paramtable.Get().QueryNodeCfg.MmapScalarField.Key, "false")
 	defer paramtable.Get().Reset(paramtable.Get().QueryNodeCfg.MmapScalarField.Key)
 
@@ -1061,75 +1055,8 @@ func (suite *SegmentLoaderTextIndexEstimateSuite) TestLoadingEstimate_TieredEvic
 	}
 	usage, err := estimateLoadingResourceUsageOfSegment(suite.schema, loadInfo, factor)
 	suite.NoError(err)
-	suite.EqualValues(textIndexSize, usage.MemorySize, "sync warmup text index must participate in segment-loader admission")
+	suite.EqualValues(0, usage.MemorySize, "text index must be skipped when tiered eviction is enabled")
 	suite.EqualValues(0, usage.DiskSize)
-	suite.Zero(usage.ReserveResource.MemorySize, "cache-managed text index must not be externally reserved through CGo")
-}
-
-func (suite *SegmentLoaderTextIndexEstimateSuite) TestLoadingEstimate_TieredEvictionEnabled_DisabledWarmupNeedsNoResource() {
-	paramtable.Get().Save(paramtable.Get().QueryNodeCfg.MmapScalarField.Key, "false")
-	defer paramtable.Get().Reset(paramtable.Get().QueryNodeCfg.MmapScalarField.Key)
-	paramtable.Get().Save(paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.Key, common.WarmupDisable)
-	defer paramtable.Get().Reset(paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.Key)
-
-	loadInfo := suite.baseLoadInfo(map[int64]*datapb.TextIndexStats{
-		101: {FieldID: 101, MemorySize: 50 * 1024 * 1024},
-	})
-	factor := resourceEstimateFactor{
-		TieredEvictionEnabled:    true,
-		textIndexExpansionFactor: 1.0,
-	}
-	usage, err := estimateLoadingResourceUsageOfSegment(suite.schema, loadInfo, factor)
-	suite.NoError(err)
-	suite.Zero(usage.MemorySize)
-	suite.Zero(usage.ReserveResource.MemorySize)
-}
-
-func (suite *SegmentLoaderTextIndexEstimateSuite) TestLoadingEstimate_TieredEvictionEnabled_ResourceContainsReserveResource() {
-	paramtable.Get().Save(paramtable.Get().QueryNodeCfg.MmapScalarField.Key, "false")
-	defer paramtable.Get().Reset(paramtable.Get().QueryNodeCfg.MmapScalarField.Key)
-	paramtable.Get().Save(paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.Key, common.WarmupSync)
-	defer paramtable.Get().Reset(paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.Key)
-
-	const fieldSize = int64(32 * 1024 * 1024)
-	const deltaSize = int64(8 * 1024 * 1024)
-	loadInfo := suite.baseLoadInfo(nil)
-	loadInfo.BinlogPaths = []*datapb.FieldBinlog{{
-		FieldID: 101,
-		Binlogs: []*datapb.Binlog{{MemorySize: fieldSize, LogSize: fieldSize}},
-	}}
-	loadInfo.Deltalogs = []*datapb.FieldBinlog{{
-		Binlogs: []*datapb.Binlog{{MemorySize: deltaSize, LogSize: deltaSize}},
-	}}
-	factor := resourceEstimateFactor{
-		TieredEvictionEnabled:    true,
-		deltaDataExpansionFactor: 2,
-	}
-	usage, err := estimateLoadingResourceUsageOfSegment(suite.schema, loadInfo, factor)
-	suite.NoError(err)
-	suite.EqualValues(2*fieldSize+2*deltaSize, usage.MemorySize, "Resource must contain the complete segment loading peak")
-	suite.EqualValues(2*deltaSize, usage.ReserveResource.MemorySize, "only non-cache-managed memory must be externally reserved through CGo")
-}
-
-func (suite *SegmentLoaderTextIndexEstimateSuite) TestLoadingEstimate_TieredEvictionEnabled_JSONStatsResource() {
-	paramtable.Get().Save(paramtable.Get().QueryNodeCfg.MmapJSONStats.Key, "false")
-	defer paramtable.Get().Reset(paramtable.Get().QueryNodeCfg.MmapJSONStats.Key)
-	paramtable.Get().Save(paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.Key, common.WarmupSync)
-	defer paramtable.Get().Reset(paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.Key)
-
-	const jsonStatsSize = int64(20 * 1024 * 1024)
-	loadInfo := suite.baseLoadInfo(nil)
-	loadInfo.JsonKeyStatsLogs = map[int64]*datapb.JsonKeyStats{
-		103: {FieldID: 103, MemorySize: jsonStatsSize},
-	}
-	factor := resourceEstimateFactor{
-		TieredEvictionEnabled:       true,
-		jsonKeyStatsExpansionFactor: 1.5,
-	}
-	usage, err := estimateLoadingResourceUsageOfSegment(suite.schema, loadInfo, factor)
-	suite.NoError(err)
-	suite.EqualValues(uint64(float64(jsonStatsSize)*1.5), usage.MemorySize)
-	suite.Zero(usage.ReserveResource.MemorySize, "cache-managed JSON stats must not be externally reserved through CGo")
 }
 
 func (suite *SegmentLoaderTextIndexEstimateSuite) TestLoadingEstimate_MultipleTextFields() {
@@ -1190,13 +1117,11 @@ func (suite *SegmentLoaderTextIndexEstimateSuite) TestLoadingEstimate_EmptyTextS
 	suite.EqualValues(0, usage.DiskSize)
 }
 
-func (suite *SegmentLoaderTextIndexEstimateSuite) TestLoadingEstimate_Mmap_TieredEvictionEnabled_TextIndexUsesCacheManagedDisk() {
-	// Synchronous mmap warmup participates in segment-loader disk admission, but
-	// the caching layer reserves the same disk usage for its cache cells.
+func (suite *SegmentLoaderTextIndexEstimateSuite) TestLoadingEstimate_Mmap_TieredEvictionEnabled_TextIndexSkipped() {
+	// When tiered eviction is enabled, text index is managed by caching layer
+	// regardless of mmap setting — must NOT appear in physical loading estimate.
 	paramtable.Get().Save(paramtable.Get().QueryNodeCfg.MmapScalarField.Key, "true")
 	defer paramtable.Get().Reset(paramtable.Get().QueryNodeCfg.MmapScalarField.Key)
-	paramtable.Get().Save(paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.Key, common.WarmupSync)
-	defer paramtable.Get().Reset(paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.Key)
 
 	const textIndexSize = int64(50 * 1024 * 1024)
 	loadInfo := suite.baseLoadInfo(map[int64]*datapb.TextIndexStats{
@@ -1210,10 +1135,8 @@ func (suite *SegmentLoaderTextIndexEstimateSuite) TestLoadingEstimate_Mmap_Tiere
 	}
 	usage, err := estimateLoadingResourceUsageOfSegment(suite.schema, loadInfo, factor)
 	suite.NoError(err)
-	suite.Zero(usage.MemorySize)
-	suite.EqualValues(textIndexSize, usage.DiskSize)
-	suite.Zero(usage.ReserveResource.MemorySize)
-	suite.Zero(usage.ReserveResource.DiskSize)
+	suite.EqualValues(0, usage.MemorySize, "text index must be skipped when tiered eviction is enabled (mmap)")
+	suite.EqualValues(0, usage.DiskSize, "text index must be skipped when tiered eviction is enabled (mmap)")
 }
 
 // --- estimateLogicalResourceUsageOfSegment tests ---
