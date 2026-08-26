@@ -10,6 +10,7 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
 #include <cstdint>
+#include <mutex>
 #include "cachinglayer/Translator.h"
 #include "common/resource_c.h"
 #include "index/Index.h"
@@ -59,7 +60,7 @@ class SealedIndexTranslator
     }
 
  private:
-    LoadResourceRequest
+    const LoadResourceRequest&
     EstimateLoadResource() const;
 
     struct IndexLoadInfo {
@@ -87,6 +88,10 @@ class SealedIndexTranslator
     Config config_;
     std::string index_key_;
     IndexLoadInfo index_load_info_;
+    // Resolve HYBRID metadata only when loading is first attempted, then reuse
+    // the same request for reservation and cell accounting.
+    mutable std::once_flag load_resource_request_once_;
+    mutable LoadResourceRequest load_resource_request_{};
     milvus::cachinglayer::Meta meta_;
 };
 }  // namespace milvus::segcore::storagev1translator

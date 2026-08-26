@@ -77,7 +77,7 @@ TEST(SealedIndexTranslatorTest, UsesFactoryPeakDiskWithoutDoublingIt) {
     EXPECT_EQ(peak_usage.file_bytes, kIndexSize);
 }
 
-TEST(SealedIndexTranslatorTest, RecomputesDynamicStreamEstimate) {
+TEST(SealedIndexTranslatorTest, CachesLoadEstimateAfterFirstUse) {
     constexpr int64_t kIndexSize = 256 * 1024 * 1024;
     auto& pool = ThreadPools::GetThreadPool(ThreadPoolPriority::HIGH);
     const auto original_worker_count = pool.GetMaxThreadNum();
@@ -107,8 +107,7 @@ TEST(SealedIndexTranslatorTest, RecomputesDynamicStreamEstimate) {
     const auto legacy_aux_bytes =
         load_info.num_rows * sizeof(int32_t) + (load_info.num_rows + 7) / 8;
     EXPECT_EQ(first_peak, legacy_aux_bytes + DEFAULT_INDEX_FILE_SLICE_SIZE);
-    EXPECT_EQ(second_peak,
-              legacy_aux_bytes + 2 * DEFAULT_INDEX_FILE_SLICE_SIZE);
+    EXPECT_EQ(second_peak, first_peak);
 }
 
 }  // namespace

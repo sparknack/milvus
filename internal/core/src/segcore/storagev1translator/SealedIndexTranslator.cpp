@@ -75,20 +75,24 @@ SealedIndexTranslator::SealedIndexTranslator(
                 index_info_.index_type, knowhere::feature::LAZY_LOAD))) {
 }
 
-LoadResourceRequest
+const LoadResourceRequest&
 SealedIndexTranslator::EstimateLoadResource() const {
-    return milvus::index::IndexFactory::GetInstance().IndexLoadResource(
-        index_load_info_.field_type,
-        index_load_info_.element_type,
-        index_load_info_.index_engine_version,
-        index_load_info_.index_size,
-        index_load_info_.index_params,
-        index_load_info_.enable_mmap,
-        index_load_info_.num_rows,
-        index_load_info_.dim,
-        index_load_info_.index_files,
-        file_manager_context_,
-        index_load_info_.field_nullable);
+    std::call_once(load_resource_request_once_, [this]() {
+        load_resource_request_ =
+            milvus::index::IndexFactory::GetInstance().IndexLoadResource(
+                index_load_info_.field_type,
+                index_load_info_.element_type,
+                index_load_info_.index_engine_version,
+                index_load_info_.index_size,
+                index_load_info_.index_params,
+                index_load_info_.enable_mmap,
+                index_load_info_.num_rows,
+                index_load_info_.dim,
+                index_load_info_.index_files,
+                file_manager_context_,
+                index_load_info_.field_nullable);
+    });
+    return load_resource_request_;
 }
 
 size_t
@@ -108,7 +112,7 @@ SealedIndexTranslator::estimated_loading_usage(
     if (cids.empty()) {
         return {};
     }
-    const auto load_resource_request = EstimateLoadResource();
+    const auto& load_resource_request = EstimateLoadResource();
     // this is an estimation, error could be up to 20%.
     const auto final_usage = milvus::cachinglayer::ResourceUsage(
         load_resource_request.final_memory_cost,
@@ -144,7 +148,7 @@ std::vector<std::pair<milvus::cachinglayer::cid_t,
 SealedIndexTranslator::get_cells(milvus::OpContext* ctx,
                                  const std::vector<cid_t>& cids) {
     int64_t segment_id = std::stoll(index_load_info_.segment_id);
-    const auto load_resource_request = EstimateLoadResource();
+    const auto& load_resource_request = EstimateLoadResource();
 
     std::unique_ptr<milvus::index::IndexBase> index =
         milvus::index::IndexFactory::GetInstance().CreateIndex(
