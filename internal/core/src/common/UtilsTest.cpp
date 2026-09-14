@@ -13,7 +13,9 @@
 #include <limits>
 #include <string>
 
+#include "common/Common.h"
 #include "common/Utils.h"
+#include "folly/ScopeGuard.h"
 #include "gtest/gtest.h"
 #include "knowhere/comp/index_param.h"
 
@@ -41,6 +43,23 @@ TEST(Util_Common, CheckPlusOverflowKeepsSystemClassification) {
         FAIL() << "expected integer overflow";
     } catch (const milvus::SegcoreError& error) {
         EXPECT_EQ(error.get_error_code(), milvus::ErrorCode::UnexpectedError);
+    }
+}
+
+TEST(Util_Common, IndexSliceSizeConfig) {
+    const auto original = milvus::FILE_SLICE_SIZE.load();
+    const auto restore =
+        folly::makeGuard([&] { milvus::FILE_SLICE_SIZE.store(original); });
+    for (const int64_t mib : {1, 3, 16}) {
+        milvus::SetIndexSliceSize(mib);
+        EXPECT_EQ(milvus::FILE_SLICE_SIZE.load(), mib * 1024 * 1024);
+        EXPECT_EQ(milvus::FILE_SLICE_SIZE.load() % 4096, 0);
+    }
+    const auto previous = milvus::FILE_SLICE_SIZE.load();
+    for (const int64_t mib :
+         {int64_t{0}, int64_t{-1}, std::numeric_limits<int64_t>::max()}) {
+        EXPECT_THROW(milvus::SetIndexSliceSize(mib), milvus::SegcoreError);
+        EXPECT_EQ(milvus::FILE_SLICE_SIZE.load(), previous);
     }
 }
 

@@ -17,11 +17,13 @@
 #include "common/Common.h"
 
 #include <string.h>
+#include <limits>
 
 #include "common/Consts.h"
 #include "gflags/gflags.h"
 #include "glog/logging.h"
 #include "log/Log.h"
+#include "storage/EntryStreamUtils.h"
 #include "storage/LoadAdmissionController.h"
 #include "tantivy-binding.h"
 
@@ -47,7 +49,16 @@ std::atomic<bool> ENABLE_PARQUET_STATS_SKIP_INDEX(
 
 void
 SetIndexSliceSize(const int64_t size) {
-    FILE_SLICE_SIZE.store(size << 20);
+    AssertInfo(size > 0 && size <= (std::numeric_limits<int64_t>::max() >> 20),
+               "Index slice size must be positive and fit in int64 bytes, "
+               "got {} MiB",
+               size);
+    const auto slice_bytes = size << 20;
+    AssertInfo(storage::IsStreamSliceSizeAligned(slice_bytes),
+               "Index slice size must be {}-byte aligned, got {} bytes",
+               storage::kStreamSliceAlignment,
+               slice_bytes);
+    FILE_SLICE_SIZE.store(slice_bytes);
     LOG_INFO("set config index slice size (byte): {}", FILE_SLICE_SIZE.load());
 }
 

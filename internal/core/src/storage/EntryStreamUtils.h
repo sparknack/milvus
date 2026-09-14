@@ -40,6 +40,21 @@ constexpr size_t kFileStreamBufferMultiplier = 2;
 // and the returned plaintext buffer.
 constexpr size_t kEncryptedStreamBufferMultiplier = 3;
 
+// Stable request window shared by packed and legacy async index loads.
+inline constexpr size_t kMaxIndexLoadInflightBytes =
+    DEFAULT_FIELD_MAX_MEMORY_LIMIT;
+inline constexpr size_t kMaxIndexLoadInflightSlices =
+    DEFAULT_FIELD_MAX_MEMORY_LIMIT / DEFAULT_INDEX_FILE_SLICE_SIZE;
+
+// Includes the largest indivisible encrypted/encoded unit, even above the cap.
+inline size_t
+IndexLoadMaxTransientBytes(size_t max_unit_bytes) {
+    return std::max(max_unit_bytes,
+                    std::min(kMaxIndexLoadInflightBytes,
+                             SaturatingMultiply(max_unit_bytes,
+                                                kMaxIndexLoadInflightSlices)));
+}
+
 // Returns whether a positive slice size satisfies the stream alignment.
 [[nodiscard]] constexpr bool
 IsStreamSliceSizeAligned(size_t slice_size) noexcept {
@@ -49,6 +64,14 @@ IsStreamSliceSizeAligned(size_t slice_size) noexcept {
 // Returns the configured default size of one entry-stream slice.
 [[nodiscard]] inline size_t
 DefaultStreamSliceSize() {
+    // Non-tail slices must remain valid DIRECT I/O write ranges.
+    static_assert(
+        DEFAULT_INDEX_FILE_SLICE_SIZE >=
+                static_cast<int64_t>(kMinStreamSliceSize) &&
+            IsStreamSliceSizeAligned(DEFAULT_INDEX_FILE_SLICE_SIZE),
+        "Default index slice size must be at least 64 KiB and 4 KiB-aligned");
+    static_assert(kMaxIndexLoadInflightSlices > 0,
+                  "Default index slice size must fit in the index load window");
     return DEFAULT_INDEX_FILE_SLICE_SIZE;
 }
 

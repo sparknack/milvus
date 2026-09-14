@@ -34,6 +34,7 @@ extern std::atomic<bool> GROWING_JSON_KEY_STATS_ENABLED;
 extern std::atomic<bool> CONFIG_PARAM_TYPE_CHECK_ENABLED;
 extern std::atomic<bool> ENABLE_PARQUET_STATS_SKIP_INDEX;
 
+// Sets the index slice size in MiB; rejects invalid values before changing it.
 void
 SetIndexSliceSize(const int64_t size);
 

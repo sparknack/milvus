@@ -493,6 +493,8 @@ PositionedFileWriter::WriteAt(size_t file_offset,
                size,
                file_size_);
 
+    const auto write_permit =
+        LocalFileIOPool::GetInstance().AcquireWritePermit();
     if (use_direct_io_) {
         WriteDirectAlignedAt(file_offset, data, size);
     } else {
@@ -505,6 +507,8 @@ PositionedFileWriter::Finish() {
     AssertInfo(!finished_, "Finish() has already been called");
     finished_ = true;
 
+    const auto write_permit =
+        LocalFileIOPool::GetInstance().AcquireWritePermit();
     if (fd_ != -1 && ftruncate(fd_, file_size_) != 0) {
         Cleanup();
         ThrowInfo(ErrorCode::FileWriteFailed,

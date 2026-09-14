@@ -1190,6 +1190,83 @@ TEST_F(FileWriterTest, DisablingWriteLimitUnblocksWaitingWriters) {
     (void)second_permit;
 }
 
+TEST_F(FileWriterTest, PositionedWriterWaitsForWriteAndFinishPermits) {
+    auto& pool = LocalFileIOPool::GetInstance();
+    pool.Configure(1);
+    const auto mode = FileWriter::GetMode();
+    FileWriter::SetMode(FileWriter::WriteMode::DIRECT);
+    auto restore = folly::makeGuard([&] { FileWriter::SetMode(mode); });
+    const std::string data(kBufferSize + 17, 'x');
+    for (const bool finish : {false, true}) {
+        const auto filename = (test_dir_ / "positioned_permit").string();
+        PositionedFileWriter writer(filename, data.size());
+        if (finish) {
+            writer.WriteAt(0, data.data(), data.size());
+        }
+        auto permit = pool.AcquireWritePermit();
+        std::promise<void> started;
+        auto entered = started.get_future();
+        auto operation = std::async(std::launch::async, [&] {
+            started.set_value();
+            if (finish) {
+                writer.Finish();
+            } else {
+                writer.WriteAt(0, data.data(), data.size());
+            }
+        });
+        auto drain = folly::makeGuard([&] {
+            permit = {};
+            operation.wait();
+        });
+        ASSERT_EQ(entered.wait_for(std::chrono::seconds(5)),
+                  std::future_status::ready);
+        EXPECT_EQ(operation.wait_for(std::chrono::milliseconds(30)),
+                  std::future_status::timeout);
+        permit = {};
+        EXPECT_NO_THROW(operation.get());
+        drain.dismiss();
+        if (!finish) {
+            writer.Finish();
+        }
+        EXPECT_EQ(ReadFile(filename), data);
+    }
+}
+
+TEST_F(FileWriterTest, PositionedWriterReleasesPermitAfterIOError) {
+    if (access("/dev/full", W_OK) != 0) {
+        GTEST_SKIP() << "/dev/full is unavailable";
+    }
+    auto& pool = LocalFileIOPool::GetInstance();
+    pool.Configure(1);
+    const auto mode = FileWriter::GetMode();
+    FileWriter::SetMode(FileWriter::WriteMode::BUFFERED);
+    auto restore = folly::makeGuard([&] { FileWriter::SetMode(mode); });
+    for (const bool finish : {false, true}) {
+        PositionedFileWriter writer("/dev/full", 1);
+        try {
+            if (finish) {
+                writer.Finish();
+            } else {
+                const char byte = 'x';
+                writer.WriteAt(0, &byte, 1);
+            }
+            FAIL() << "expected local I/O failure";
+        } catch (const SegcoreError& error) {
+            EXPECT_EQ(error.get_error_code(), FileWriteFailed);
+        }
+        auto acquire = std::async(std::launch::async,
+                                  [&] { return pool.AcquireWritePermit(); });
+        auto drain = folly::makeGuard([&] {
+            pool.Configure(0);
+            acquire.wait();
+        });
+        ASSERT_EQ(acquire.wait_for(std::chrono::seconds(5)),
+                  std::future_status::ready);
+        auto permit = acquire.get();
+        drain.dismiss();
+    }
+}
+
 TEST_F(FileWriterTest, SameWorkerCountDoesNotReplaceActiveExecutor) {
     auto& pool = LocalFileIOPool::GetInstance();
     pool.Configure(1);
