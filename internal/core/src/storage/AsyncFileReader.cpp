@@ -19,9 +19,12 @@
 #include <chrono>
 #include <cstring>
 #include <memory>
+#include <type_traits>
 #include <utility>
 #include "arrow/buffer.h"
+#include "arrow/util/thread_pool.h"
 #include "folly/coro/Promise.h"
+#include "folly/Try.h"
 #include "folly/coro/WithCancellation.h"
 #include "folly/futures/Future.h"
 #include "milvus-storage/common/extend_status.h"
@@ -33,17 +36,34 @@ namespace {
 
 // Keep the Arrow status intact for retry classification. The coroutine does
 // not abandon a caller-owned destination while the Arrow future can write it.
-folly::coro::Future<arrow::Result<int64_t>>
-AwaitFileResult(arrow::Future<int64_t> arrow_future) {
+template <typename T>
+folly::coro::Future<arrow::Result<T>>
+AwaitFileResult(arrow::Future<T> arrow_future) {
     auto [promise, future] =
-        folly::coro::makePromiseContract<arrow::Result<int64_t>>();
+        folly::coro::makePromiseContract<arrow::Result<T>>();
+    auto completion = std::make_shared<folly::coro::Promise<arrow::Result<T>>>(
+        std::move(promise));
+    arrow_future.AddCallback([completion](const arrow::Result<T>& result) {
+        completion->setValue(result);
+    });
+    return future;
+}
+
+// Arrow's task runner does not transport thrown C++ exceptions. Complete a
+// Folly promise so filesystem exceptions retain their types across the I/O hop.
+template <typename Fn>
+auto
+RunFileIO(arrow::internal::Executor& executor, Fn fn) {
+    using Result = std::invoke_result_t<Fn>;
+    auto [promise, future] = folly::coro::makePromiseContract<Result>();
     auto completion =
-        std::make_shared<folly::coro::Promise<arrow::Result<int64_t>>>(
-            std::move(promise));
-    arrow_future.AddCallback(
-        [completion](const arrow::Result<int64_t>& result) {
-            completion->setValue(result);
-        });
+        std::make_shared<folly::coro::Promise<Result>>(std::move(promise));
+    auto status = executor.Spawn([completion, fn = std::move(fn)]() mutable {
+        completion->setResult(folly::makeTryWith(std::move(fn)));
+    });
+    if (!status.ok()) {
+        throw milvus_storage::ToSegcoreError(status);
+    }
     return future;
 }
 
@@ -59,17 +79,35 @@ IsRetryableRead(const arrow::Status& status) {
 
 }  // namespace
 
+folly::coro::Task<std::shared_ptr<arrow::io::RandomAccessFile>>
+OpenInputFileAsync(std::shared_ptr<arrow::fs::FileSystem> fs,
+                   std::string path,
+                   folly::CancellationToken token) {
+    ThrowIfCancelled(token, "OpenInputFileAsync");
+    auto pending = RunFileIO(
+        *fs->io_context().executor(),
+        [fs, path = std::move(path)] { return fs->OpenInputFile(path); });
+    auto result = co_await folly::coro::co_withCancellation(
+        folly::CancellationToken{}, std::move(pending));
+    ThrowIfCancelled(token, "OpenInputFileAsync");
+    if (!result.ok()) {
+        throw milvus_storage::ToSegcoreError(result.status());
+    }
+    co_return std::move(result).ValueOrDie();
+}
+
 folly::coro::Task<int64_t>
 GetFileSizeAsync(arrow::io::RandomAccessFile& file,
                  folly::CancellationToken token) {
     ThrowIfCancelled(token, "GetFileSizeAsync");
     auto* native =
         dynamic_cast<milvus_storage::NonBlockingRandomAccessFile*>(&file);
-    auto result = native != nullptr
-                      ? co_await folly::coro::co_withCancellation(
-                            folly::CancellationToken{},
-                            AwaitFileResult(native->GetSizeAsync()))
-                      : file.GetSize();
+    auto pending = native != nullptr
+                       ? AwaitFileResult(native->GetSizeAsync())
+                       : RunFileIO(*file.io_context().executor(),
+                                   [&file] { return file.GetSize(); });
+    auto result = co_await folly::coro::co_withCancellation(
+        folly::CancellationToken{}, std::move(pending));
     ThrowIfCancelled(token, "GetFileSizeAsync");
     if (!result.ok()) {
         throw milvus_storage::ToSegcoreError(result.status());

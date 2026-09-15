@@ -206,10 +206,23 @@ class ControlledDirectReadFile final
 
     arrow::Future<int64_t>
     GetSizeAsync() override {
+        {
+            std::lock_guard lock(mutex_);
+            ++size_calls_;
+        }
+        calls_cv_.notify_all();
         if (size_future_) {
             return *size_future_;
         }
         return arrow::Future<int64_t>::MakeFinished(GetSize());
+    }
+
+    bool
+    WaitForSizeCall(
+        std::chrono::milliseconds timeout = std::chrono::seconds(5)) const {
+        std::unique_lock lock(mutex_);
+        return calls_cv_.wait_for(
+            lock, timeout, [this] { return size_calls_ > 0; });
     }
 
     // Configure before starting a load to control its native size request.
@@ -252,6 +265,7 @@ class ControlledDirectReadFile final
         std::lock_guard lock(mutex_);
         AssertInfo(active_reads_ == 0, "Cannot reset pending mock reads");
         calls_.clear();
+        size_calls_ = 0;
         peak_inflight_ = 0;
     }
 
@@ -350,6 +364,7 @@ class ControlledDirectReadFile final
     std::optional<Completion> next_completion_;
     std::optional<arrow::Future<int64_t>> size_future_;
     bool auto_complete_{true};
+    size_t size_calls_{0};
     size_t active_reads_{0};
     size_t peak_inflight_{0};
 };

@@ -31,6 +31,7 @@
 #include "NamedType/named_type_impl.hpp"
 #include "NamedType/underlying_functionalities.hpp"
 #include "arrow/api.h"
+#include "arrow/filesystem/localfs.h"
 #include "boost/filesystem/operations.hpp"
 #include "cachinglayer/Manager.h"
 #include "cachinglayer/Translator.h"
@@ -83,8 +84,6 @@
 #include "storage/AsyncFileReader.h"
 #include "storage/AsyncLoadExecutor.h"
 #include "storage/EntryStreamUtils.h"
-#include "storage/LegacyIndexLoader.h"
-#include "storage/RemoteInputStream.h"
 #include "storage/loon_ffi/property_singleton.h"
 
 namespace milvus::index {
@@ -92,16 +91,32 @@ namespace milvus::index {
 namespace {
 
 // meta.json is raw JSON, not an index envelope. Keep its input and parser
-// scratch admitted together; no staging file or second admission is needed.
+// scratch admitted together after a bounded size probe; no staging file is needed.
 folly::coro::Task<std::unordered_map<std::string, std::set<std::string>>>
 LoadJsonStatsMetaAsync(const storage::FileManagerContext& context,
                        const std::string& remote_path,
                        proto::common::LoadPriority priority,
                        folly::CancellationToken token) {
     storage::ThrowIfCancelled(token, "JsonKeyStats::LoadMeta");
-    auto input = storage::OpenLegacyIndexInput(
-        context.chunkManagerPtr, context.fs, remote_path);
-    const auto size = input->Size();
+    auto fs = context.fs ? context.fs : segcore::GetDefaultArrowFileSystem();
+    // meta.json is uploaded through ChunkManager: local paths already include
+    // the root, unlike Parquet paths written through the rooted Arrow filesystem.
+    if (milvus_storage::IsLocalFileSystem(fs)) {
+        fs = std::make_shared<arrow::fs::LocalFileSystem>();
+    }
+    std::shared_ptr<arrow::io::RandomAccessFile> input;
+    size_t size;
+    {
+        auto probe =
+            co_await storage::LoadAdmissionController::GetInstance()
+                .AcquireAsync({4096, 1},
+                              priority == proto::common::LoadPriority::LOW
+                                  ? storage::LoadAdmissionPriority::Low
+                                  : storage::LoadAdmissionPriority::High,
+                              token);
+        input = co_await storage::OpenInputFileAsync(fs, remote_path, token);
+        size = co_await storage::GetFileSizeAsync(*input, token);
+    }
     AssertInfo(size <= std::string{}.max_size(),
                "JSON stats metadata exceeds string capacity: {}",
                size);
@@ -116,20 +131,13 @@ LoadJsonStatsMetaAsync(const storage::FileManagerContext& context,
                 : storage::LoadAdmissionPriority::High,
             token);
     std::string content(size, '\0');
-    auto* remote = dynamic_cast<storage::RemoteInputStream*>(input.get());
     for (size_t offset = 0; offset < size;) {
         storage::ThrowIfCancelled(token, "JsonKeyStats::ReadMeta");
         const auto bytes =
             std::min(storage::DefaultStreamSliceSize(), size - offset);
         auto* destination = reinterpret_cast<uint8_t*>(content.data() + offset);
-        if (remote != nullptr) {
-            co_await storage::ReadFileRangeAsync(
-                *remote->GetFile(), offset, destination, bytes, token);
-        } else {
-            AssertInfo(input->ReadAt(destination, offset, bytes) == bytes,
-                       "Short JSON stats metadata read: {}",
-                       remote_path);
-        }
+        co_await storage::ReadFileRangeAsync(
+            *input, offset, destination, bytes, token);
         offset += bytes;
     }
     storage::ThrowIfCancelled(token, "JsonKeyStats::ParseMeta");
@@ -242,11 +250,7 @@ ReadJsonStatsParquetMetadataAsync(
         auto lease = co_await admission.AcquireAsync(
             {4096, 1}, admission_priority, token);
         storage::ThrowIfCancelled(token, "JsonKeyStats::ProbeParquetFooter");
-        auto opened = fs->OpenInputFile(path);
-        if (!opened.ok()) {
-            throw milvus_storage::ToSegcoreError(opened.status());
-        }
-        auto file = std::move(opened).ValueOrDie();
+        auto file = co_await storage::OpenInputFileAsync(fs, path, token);
         file_size = co_await storage::GetFileSizeAsync(*file, token);
         AssertInfo(file_size >= trailer_size + 4,
                    "Truncated JSON stats Parquet file: {}",
@@ -368,6 +372,129 @@ GetJsonStatsFieldsFromSchema(const std::shared_ptr<arrow::Schema>& schema) {
 }
 
 }  // namespace
+
+struct JsonKeyStats::ColumnGroupReaders {
+    std::vector<segcore::storagev2translator::ChunkReaderPtr> chunks;
+    segcore::storagev2translator::ColumnSizeEstimateResult size_estimate;
+    bool eager;
+    bool enable_async_load;
+};
+
+namespace {
+
+bool
+JsonStatsEagerLoad(const std::string& warmup_policy) {
+    return segcore::getCacheWarmupPolicy(warmup_policy,
+                                         /*is_vector=*/false,
+                                         /*is_index=*/false,
+                                         /*in_load_list=*/true) !=
+           CacheWarmupPolicy::CacheWarmupPolicy_Disable;
+}
+
+std::shared_ptr<milvus_storage::api::Reader>
+CreateJsonStatsReader(std::vector<std::string> files,
+                      const std::vector<int64_t>& file_num_rows,
+                      const std::vector<std::string>& column_names) {
+    auto column_group = std::make_shared<milvus_storage::api::ColumnGroup>();
+    column_group->columns = column_names;
+    column_group->format = LOON_FORMAT_PARQUET;
+    column_group->files.reserve(files.size());
+    for (size_t i = 0; i < files.size(); ++i) {
+        column_group->files.push_back(milvus_storage::api::ColumnGroupFile{
+            .path = std::move(files[i]),
+            .start_index = 0,
+            .end_index = file_num_rows[i],
+            .properties = {},
+        });
+    }
+    auto column_groups = std::make_shared<milvus_storage::api::ColumnGroups>();
+    column_groups->push_back(std::move(column_group));
+    return std::shared_ptr<milvus_storage::api::Reader>(
+        milvus_storage::api::Reader::create(
+            column_groups,
+            nullptr,
+            std::make_shared<std::vector<std::string>>(column_names),
+            GetJsonStatsReadProperties()));
+}
+
+}  // namespace
+
+JsonKeyStats::ColumnGroupReaders
+JsonKeyStats::OpenColumnGroup(int64_t group_id,
+                              std::vector<std::string> files,
+                              const std::vector<int64_t>& rows,
+                              const std::shared_ptr<arrow::Schema>& schema,
+                              const std::string& warmup_policy) {
+    const auto column_names = schema->field_names();
+    auto reader = CreateJsonStatsReader(std::move(files), rows, column_names);
+    AssertInfo(reader != nullptr,
+               "Failed to create JSON stats reader for group {}",
+               group_id);
+    ColumnGroupReaders result{{}, {}, JsonStatsEagerLoad(warmup_policy), false};
+    auto all_columns = std::make_shared<std::vector<std::string>>(column_names);
+    auto all = OpenJsonStatsChunkReaderSync(
+        *reader, all_columns, group_id, segment_id_);
+    if (result.eager) {
+        result.chunks.push_back(std::move(all));
+    } else {
+        result.size_estimate =
+            segcore::storagev2translator::FetchColumnSizeEstimates(*all);
+        all.reset();
+        result.chunks.reserve(column_names.size());
+        for (const auto& name : column_names) {
+            result.chunks.push_back(OpenJsonStatsChunkReaderSync(
+                *reader,
+                std::make_shared<std::vector<std::string>>(1, name),
+                group_id,
+                segment_id_));
+        }
+    }
+    return result;
+}
+
+JsonKeyStats::ColumnGroupReaders
+JsonKeyStats::OpenColumnGroupAsync(int64_t group_id,
+                                   std::vector<std::string> files,
+                                   const std::vector<int64_t>& rows,
+                                   const std::shared_ptr<arrow::Schema>& schema,
+                                   const std::string& warmup_policy,
+                                   milvus::OpContext* op_ctx) {
+    const auto column_names = schema->field_names();
+    auto reader = CreateJsonStatsReader(std::move(files), rows, column_names);
+    AssertInfo(reader != nullptr && !column_names.empty(),
+               "Failed to create JSON stats reader for group {}",
+               group_id);
+    ColumnGroupReaders result{{}, {}, JsonStatsEagerLoad(warmup_policy), true};
+    std::vector<segcore::storagev2translator::ChunkReaderOpenSpec> specs;
+    specs.reserve(result.eager ? 1 : column_names.size());
+    if (result.eager) {
+        specs.push_back(
+            {kJsonStatsReaderColumnGroupIndex,
+             std::make_shared<std::vector<std::string>>(column_names)});
+    } else {
+        for (const auto& name : column_names) {
+            specs.push_back(
+                {kJsonStatsReaderColumnGroupIndex,
+                 std::make_shared<std::vector<std::string>>(1, name)});
+        }
+    }
+    result.chunks = folly::coro::blockingWait(
+        segcore::storagev2translator::OpenChunkReadersAsync(
+            op_ctx,
+            segment_id_,
+            std::move(reader),
+            std::move(specs),
+            {.load_priority = load_priority_}));
+    AssertInfo(result.chunks.size() == (result.eager ? 1 : column_names.size()),
+               "JSON stats async reader count mismatch for group {}",
+               group_id);
+    if (!result.eager) {
+        result.size_estimate =
+            segcore::storagev2translator::FetchColumnSizeEstimates(
+                *result.chunks.front());
+    }
+    return result;
+}
 
 JsonKeyStats::JsonKeyStats(const storage::FileManagerContext& ctx,
                            bool is_load,
@@ -1295,22 +1422,25 @@ JsonKeyStats::LoadColumnGroup(int64_t column_group_id,
         file_num_rows.push_back(file_rows);
     }
 
+    auto readers = OpenColumnGroup(column_group_id,
+                                   std::move(files),
+                                   file_num_rows,
+                                   first_file_metadata.schema,
+                                   warmup_policy);
     LoadColumnGroupFromMetadata(column_group_id,
-                                std::move(files),
                                 file_num_rows,
                                 first_file_metadata.schema,
                                 warmup_policy,
-                                nullptr);
+                                std::move(readers));
 }
 
 void
 JsonKeyStats::LoadColumnGroupFromMetadata(
     int64_t column_group_id,
-    std::vector<std::string> files,
     const std::vector<int64_t>& file_num_rows,
     const std::shared_ptr<arrow::Schema>& schema,
     const std::string& warmup_policy,
-    milvus::OpContext* op_ctx) {
+    ColumnGroupReaders readers) {
     const auto [milvus_field_ids, column_names] =
         GetJsonStatsFieldsFromSchema(schema);
     AssertInfo(
@@ -1374,66 +1504,14 @@ JsonKeyStats::LoadColumnGroupFromMetadata(
                                     ? MmapChunkWritebackMode::FdatasyncOnFinish
                                     : MmapChunkWritebackMode::Disabled;
 
-    auto column_group = std::make_shared<milvus_storage::api::ColumnGroup>();
-    column_group->columns = column_names;
-    column_group->format = LOON_FORMAT_PARQUET;
-    column_group->files.reserve(files.size());
-    for (size_t i = 0; i < files.size(); ++i) {
-        column_group->files.push_back(milvus_storage::api::ColumnGroupFile{
-            .path = std::move(files[i]),
-            .start_index = 0,
-            .end_index = file_num_rows[i],
-            .properties = {},
-        });
-    }
-    auto column_groups = std::make_shared<milvus_storage::api::ColumnGroups>();
-    column_groups->push_back(std::move(column_group));
-    const auto properties = GetJsonStatsReadProperties();
-    const auto resolved_warmup_policy =
-        milvus::segcore::getCacheWarmupPolicy(warmup_policy,
-                                              /*is_vector=*/false,
-                                              /*is_index=*/false,
-                                              /*in_load_list=*/true);
-    const bool eager_load =
-        resolved_warmup_policy != CacheWarmupPolicy::CacheWarmupPolicy_Disable;
-    const bool enable_async_load =
-        milvus::segcore::storagev2translator::StorageV2AsyncLoadEnabled();
+    const bool eager_load = readers.eager;
+    const bool enable_async_load = readers.enable_async_load;
+    AssertInfo(readers.chunks.size() == (eager_load ? 1 : column_names.size()),
+               "JSON stats reader count mismatch for group {}",
+               column_group_id);
 
     if (eager_load) {
-        const auto needed_columns =
-            std::make_shared<std::vector<std::string>>(column_names);
-        const auto reader = std::shared_ptr<milvus_storage::api::Reader>(
-            milvus_storage::api::Reader::create(
-                column_groups, nullptr, needed_columns, properties));
-        AssertInfo(reader != nullptr,
-                   "[JsonStats] failed to create reader for column group {} "
-                   "segment {}",
-                   column_group_id,
-                   segment_id_);
-
-        milvus::segcore::storagev2translator::ChunkReaderPtr chunk_reader;
-        if (enable_async_load) {
-            std::vector<
-                milvus::segcore::storagev2translator::ChunkReaderOpenSpec>
-                open_specs{{kJsonStatsReaderColumnGroupIndex, needed_columns}};
-            auto chunk_readers = folly::coro::blockingWait(
-                milvus::segcore::storagev2translator::OpenChunkReadersAsync(
-                    op_ctx,
-                    segment_id_,
-                    reader,
-                    std::move(open_specs),
-                    {.load_priority = load_priority_}));
-            AssertInfo(chunk_readers.size() == 1,
-                       "[JsonStats] async reader count mismatch for column "
-                       "group {} segment {}: expected 1, got {}",
-                       column_group_id,
-                       segment_id_,
-                       chunk_readers.size());
-            chunk_reader = std::move(chunk_readers.front());
-        } else {
-            chunk_reader = OpenJsonStatsChunkReaderSync(
-                *reader, needed_columns, column_group_id, segment_id_);
-        }
+        auto chunk_reader = std::move(readers.chunks.front());
 
         auto translator = std::make_unique<
             milvus::segcore::storagev2translator::ManifestGroupTranslator>(
@@ -1480,75 +1558,10 @@ JsonKeyStats::LoadColumnGroupFromMetadata(
         return;
     }
 
-    // Lazy JSON stats columns are loaded through per-column projected readers,
-    // same as lazy storage-v2 column-group entries. Fetch the complete estimate
-    // matrix once and pass that temporary result to each projected translator.
-    const auto all_columns =
-        std::make_shared<std::vector<std::string>>(column_names);
-    const auto reader = std::shared_ptr<milvus_storage::api::Reader>(
-        milvus_storage::api::Reader::create(
-            column_groups, nullptr, all_columns, properties));
-    AssertInfo(reader != nullptr,
-               "[JsonStats] failed to create reader for column group {} "
-               "segment {}",
-               column_group_id,
-               segment_id_);
-
-    std::vector<std::shared_ptr<std::vector<std::string>>>
-        async_projected_columns;
-    std::vector<milvus::segcore::storagev2translator::ChunkReaderPtr>
-        async_chunk_readers;
-    milvus::segcore::storagev2translator::ColumnSizeEstimateResult
-        size_estimate;
-    if (enable_async_load) {
-        async_projected_columns.reserve(column_names.size());
-        std::vector<milvus::segcore::storagev2translator::ChunkReaderOpenSpec>
-            open_specs;
-        open_specs.reserve(column_names.size());
-        for (const auto& column_name : column_names) {
-            auto projected_columns =
-                std::make_shared<std::vector<std::string>>(1, column_name);
-            open_specs.push_back(
-                {kJsonStatsReaderColumnGroupIndex, projected_columns});
-            async_projected_columns.push_back(std::move(projected_columns));
-        }
-        async_chunk_readers = folly::coro::blockingWait(
-            milvus::segcore::storagev2translator::OpenChunkReadersAsync(
-                op_ctx,
-                segment_id_,
-                reader,
-                std::move(open_specs),
-                {.load_priority = load_priority_}));
-        AssertInfo(async_chunk_readers.size() == column_names.size(),
-                   "[JsonStats] async reader count mismatch for column group "
-                   "{} segment {}: expected {}, got {}",
-                   column_group_id,
-                   segment_id_,
-                   column_names.size(),
-                   async_chunk_readers.size());
-        size_estimate =
-            milvus::segcore::storagev2translator::FetchColumnSizeEstimates(
-                *async_chunk_readers.front());
-    } else {
-        const auto estimate_chunk_reader = OpenJsonStatsChunkReaderSync(
-            *reader, all_columns, column_group_id, segment_id_);
-        size_estimate =
-            milvus::segcore::storagev2translator::FetchColumnSizeEstimates(
-                *estimate_chunk_reader);
-    }
-
     for (size_t i = 0; i < milvus_field_ids.size(); ++i) {
         const auto& inner_field_id = milvus_field_ids[i];
         const auto& column_name = column_names[i];
-        const auto needed_columns =
-            enable_async_load
-                ? async_projected_columns[i]
-                : std::make_shared<std::vector<std::string>>(1, column_name);
-        auto chunk_reader =
-            enable_async_load
-                ? std::move(async_chunk_readers[i])
-                : OpenJsonStatsChunkReaderSync(
-                      *reader, needed_columns, column_group_id, segment_id_);
+        auto chunk_reader = std::move(readers.chunks[i]);
 
         const auto& field_meta = field_meta_map.at(inner_field_id);
         std::unordered_map<FieldId, FieldMeta> projected_field_meta_map;
@@ -1561,7 +1574,7 @@ JsonKeyStats::LoadColumnGroupFromMetadata(
             std::move(chunk_reader),
             projected_field_meta_map,
             column_names,
-            *needed_columns,
+            std::vector<std::string>{column_name},
             enable_mmap,
             mmap_config.GetMmapPopulate(),
             mmap_filepath_,
@@ -1572,7 +1585,7 @@ JsonKeyStats::LoadColumnGroupFromMetadata(
             fmt::format("jks_{}_{}", field_id_, inner_field_id.get()),
             /*fallback_bytes_per_row=*/0,
             shard_,
-            /*column_size_estimate=*/size_estimate,
+            /*column_size_estimate=*/readers.size_estimate,
             /*writeback_mode=*/writeback_mode,
             /*enable_async_load=*/enable_async_load);
 
@@ -1596,8 +1609,7 @@ JsonKeyStats::LoadColumnGroupFromMetadata(
 
 void
 JsonKeyStats::LoadShreddingData(const std::vector<std::string>& index_files,
-                                const std::string& warmup_policy,
-                                milvus::OpContext* op_ctx) {
+                                const std::string& warmup_policy) {
     // sort files by column group id and file id
     auto sorted_files = SortByParquetPath(index_files);
     if (sorted_files.empty()) {
@@ -1616,70 +1628,6 @@ JsonKeyStats::LoadShreddingData(const std::vector<std::string>& index_files,
         }
     }
 
-    if (segcore::storagev2translator::StorageV2AsyncLoadEnabled()) {
-        const auto token =
-            op_ctx ? op_ctx->cancellation_token : folly::CancellationToken{};
-        const auto fs = file_manager_context_.fs
-                            ? file_manager_context_.fs
-                            : segcore::GetDefaultArrowFileSystem();
-        struct GroupMetadata {
-            std::vector<std::string> files;
-            std::shared_ptr<arrow::Schema> schema;
-            std::vector<int64_t> rows;
-        };
-        std::vector<GroupMetadata> groups;
-        groups.reserve(sorted_files.size());
-        // Keep only one schema per group and one row count per file. No footer
-        // objects or duplicate per-file schemas survive preparation.
-        for (const auto& [group_id, file_ids] : sorted_files) {
-            auto& group = groups.emplace_back();
-            group.files.reserve(file_ids.size());
-            for (const auto file_id : file_ids) {
-                group.files.push_back(CreateColumnGroupParquetPath(
-                    shredding_prefix, group_id, file_id));
-            }
-            std::vector<JsonStatsParquetMetadata> metadata;
-            try {
-                metadata = folly::coro::blockingWait(
-                    ReadJsonStatsParquetFilesAsync(
-                        fs,
-                        group.files,
-                        load_priority_,
-                        token,
-                        [&](const std::shared_ptr<arrow::Schema>& schema) {
-                            if (groups.size() == 1 && key_field_map_.empty()) {
-                                LoadCommonMeta(schema->metadata(),
-                                               group.files.front());
-                            }
-                            LoadColumnSchema(schema);
-                        })
-                        .scheduleOn(storage::ResolveAsyncLoadExecutor(
-                            {}, load_priority_)));
-            } catch (...) {
-                segcore::storagev2translator::detail::
-                    RethrowAsyncLoadException();
-            }
-            AssertInfo(!metadata.empty(),
-                       "Empty JSON stats Parquet group {}",
-                       group_id);
-            group.schema = std::move(metadata.front().schema);
-            group.rows.reserve(metadata.size());
-            for (const auto& file : metadata) {
-                group.rows.push_back(file.num_rows);
-            }
-        }
-        for (size_t i = 0; i < groups.size(); ++i) {
-            storage::ThrowIfCancelled(token, "JsonKeyStats::LoadColumnGroup");
-            LoadColumnGroupFromMetadata(sorted_files[i].first,
-                                        std::move(groups[i].files),
-                                        groups[i].rows,
-                                        groups[i].schema,
-                                        warmup_policy,
-                                        op_ctx);
-        }
-        return;
-    }
-
     // load shredding meta
     LoadShreddingMeta(sorted_files, shredding_prefix);
 
@@ -1687,6 +1635,89 @@ JsonKeyStats::LoadShreddingData(const std::vector<std::string>& index_files,
     for (const auto& [column_group_id, file_ids] : sorted_files) {
         LoadColumnGroup(
             column_group_id, file_ids, warmup_policy, shredding_prefix);
+    }
+}
+
+void
+JsonKeyStats::LoadShreddingDataAsync(
+    const std::vector<std::string>& index_files,
+    const std::string& warmup_policy,
+    milvus::OpContext* op_ctx) {
+    // sort files by column group id and file id
+    auto sorted_files = SortByParquetPath(index_files);
+    if (sorted_files.empty()) {
+        return;
+    }
+
+    // Extract the shredding prefix from the first file path.
+    // Files are absolute paths like: basePath/shredding_data/0/0
+    // The prefix is everything up to and including "shredding_data".
+    std::string shredding_prefix;
+    if (!index_files.empty()) {
+        auto pos = index_files[0].find(JSON_STATS_SHREDDING_DATA_PATH);
+        if (pos != std::string::npos) {
+            shredding_prefix = index_files[0].substr(
+                0, pos + strlen(JSON_STATS_SHREDDING_DATA_PATH));
+        }
+    }
+
+    const auto token =
+        op_ctx ? op_ctx->cancellation_token : folly::CancellationToken{};
+    const auto fs = file_manager_context_.fs
+                        ? file_manager_context_.fs
+                        : segcore::GetDefaultArrowFileSystem();
+    struct GroupMetadata {
+        std::vector<std::string> files;
+        std::shared_ptr<arrow::Schema> schema;
+        std::vector<int64_t> rows;
+    };
+    std::vector<GroupMetadata> groups;
+    groups.reserve(sorted_files.size());
+    // Keep only one schema per group and one row count per file. No footer
+    // objects or duplicate per-file schemas survive preparation.
+    for (const auto& [group_id, file_ids] : sorted_files) {
+        auto& group = groups.emplace_back();
+        group.files.reserve(file_ids.size());
+        for (const auto file_id : file_ids) {
+            group.files.push_back(CreateColumnGroupParquetPath(
+                shredding_prefix, group_id, file_id));
+        }
+        std::vector<JsonStatsParquetMetadata> metadata;
+        metadata = folly::coro::blockingWait(
+            ReadJsonStatsParquetFilesAsync(
+                fs,
+                group.files,
+                load_priority_,
+                token,
+                [&](const std::shared_ptr<arrow::Schema>& schema) {
+                    if (groups.size() == 1 && key_field_map_.empty()) {
+                        LoadCommonMeta(schema->metadata(), group.files.front());
+                    }
+                    LoadColumnSchema(schema);
+                })
+                .scheduleOn(
+                    storage::ResolveAsyncLoadExecutor({}, load_priority_)));
+        AssertInfo(
+            !metadata.empty(), "Empty JSON stats Parquet group {}", group_id);
+        group.schema = std::move(metadata.front().schema);
+        group.rows.reserve(metadata.size());
+        for (const auto& file : metadata) {
+            group.rows.push_back(file.num_rows);
+        }
+    }
+    for (size_t i = 0; i < groups.size(); ++i) {
+        storage::ThrowIfCancelled(token, "JsonKeyStats::LoadColumnGroup");
+        auto readers = OpenColumnGroupAsync(sorted_files[i].first,
+                                            std::move(groups[i].files),
+                                            groups[i].rows,
+                                            groups[i].schema,
+                                            warmup_policy,
+                                            op_ctx);
+        LoadColumnGroupFromMetadata(sorted_files[i].first,
+                                    groups[i].rows,
+                                    groups[i].schema,
+                                    warmup_policy,
+                                    std::move(readers));
     }
 }
 
@@ -1793,36 +1824,23 @@ JsonKeyStats::Load(milvus::tracer::TraceContext ctx,
         }
     }
 
-    // load meta file first (contains layout type map)
-    if (!meta_files.empty()) {
-        AssertInfo(
-            meta_files.size() == 1,
-            "expected exactly one meta file, got {} for segment {}, field {}",
-            meta_files.size(),
-            segment_id_,
-            field_id_);
-        if (segcore::storagev2translator::StorageV2AsyncLoadEnabled()) {
-            try {
-                key_field_map_ = folly::coro::blockingWait(
-                    LoadJsonStatsMetaAsync(file_manager_context_,
-                                           meta_files[0],
-                                           load_priority_,
-                                           token)
-                        .scheduleOn(storage::ResolveAsyncLoadExecutor(
-                            {}, load_priority_)));
-            } catch (const folly::OperationCancelled& error) {
-                throw SegcoreError(FollyCancel, error.what());
-            }
-        } else {
+    AssertInfo(
+        meta_files.size() <= 1,
+        "expected at most one meta file, got {} for segment {}, field {}",
+        meta_files.size(),
+        segment_id_,
+        field_id_);
+    if (segcore::storagev2translator::StorageV2AsyncLoadEnabled()) {
+        LoadDataAsync(meta_files, shredding_data_files, warmup_policy, op_ctx);
+    } else {
+        if (!meta_files.empty()) {
             auto local_meta_file = disk_file_manager_->CacheJsonStatsMetaToDisk(
                 meta_files[0], load_priority_);
             LoadMetaFile(local_meta_file);
         }
+        storage::ThrowIfCancelled(token, "JsonKeyStats::LoadShreddingData");
+        LoadShreddingData(shredding_data_files, warmup_policy);
     }
-
-    storage::ThrowIfCancelled(token, "JsonKeyStats::LoadShreddingData");
-    // load shredding data (files are already absolute paths)
-    LoadShreddingData(shredding_data_files, warmup_policy, op_ctx);
     storage::ThrowIfCancelled(token, "JsonKeyStats::LoadSharedKeyIndex");
 
     auto index_size =
@@ -1832,6 +1850,32 @@ JsonKeyStats::Load(milvus::tracer::TraceContext ctx,
     LoadSharedKeyIndex(
         shared_key_index_files, enable_mmap, index_size, warmup_policy, op_ctx);
     storage::ThrowIfCancelled(token, "JsonKeyStats::Load");
+}
+
+void
+JsonKeyStats::LoadDataAsync(const std::vector<std::string>& meta_files,
+                            const std::vector<std::string>& shredding_files,
+                            const std::string& warmup_policy,
+                            milvus::OpContext* op_ctx) {
+    const auto token =
+        op_ctx ? op_ctx->cancellation_token : folly::CancellationToken{};
+    try {
+        if (!meta_files.empty()) {
+            key_field_map_ = folly::coro::blockingWait(
+                LoadJsonStatsMetaAsync(file_manager_context_,
+                                       meta_files.front(),
+                                       load_priority_,
+                                       token)
+                    .scheduleOn(
+                        storage::ResolveAsyncLoadExecutor({}, load_priority_)));
+        }
+        storage::ThrowIfCancelled(token,
+                                  "JsonKeyStats::LoadShreddingDataAsync");
+        LoadShreddingDataAsync(shredding_files, warmup_policy, op_ctx);
+    } catch (...) {
+        storage::ThrowIfCancelled(token, "JsonKeyStats::LoadDataAsync");
+        segcore::storagev2translator::detail::RethrowAsyncLoadException();
+    }
 }
 
 IndexStatsPtr

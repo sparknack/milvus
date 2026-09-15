@@ -580,11 +580,36 @@ class JsonKeyStats : public ScalarIndex<std::string> {
         return JSONType::UNKNOWN;
     }
 
-    // Async metadata preparation releases all admission before opening data readers.
     void
     LoadShreddingData(const std::vector<std::string>& index_files,
-                      const std::string& warmup_policy,
-                      milvus::OpContext* op_ctx);
+                      const std::string& warmup_policy);
+
+    // Async orchestration is selected once by Load; it never calls the legacy loader.
+    void
+    LoadDataAsync(const std::vector<std::string>& meta_files,
+                  const std::vector<std::string>& shredding_files,
+                  const std::string& warmup_policy,
+                  milvus::OpContext* op_ctx);
+
+    void
+    LoadShreddingDataAsync(const std::vector<std::string>& index_files,
+                           const std::string& warmup_policy,
+                           milvus::OpContext* op_ctx);
+
+    struct ColumnGroupReaders;
+    ColumnGroupReaders
+    OpenColumnGroup(int64_t group_id,
+                    std::vector<std::string> files,
+                    const std::vector<int64_t>& rows,
+                    const std::shared_ptr<arrow::Schema>& schema,
+                    const std::string& warmup_policy);
+    ColumnGroupReaders
+    OpenColumnGroupAsync(int64_t group_id,
+                         std::vector<std::string> files,
+                         const std::vector<int64_t>& rows,
+                         const std::shared_ptr<arrow::Schema>& schema,
+                         const std::string& warmup_policy,
+                         milvus::OpContext* op_ctx);
 
     // Populate field names, IDs and JSON types from an already decoded schema.
     void
@@ -605,14 +630,13 @@ class JsonKeyStats : public ScalarIndex<std::string> {
                     const std::string& warmup_policy = "",
                     const std::string& override_prefix = "");
 
-    // Shared column construction after either metadata preparation path completes.
+    // Construct columns from prepared readers; performs no reader opens.
     void
     LoadColumnGroupFromMetadata(int64_t column_group_id,
-                                std::vector<std::string> files,
                                 const std::vector<int64_t>& file_num_rows,
                                 const std::shared_ptr<arrow::Schema>& schema,
                                 const std::string& warmup_policy,
-                                milvus::OpContext* op_ctx);
+                                ColumnGroupReaders readers);
 
     void
     LoadShreddingMeta(

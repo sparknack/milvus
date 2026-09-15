@@ -22,6 +22,8 @@
 #include "parquet/arrow/writer.h"
 #include "parquet/file_reader.h"
 #include "folly/system/ThreadName.h"
+#include "folly/coro/BlockingWait.h"
+#include "storage/AsyncFileReader.h"
 #include "test_utils/AsyncLoadTestUtils.h"
 #include <nlohmann/json.hpp>
 #include <simdjson.h>
@@ -558,23 +560,33 @@ class JsonStatsMetaFileSystem : public arrow::fs::SubTreeFileSystem {
     }
     arrow::Result<std::shared_ptr<arrow::io::RandomAccessFile>>
     OpenInputFile(const std::string& path) override {
-        if (path.find(JSON_STATS_SHREDDING_DATA_PATH) != std::string::npos)
+        if (path.find(JSON_STATS_SHREDDING_DATA_PATH) != std::string::npos) {
+            shredding_opens.fetch_add(1);
             return milvus::segcore::GetDefaultArrowFileSystem()->OpenInputFile(
                 path);
+        }
         if (path != path_)
             return SubTreeFileSystem::OpenInputFile(path);
-        EXPECT_TRUE(folly::getCurrentThreadName().value_or("").starts_with(
-            "MILVUS_ASYNC"));
         opened.set_value();
+        if (open_gate.valid())
+            open_gate.wait();
+        if (throw_on_open)
+            throw SegcoreError(MemAllocateFailed, "injected open exception");
+        if (!open_status.ok())
+            return open_status;
         return std::static_pointer_cast<arrow::io::RandomAccessFile>(meta);
     }
     arrow::Result<std::shared_ptr<arrow::io::RandomAccessFile>>
     OpenInputFile(const arrow::fs::FileInfo& info) override {
         return OpenInputFile(info.path());
     }
+    std::atomic<size_t> shredding_opens{0};
+    bool throw_on_open = false;
+    arrow::Status open_status;
     std::string path_;
     std::shared_ptr<milvus::test::ControlledDirectReadFile> meta;
     std::promise<void> opened;
+    std::shared_future<void> open_gate;
 };
 
 // Reopen each controlled Parquet file for the trailer probe and format reader.
@@ -590,8 +602,6 @@ class JsonStatsParquetFileSystem : public arrow::fs::SubTreeFileSystem {
         const auto it = files.find(path);
         if (it == files.end())
             return SubTreeFileSystem::OpenInputFile(path);
-        EXPECT_TRUE(folly::getCurrentThreadName().value_or("").starts_with(
-            "MILVUS_ASYNC"));
         if (opens.fetch_add(1) == 0)
             opened.set_value();
         return std::static_pointer_cast<arrow::io::RandomAccessFile>(
@@ -609,6 +619,60 @@ class JsonStatsParquetFileSystem : public arrow::fs::SubTreeFileSystem {
 };
 
 }  // namespace
+
+TEST(JsonStatsAsyncFileInput, GenericSizeDoesNotBlockLoadWorker) {
+    class BlockingSizeFile
+        : public milvus::test::AsyncTrackingRandomAccessFile {
+     public:
+        BlockingSizeFile()
+            : AsyncTrackingRandomAccessFile({}), gate(release.get_future()) {
+        }
+        arrow::Result<int64_t>
+        GetSize() override {
+            started.set_value();
+            gate.wait();
+            return 42;
+        }
+        std::promise<void> started;
+        std::promise<void> release;
+        std::future<void> gate;
+    } file;
+    const auto old_workers = storage::GetAsyncLoadThreadPoolSize();
+    storage::SetAsyncLoadThreadPoolSize(1);
+    auto restore = folly::makeGuard(
+        [&] { storage::SetAsyncLoadThreadPoolSize(old_workers); });
+    auto executor = storage::ResolveAsyncLoadExecutor(
+        {}, proto::common::LoadPriority::HIGH);
+    folly::CancellationSource cancel;
+    auto started = file.started.get_future();
+    auto pending = std::async(std::launch::async, [&] {
+        return folly::coro::blockingWait(
+            storage::GetFileSizeAsync(file, cancel.getToken())
+                .scheduleOn(executor));
+    });
+    auto drain = folly::makeGuard([&] {
+        file.release.set_value();
+        pending.wait();
+    });
+    ASSERT_EQ(started.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    auto probe = std::make_shared<std::promise<void>>();
+    auto ready = probe->get_future();
+    executor->add([probe] { probe->set_value(); });
+    EXPECT_EQ(ready.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    cancel.requestCancellation();
+    EXPECT_EQ(pending.wait_for(std::chrono::milliseconds(30)),
+              std::future_status::timeout);
+    file.release.set_value();
+    drain.dismiss();
+    try {
+        pending.get();
+        FAIL() << "cancel must be honored after the size request drains";
+    } catch (const SegcoreError& error) {
+        EXPECT_EQ(error.get_error_code(), FollyCancel);
+    }
+}
 
 TEST_F(JsonKeyStatsUploadLoadTest, MetadataAdmissionRoutingAndCancellation) {
     InitContext();
@@ -666,7 +730,11 @@ TEST_F(JsonKeyStatsUploadLoadTest, MetadataAdmissionRoutingAndCancellation) {
         Compatibility,
         Stream,
         CancelRead,
+        CancelOpen,
+        CancelSize,
         CancelAdmission,
+        OpenFailure,
+        OpenException,
         ReadFailure,
         ShortRead,
         InvalidJson
@@ -674,7 +742,11 @@ TEST_F(JsonKeyStatsUploadLoadTest, MetadataAdmissionRoutingAndCancellation) {
     for (const auto outcome : {Outcome::Compatibility,
                                Outcome::Stream,
                                Outcome::CancelRead,
+                               Outcome::CancelOpen,
+                               Outcome::CancelSize,
                                Outcome::CancelAdmission,
+                               Outcome::OpenFailure,
+                               Outcome::OpenException,
                                Outcome::ReadFailure,
                                Outcome::ShortRead,
                                Outcome::InvalidJson}) {
@@ -702,6 +774,10 @@ TEST_F(JsonKeyStatsUploadLoadTest, MetadataAdmissionRoutingAndCancellation) {
             continue;
         }
         EXPECT_FALSE(has_staged_metadata());
+        if (outcome == Outcome::OpenFailure)
+            fs->open_status =
+                arrow::Status::IOError("injected metadata open failure");
+        fs->throw_on_open = outcome == Outcome::OpenException;
         const bool pending_read =
             outcome == Outcome::Stream || outcome == Outcome::CancelRead;
         fs->meta->SetAutoComplete(!pending_read);
@@ -710,6 +786,17 @@ TEST_F(JsonKeyStatsUploadLoadTest, MetadataAdmissionRoutingAndCancellation) {
                 arrow::Status::IOError("injected metadata read failure"));
         if (outcome == Outcome::ShortRead)
             fs->meta->SetNextCompletion(arrow::Status::OK(), 1);
+        auto size_future = arrow::Future<int64_t>::Make();
+        if (outcome == Outcome::CancelSize)
+            fs->meta->SetSizeFuture(size_future);
+        std::promise<void> open_gate;
+        if (outcome == Outcome::CancelOpen)
+            fs->open_gate = open_gate.get_future().share();
+        bool open_released = false;
+        auto release_open = [&] {
+            if (!std::exchange(open_released, true))
+                open_gate.set_value();
+        };
         folly::CancellationSource cancel;
         OpContext op;
         op.cancellation_token = cancel.getToken();
@@ -726,14 +813,22 @@ TEST_F(JsonKeyStatsUploadLoadTest, MetadataAdmissionRoutingAndCancellation) {
             std::async(std::launch::async, [&] { Load("disable", &op); });
         auto drain = folly::makeGuard([&] {
             cancel.requestCancellation();
+            release_open();
+            if (!size_future.is_finished())
+                size_future.MarkFinished(static_cast<int64_t>(file_size));
             fs->meta->SetAutoComplete(true);
             for (size_t i = 0; i < fs->meta->DirectReadCalls().size(); ++i)
                 fs->meta->Complete(i);
             pending.wait();
         });
-        ASSERT_EQ(opened.wait_for(std::chrono::seconds(5)),
-                  std::future_status::ready);
-        if (pending_read || hold_slot) {
+        EXPECT_EQ(opened.wait_for(hold_slot ? std::chrono::milliseconds(30)
+                                            : std::chrono::milliseconds(5000)),
+                  hold_slot ? std::future_status::timeout
+                            : std::future_status::ready);
+        if (outcome == Outcome::CancelSize)
+            ASSERT_TRUE(fs->meta->WaitForSizeCall());
+        if (pending_read || hold_slot || outcome == Outcome::CancelOpen ||
+            outcome == Outcome::CancelSize) {
             if (pending_read)
                 ASSERT_TRUE(fs->meta->WaitForCallCount(1));
             auto probe = std::make_shared<std::promise<void>>();
@@ -748,8 +843,20 @@ TEST_F(JsonKeyStatsUploadLoadTest, MetadataAdmissionRoutingAndCancellation) {
             EXPECT_FALSE(available);
             if (available)
                 admission.Release({0, 1});
-            if (outcome != Outcome::Stream)
+            if (outcome != Outcome::Stream) {
                 cancel.requestCancellation();
+            } else {
+                // A load already in progress keeps its selected metadata/reader path.
+                segcore::storagev2translator::SetStorageV2AsyncLoadEnabled(
+                    false);
+            }
+            if (outcome == Outcome::CancelOpen ||
+                outcome == Outcome::CancelSize) {
+                EXPECT_EQ(pending.wait_for(std::chrono::milliseconds(30)),
+                          std::future_status::timeout);
+                release_open();
+                size_future.MarkFinished(static_cast<int64_t>(file_size));
+            }
             if (pending_read) {
                 EXPECT_EQ(pending.wait_for(std::chrono::milliseconds(30)),
                           std::future_status::timeout);
@@ -761,6 +868,7 @@ TEST_F(JsonKeyStatsUploadLoadTest, MetadataAdmissionRoutingAndCancellation) {
         drain.dismiss();
         if (outcome == Outcome::Stream) {
             EXPECT_NO_THROW(pending.get());
+            EXPECT_GT(fs->shredding_opens.load(), 0);
             VerifyBasicOperations();
             VerifyPathInShredding("/int");
             const auto reads = fs->meta->DirectReadCalls();
@@ -775,9 +883,15 @@ TEST_F(JsonKeyStatsUploadLoadTest, MetadataAdmissionRoutingAndCancellation) {
                 FAIL() << "metadata failure must stop loading";
             } catch (const SegcoreError& error) {
                 const auto expected =
-                    (outcome == Outcome::CancelRead || hold_slot) ? FollyCancel
-                    : outcome == Outcome::ReadFailure             ? StorageError
-                                                      : UnexpectedError;
+                    (outcome == Outcome::CancelRead || hold_slot ||
+                     outcome == Outcome::CancelOpen ||
+                     outcome == Outcome::CancelSize)
+                        ? FollyCancel
+                    : (outcome == Outcome::ReadFailure ||
+                       outcome == Outcome::OpenFailure)
+                        ? StorageError
+                    : outcome == Outcome::OpenException ? MemAllocateFailed
+                                                        : UnexpectedError;
                 EXPECT_EQ(error.get_error_code(), expected);
             }
             EXPECT_TRUE(load_index_->GetShreddingFields("/int").empty());

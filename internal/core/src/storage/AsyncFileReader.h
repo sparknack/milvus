@@ -18,14 +18,24 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <string>
 #include "arrow/io/interfaces.h"
+#include "arrow/filesystem/filesystem.h"
 #include "folly/CancellationToken.h"
 #include "folly/coro/Task.h"
 
 namespace milvus::storage {
 
+// Filesystem open can issue a synchronous HEAD, even via OpenInputFileAsync().
+// Run it on the filesystem's I/O executor and drain it before honoring cancel.
+[[nodiscard]] folly::coro::Task<std::shared_ptr<arrow::io::RandomAccessFile>>
+OpenInputFileAsync(std::shared_ptr<arrow::fs::FileSystem> fs,
+                   std::string path,
+                   folly::CancellationToken token);
+
 // Resolves file size through the native async API when available. Generic
-// files use GetSize() on the awaiting executor. Issued requests drain on cancel.
+// files use their I/O executor. Issued requests drain on cancel.
 [[nodiscard]] folly::coro::Task<int64_t>
 GetFileSizeAsync(arrow::io::RandomAccessFile& file,
                  folly::CancellationToken token);
