@@ -18,6 +18,7 @@
 #include <map>
 #include <memory>
 #include "index/TextMatchIndexBase.h"
+#include "index/FstTermDictionary.h"
 #include "index/InvertedIndexKnowhereCore.h"
 #include "common/Tracer.h"
 #include "tantivy/tokenizer.h"
@@ -27,12 +28,15 @@ namespace milvus::index {
 // term dictionary, docID compression and query execution are independent.
 class TextMatchIndexKnowhere final : public TextMatchIndexBase {
  public:
-    using Core = InvertedIndexKnowhereCore<std::string, TargetBitmap, OpType>;
+    using Core = InvertedIndexKnowhereCore<uint32_t, TargetBitmap, OpType>;
     explicit TextMatchIndexKnowhere(
         const std::string& analyzer_params = "{}",
-        KnowhereSparsePostingCodec::Format format = KnowhereSparsePostingCodec::Format::Adaptive)
+        KnowhereSparsePostingCodec::Format format =
+            KnowhereSparsePostingCodec::Format::Adaptive)
         : analyzer_(std::make_unique<milvus::tantivy::Tokenizer>(
-              std::string(analyzer_params))), core_(format) {
+              std::string(analyzer_params))),
+          core_(format),
+          format_(format) {
     }
     void
     Build(size_t n,
@@ -61,8 +65,21 @@ class TextMatchIndexKnowhere final : public TextMatchIndexBase {
                     ids.push_back(row);
             }
         }
-        // core publishes only once all analysis and encoding succeed.
-        core_.BuildFromPostings(n, postings, nulls);
+        std::vector<std::string> terms;
+        terms.reserve(postings.size());
+        std::map<uint32_t, std::vector<uint32_t>> ordinal_postings;
+        for (auto& [term, ids] : postings) {
+            AssertInfo(terms.size() < UINT32_MAX,
+                       "text term count exceeds uint32");
+            ordinal_postings.emplace(terms.size(), std::move(ids));
+            terms.push_back(term);
+        }
+        auto dictionary = FstTermDictionary::Build(terms);
+        Core next(format_);
+        next.BuildFromPostings(n, ordinal_postings, nulls);
+        // Publish both together only after every build stage succeeds.
+        core_ = std::move(next);
+        dictionary_ = std::move(dictionary);
     }
     int64_t
     Count() override {
@@ -70,7 +87,7 @@ class TextMatchIndexKnowhere final : public TextMatchIndexBase {
     }
     int64_t
     ByteSize() const override {
-        return core_.ByteSize();
+        return core_.ByteSize() + dictionary_.ByteSize();
     }
     int64_t
     ValidityBitmapByteSize() const override {
@@ -92,7 +109,12 @@ class TextMatchIndexKnowhere final : public TextMatchIndexBase {
         if (minimum <= 1) {
             std::sort(terms.begin(), terms.end());
             terms.erase(std::unique(terms.begin(), terms.end()), terms.end());
-            return core_.In(terms.size(), terms.data());
+            TargetBitmap result(core_.Count());
+            for (const auto& term : terms) {
+                if (auto id = dictionary_.Lookup(term))
+                    core_.DecodeInto(*id, result);
+            }
+            return result;
         }
         TargetBitmap result(core_.Count());
         if (minimum > terms.size())
@@ -102,12 +124,18 @@ class TextMatchIndexKnowhere final : public TextMatchIndexBase {
         std::vector<size_t> postings;
         postings.reserve(terms.size());
         for (const auto& term : terms) {
-            auto id = core_.Lookup(term);
-            if (id != core_.TermCount())
-                postings.push_back(id);
+            if (auto id = dictionary_.Lookup(term))
+                postings.push_back(*id);
         }
         if (postings.size() < minimum)
             return result;
+        // If every remaining clause is required, intersection is sufficient.
+        // Decide BEFORE deduplicating: repeated clauses retain their weight for
+        // general thresholds. Missing clauses can reduce a threshold to AND.
+        if (postings.size() == minimum) {
+            core_.IntersectInto(std::move(postings), result);
+            return result;
+        }
         // Tantivy counts matching query clauses, including repeated query terms.
         // Repeated occurrences in a document do not count as extra clauses.
         std::vector<uint32_t> matched(core_.Count(), 0);
@@ -118,6 +146,20 @@ class TextMatchIndexKnowhere final : public TextMatchIndexBase {
             });
         }
         return result;
+    }
+    const FstTermDictionary&
+    Dictionary() const {
+        return dictionary_;
+    }
+    // Dictionary-only reload acceptance hook. The complete text index does not
+    // yet have a persisted format. Reject a dictionary from another build.
+    void
+    UseMappedDictionaryForUT(const std::string& path) {
+        auto mapped = FstTermDictionary::MapFile(path);
+        if (mapped.SerializedBytes() != dictionary_.SerializedBytes())
+            ThrowInfo(ErrorCode::DataFormatBroken,
+                      "FST does not belong to this text index");
+        dictionary_ = std::move(mapped);
     }
     const Core&
     CoreForUT() const {
@@ -132,5 +174,7 @@ class TextMatchIndexKnowhere final : public TextMatchIndexBase {
     }
     std::unique_ptr<milvus::tantivy::Tokenizer> analyzer_;
     Core core_;
+    KnowhereSparsePostingCodec::Format format_;
+    FstTermDictionary dictionary_;
 };
 }  // namespace milvus::index

@@ -132,7 +132,8 @@ KnowhereSparsePostingCodec::View::DecodeBlock(size_t block,
         std::min(kBlockSize, size_t(count_) - block * kBlockSize);
     const auto* start = blocks_ + (block ? EndOffset(block - 1) : 0);
     if (format_ == Format::Adaptive)
-        knowhere::sparse::inverted::AdaptiveBlockCodec{}.decode(start, ids, size);
+        knowhere::sparse::inverted::AdaptiveBlockCodec{}.decode(
+            start, ids, size);
     else
         streamvbyte_decode_0124(start, ids, size);
     uint32_t previous = block ? MaxDoc(block - 1) : UINT32_MAX;
@@ -141,5 +142,64 @@ KnowhereSparsePostingCodec::View::DecodeBlock(size_t block,
         previous = ids[i];
     }
     return size;
+}
+void
+KnowhereSparsePostingCodec::Cursor::LoadBlock(size_t block) {
+    block_ = block;
+    size_ = view_.DecodeBlock(block, ids_.data());
+    position_ = 0;
+    started_ = true;
+    ++decoded_blocks_;
+}
+
+uint32_t
+KnowhereSparsePostingCodec::Cursor::Seek(uint32_t target) {
+    if (ended_)
+        return kEnd;
+    if (target == kEnd || view_.Blocks() == 0) {
+        ended_ = true;
+        return kEnd;
+    }
+    if (started_ && target <= Doc())
+        return Doc();
+    size_t block = started_ ? block_ : 0;
+    if (view_.MaxDoc(block) < target) {
+        size_t lo = block + 1, hi = view_.Blocks();
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            if (view_.MaxDoc(mid) < target)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        block = lo;
+    }
+    if (block == view_.Blocks()) {
+        ended_ = true;
+        return kEnd;
+    }
+    if (!started_ || block != block_)
+        LoadBlock(block);
+    // The block maximum guarantees a result inside this decoded block.
+    position_ = std::lower_bound(
+                    ids_.begin() + position_, ids_.begin() + size_, target) -
+                ids_.begin();
+    return Doc();
+}
+
+uint32_t
+KnowhereSparsePostingCodec::Cursor::Next() {
+    if (ended_)
+        return kEnd;
+    if (!started_)
+        return Seek(0);
+    if (++position_ == size_) {
+        if (block_ + 1 == view_.Blocks()) {
+            ended_ = true;
+            return kEnd;
+        }
+        LoadBlock(block_ + 1);
+    }
+    return Doc();
 }
 }  // namespace milvus::index

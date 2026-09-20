@@ -30,7 +30,9 @@ class KnowhereSparsePostingCodec {
     static constexpr size_t kBlockSize = 256;
     static constexpr size_t kPadding = 16;
     static void
-    Append(const uint32_t* ids, size_t count, std::vector<uint8_t>& bytes,
+    Append(const uint32_t* ids,
+           size_t count,
+           std::vector<uint8_t>& bytes,
            Format format = Format::StreamVByte);
 
     // Trusted in-process output of Append only; not a persisted-data parser.
@@ -59,6 +61,37 @@ class KnowhereSparsePostingCodec {
         const uint8_t* maxima_ = nullptr;
         const uint8_t* ends_ = nullptr;
         const uint8_t* blocks_ = nullptr;
+    };
+
+    // Monotone, lazy cursor over trusted immutable posting bytes. The caller
+    // keeps the backing blob alive. Before first use call Seek() or Next().
+    class Cursor {
+     public:
+        static constexpr uint32_t kEnd = UINT32_MAX;
+        explicit Cursor(const uint8_t* data,
+                        Format format = Format::StreamVByte)
+            : view_(data, format) {
+        }
+        uint32_t
+        Doc() const {
+            return !started_ || ended_ ? kEnd : ids_[position_];
+        }
+        uint32_t
+        Seek(uint32_t target);
+        uint32_t
+        Next();
+        size_t
+        DecodedBlocksForUT() const {
+            return decoded_blocks_;
+        }
+
+     private:
+        void
+        LoadBlock(size_t block);
+        View view_;
+        std::array<uint32_t, kBlockSize> ids_;
+        size_t block_ = 0, position_ = 0, size_ = 0, decoded_blocks_ = 0;
+        bool started_ = false, ended_ = false;
     };
 };
 }  // namespace milvus::index

@@ -44,3 +44,5 @@ endif()
 
 add_subdirectory(milvus-storage)
 
+
+add_subdirectory(cpp-fstlib)

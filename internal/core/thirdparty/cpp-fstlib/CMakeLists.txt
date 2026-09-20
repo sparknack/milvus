@@ -1,0 +1,2 @@
+add_library(milvus_cpp_fstlib INTERFACE)
+target_include_directories(milvus_cpp_fstlib SYSTEM INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})

@@ -36,12 +36,16 @@ template <typename T, typename TargetBitmap, typename OpType>
 class InvertedIndexKnowhereCore {
  public:
     using PostingFormat = KnowhereSparsePostingCodec::Format;
-    explicit InvertedIndexKnowhereCore(PostingFormat format = PostingFormat::StreamVByte)
-        : format_(format) {}
+    explicit InvertedIndexKnowhereCore(
+        PostingFormat format = PostingFormat::StreamVByte)
+        : format_(format) {
+    }
     size_t
     PostingLogicalBytes() const {
         return posting_bytes_.size() >= KnowhereSparsePostingCodec::kPadding
-            ? posting_bytes_.size() - KnowhereSparsePostingCodec::kPadding : 0;
+                   ? posting_bytes_.size() -
+                         KnowhereSparsePostingCodec::kPadding
+                   : 0;
     }
     struct TermPostingMeta {
         uint64_t doc_stream_offset;
@@ -152,12 +156,75 @@ class InvertedIndexKnowhereCore {
         if (term == terms_.size())
             return;
         const auto& meta = posting_metas_.at(term);
-        KnowhereSparsePostingCodec::View posting(posting_bytes_.data() +
-                                                 meta.doc_stream_offset, format_);
+        KnowhereSparsePostingCodec::View posting(
+            posting_bytes_.data() + meta.doc_stream_offset, format_);
         std::array<uint32_t, KnowhereSparsePostingCodec::kBlockSize> ids;
         for (size_t b = 0; b < posting.Blocks(); ++b) {
             auto n = posting.DecodeBlock(b, ids.data());
             for (size_t i = 0; i < n; ++i) callback(ids[i]);
+        }
+    }
+    // Add the intersection of existing term ordinals to a caller-owned bitmap.
+    // Sort by posting length; cursor seeks skip compressed blocks using max IDs.
+    void
+    IntersectInto(std::vector<size_t> terms, TargetBitmap& result) const {
+        AssertInfo(result.size() == count_, "PoC result bitmap size mismatch");
+        if (terms.empty())
+            return;
+        std::sort(terms.begin(), terms.end());
+        terms.erase(std::unique(terms.begin(), terms.end()), terms.end());
+        for (auto term : terms)
+            AssertInfo(term < posting_metas_.size(),
+                       "invalid intersection term ordinal");
+        if (terms.size() == 1) {
+            DecodeInto(terms.front(), result);
+            return;
+        }
+        std::sort(terms.begin(), terms.end(), [&](size_t a, size_t b) {
+            return std::make_pair(DocFreq(a), a) <
+                   std::make_pair(DocFreq(b), b);
+        });
+        // Above roughly one candidate per bitmap word, repeated per-doc seeks
+        // become expensive. Use sequential decode + word-wise AND for dense
+        // conjunctions. This is a conservative heuristic, not a codec property.
+        if (DocFreq(terms.front()) > std::max<size_t>(1, count_ / 64)) {
+            TargetBitmap intersection(count_), scratch(count_);
+            DecodeInto(terms.front(), intersection);
+            for (size_t i = 1; i < terms.size(); ++i) {
+                scratch.reset();
+                DecodeInto(terms[i], scratch);
+                intersection &= scratch;
+                if (intersection.count() == 0)
+                    return;
+            }
+            result |= intersection;
+            return;
+        }
+        using Cursor = KnowhereSparsePostingCodec::Cursor;
+        std::vector<Cursor> cursors;
+        cursors.reserve(terms.size());
+        for (auto term : terms)
+            cursors.emplace_back(
+                posting_bytes_.data() + posting_metas_[term].doc_stream_offset,
+                format_);
+        auto& lead = cursors.front();
+        auto candidate = lead.Seek(0);
+        while (candidate != Cursor::kEnd) {
+            bool matched = true;
+            for (size_t i = 1; i < cursors.size(); ++i) {
+                auto doc = cursors[i].Seek(candidate);
+                if (doc == Cursor::kEnd)
+                    return;
+                if (doc != candidate) {
+                    candidate = lead.Seek(doc);
+                    matched = false;
+                    break;
+                }
+            }
+            if (matched) {
+                result.set(candidate);
+                candidate = lead.Next();
+            }
         }
     }
     size_t
@@ -228,8 +295,8 @@ class InvertedIndexKnowhereCore {
         if (term == terms_.size())
             return;
         const auto& meta = posting_metas_.at(term);
-        KnowhereSparsePostingCodec::View posting(posting_bytes_.data() +
-                                                 meta.doc_stream_offset, format_);
+        KnowhereSparsePostingCodec::View posting(
+            posting_bytes_.data() + meta.doc_stream_offset, format_);
         std::array<uint32_t, KnowhereSparsePostingCodec::kBlockSize> ids;
         for (size_t b = 0; b < posting.Blocks(); ++b) {
             size_t n = posting.DecodeBlock(b, ids.data());
