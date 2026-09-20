@@ -176,6 +176,12 @@ set_target_properties(all_tests PROPERTIES
 
 install(TARGETS all_tests DESTINATION unittest)
 
+# Optional external PoC tests; benchmark sources/results live outside Milvus.
+set(MILVUS_SCALAR_POC_DIR "" CACHE PATH "External Knowhere scalar PoC test checkout")
+if(MILVUS_SCALAR_POC_DIR)
+    include("${MILVUS_SCALAR_POC_DIR}/milvus-tests.cmake")
+endif()
+
 add_subdirectory(test_json_stats)
 
 # bitset unit test

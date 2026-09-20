@@ -184,7 +184,7 @@ AssertTextMatchUploadReturnsRelativePaths(
 }
 
 void
-ExpectOnlyTextMatchHit(index::TextMatchIndex& index,
+ExpectOnlyTextMatchHit(index::TextMatchIndexBase& index,
                        const std::string& term,
                        int64_t expected,
                        int64_t row_count) {

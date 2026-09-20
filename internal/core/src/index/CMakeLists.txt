@@ -22,3 +22,7 @@ add_library(milvus_index OBJECT ${SOURCE_FILES})
 # libsais (PUBLIC) propagates its include dir so the vendored FM-index sources
 # under fmindex/ can #include "libsais.h"; milvus_core links the objects (below).
 target_link_libraries(milvus_index PUBLIC milvus_conan_deps libsais)
+
+# The experimental posting adapter calls the dependency implementation directly.
+set_source_files_properties(KnowhereSparsePostingCodec.cpp PROPERTIES
+    INCLUDE_DIRECTORIES "${knowhere_SOURCE_DIR}/src")

@@ -2022,7 +2022,7 @@ ChunkedSegmentSealedImpl::PublishRuntimeStateLocked(
         MakeStateDelta(
             current->schema, current->load_info, runtime, current->commit_ts)));
 }
-cachinglayer::PinWrapper<index::TextMatchIndex*>
+cachinglayer::PinWrapper<index::TextMatchIndexBase*>
 ChunkedSegmentSealedImpl::GetTextIndex(milvus::OpContext* op_ctx,
                                        FieldId field_id) const {
     auto snapshot = CapturePublishedState();
@@ -2041,13 +2041,13 @@ ChunkedSegmentSealedImpl::GetTextIndex(milvus::OpContext* op_ctx,
     }
 
     auto make_pin =
-        [&](auto&& alt) -> cachinglayer::PinWrapper<index::TextMatchIndex*> {
+        [&](auto&& alt) -> cachinglayer::PinWrapper<index::TextMatchIndexBase*> {
         using Alt = std::decay_t<decltype(alt)>;
         if constexpr (std::is_same_v<
                           Alt,
                           std::shared_ptr<
                               milvus::index::TextMatchIndexHolder>>) {
-            return cachinglayer::PinWrapper<index::TextMatchIndex*>(alt,
+            return cachinglayer::PinWrapper<index::TextMatchIndexBase*>(alt,
                                                                     alt->get());
         } else if constexpr (std::is_same_v<
                                  Alt,
@@ -2056,7 +2056,7 @@ ChunkedSegmentSealedImpl::GetTextIndex(milvus::OpContext* op_ctx,
                                          milvus::index::TextMatchIndex>>>) {
             auto ca = cachinglayer::SemiInlineGet(alt->PinCells(op_ctx, {0}));
             auto index = ca->get_cell_of(0);
-            return cachinglayer::PinWrapper<index::TextMatchIndex*>(
+            return cachinglayer::PinWrapper<index::TextMatchIndexBase*>(
                 std::move(ca), index);
         } else {
             ThrowInfo(milvus::ErrorCode::UnexpectedError,

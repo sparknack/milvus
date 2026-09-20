@@ -247,7 +247,7 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     CreateTextIndex(FieldId field_id,
                     milvus::OpContext* op_ctx = nullptr) override;
 
-    PinWrapper<index::TextMatchIndex*>
+    PinWrapper<index::TextMatchIndexBase*>
     GetTextIndex(milvus::OpContext* op_ctx, FieldId field_id) const override;
 
     std::shared_ptr<index::JsonKeyStats>

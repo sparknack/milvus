@@ -17,12 +17,21 @@
 #include "cachinglayer/Manager.h"
 #include "index/InvertedIndexTantivy.h"
 #include "index/IndexStats.h"
+#include "index/TextMatchIndexBase.h"
 
 namespace milvus::index {
 
 using stdclock = std::chrono::high_resolution_clock;
-class TextMatchIndex : public InvertedIndexTantivy<std::string> {
+class TextMatchIndex : public InvertedIndexTantivy<std::string>,
+                       public TextMatchIndexBase {
  public:
+    int64_t Count() override { return InvertedIndexTantivy<std::string>::Count(); }
+    int64_t ByteSize() const override { return InvertedIndexTantivy<std::string>::ByteSize(); }
+    int64_t ValidityBitmapByteSize() const override {
+        return InvertedIndexTantivy<std::string>::ValidityBitmapByteSize();
+    }
+    using InvertedIndexTantivy<std::string>::IsNotNull;
+    TargetBitmap IsNotNull() override { return InvertedIndexTantivy<std::string>::IsNotNull(); }
     // In-memory writer used by both growing segments and sealed interim index
     // builds. Growing segments enable background merge because periodic
     // commits would otherwise grow the segment count unbounded; sealed builds
@@ -71,7 +80,7 @@ class TextMatchIndex : public InvertedIndexTantivy<std::string> {
     AddTextsGrowing(size_t n,
                     const std::string* texts,
                     const bool* valids,
-                    int64_t offset_begin);
+                    int64_t offset_begin) override;
 
     // `offset_begin` is the logical offset of the batch's first row, the same
     // doc-id space AddTextsGrowing writes into. A growing segment that already
@@ -80,16 +89,16 @@ class TextMatchIndex : public InvertedIndexTantivy<std::string> {
     void
     BuildIndexFromFieldData(const std::vector<FieldDataPtr>& field_datas,
                             bool nullable,
-                            int64_t offset_begin);
+                            int64_t offset_begin) override;
 
     void
     Finish();
 
     void
-    Commit();
+    Commit() override;
 
     void
-    Reload();
+    Reload() override;
 
  public:
     void
@@ -99,13 +108,13 @@ class TextMatchIndex : public InvertedIndexTantivy<std::string> {
     RegisterAnalyzer(const char* analyzer_name, const char* analyzer_params);
 
     TargetBitmap
-    MatchQuery(const std::string& query, uint32_t min_should_match);
+    MatchQuery(const std::string& query, uint32_t min_should_match) override;
 
     TargetBitmap
-    PhraseMatchQuery(const std::string& query, uint32_t slop);
+    PhraseMatchQuery(const std::string& query, uint32_t slop) override;
 
     TargetBitmap
-    FuzzyMatchQuery(const std::string& query, uint32_t max_edit_distance);
+    FuzzyMatchQuery(const std::string& query, uint32_t max_edit_distance) override;
 
  private:
     TargetBitmap
@@ -123,7 +132,7 @@ class TextMatchIndex : public InvertedIndexTantivy<std::string> {
 class TextMatchIndexHolder {
  public:
     explicit TextMatchIndexHolder(
-        std::unique_ptr<milvus::index::TextMatchIndex> index, bool mmap_enabled)
+        std::unique_ptr<milvus::index::TextMatchIndexBase> index, bool mmap_enabled)
         : index_(std::move(index)), loaded_size_([&]() {
               if (!index_) {
                   return milvus::cachinglayer::ResourceUsage(0, 0);
@@ -146,13 +155,13 @@ class TextMatchIndexHolder {
             loaded_size_);
     }
 
-    milvus::index::TextMatchIndex*
+    milvus::index::TextMatchIndexBase*
     get() const {
         return index_.get();
     }
 
  private:
-    std::unique_ptr<milvus::index::TextMatchIndex> index_;
+    std::unique_ptr<milvus::index::TextMatchIndexBase> index_;
     const milvus::cachinglayer::ResourceUsage loaded_size_;
 };
 

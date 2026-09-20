@@ -256,7 +256,7 @@ class SegmentInterface {
     virtual void
     CreateTextIndex(FieldId field_id, milvus::OpContext* op_ctx = nullptr) = 0;
 
-    virtual PinWrapper<index::TextMatchIndex*>
+    virtual PinWrapper<index::TextMatchIndexBase*>
     GetTextIndex(milvus::OpContext* op_ctx, FieldId field_id) const = 0;
 
     virtual std::vector<PinWrapper<const index::IndexBase*>>
@@ -680,7 +680,7 @@ class SegmentInternalInterface : public SegmentInterface {
     virtual DataType
     GetFieldDataType(FieldId fieldId) const = 0;
 
-    PinWrapper<index::TextMatchIndex*>
+    PinWrapper<index::TextMatchIndexBase*>
     GetTextIndex(milvus::OpContext* op_ctx, FieldId field_id) const override;
 
     PinWrapper<index::NgramInvertedIndex*>

@@ -795,7 +795,7 @@ SegmentInternalInterface::GetFieldSkipMetrics(FieldId field_id) const {
     return {};
 }
 
-PinWrapper<index::TextMatchIndex*>
+PinWrapper<index::TextMatchIndexBase*>
 SegmentInternalInterface::GetTextIndex(milvus::OpContext* op_ctx,
                                        FieldId field_id) const {
     std::shared_lock lock(mutex_);
@@ -806,18 +806,18 @@ SegmentInternalInterface::GetTextIndex(milvus::OpContext* op_ctx,
                   field_id.get());
     }
 
-    auto make_pin = [&](auto&& alt) -> PinWrapper<index::TextMatchIndex*> {
+    auto make_pin = [&](auto&& alt) -> PinWrapper<index::TextMatchIndexBase*> {
         using Alt = std::decay_t<decltype(alt)>;
 
         if constexpr (std::is_same_v<
                           Alt,
                           std::unique_ptr<milvus::index::TextMatchIndex>>) {
-            return PinWrapper<index::TextMatchIndex*>(alt.get());
+            return PinWrapper<index::TextMatchIndexBase*>(alt.get());
         } else if constexpr (std::is_same_v<
                                  Alt,
                                  std::shared_ptr<
                                      milvus::index::TextMatchIndexHolder>>) {
-            return PinWrapper<index::TextMatchIndex*>(alt, alt->get());
+            return PinWrapper<index::TextMatchIndexBase*>(alt, alt->get());
         } else if constexpr (std::is_same_v<
                                  Alt,
                                  std::shared_ptr<
@@ -825,7 +825,7 @@ SegmentInternalInterface::GetTextIndex(milvus::OpContext* op_ctx,
                                          milvus::index::TextMatchIndex>>>) {
             auto ca = SemiInlineGet(alt->PinCells(op_ctx, {0}));
             auto index = ca->get_cell_of(0);
-            return PinWrapper<index::TextMatchIndex*>(std::move(ca), index);
+            return PinWrapper<index::TextMatchIndexBase*>(std::move(ca), index);
         } else {
             ThrowInfo(milvus::ErrorCode::UnexpectedError,
                       "text index of segment is not supported for field {}",
