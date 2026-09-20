@@ -19,6 +19,7 @@
 #include <memory>
 #include "index/TextMatchIndexBase.h"
 #include "index/FstTermDictionary.h"
+#include "index/KnowherePositionIndex.h"
 #include "index/InvertedIndexKnowhereCore.h"
 #include "common/Tracer.h"
 #include "tantivy/tokenizer.h"
@@ -50,7 +51,11 @@ class TextMatchIndexKnowhere final : public TextMatchIndexBase {
                 (nulls.empty() || nulls.back() < n),
             "invalid text null offsets");
         auto tokenizer = analyzer_->Clone();
-        std::map<std::string, std::vector<uint32_t>> postings;
+        struct PostingBuilder {
+            std::vector<uint32_t> docs, frequencies, deltas;
+            uint32_t last_position = 0;
+        };
+        std::map<std::string, PostingBuilder> postings;
         size_t null = 0;
         for (size_t row = 0; row < n; ++row) {
             if (null < nulls.size() && nulls[null] == row) {
@@ -60,26 +65,42 @@ class TextMatchIndexKnowhere final : public TextMatchIndexBase {
             CheckText(texts[row]);
             auto stream = tokenizer->CreateTokenStreamCopyText(texts[row]);
             while (stream->advance()) {
-                auto& ids = postings[stream->get_token()];
-                if (ids.empty() || ids.back() != row)
-                    ids.push_back(row);
+                auto [text, position] = DetailedToken(*stream);
+                auto& posting = postings[text];
+                if (posting.docs.empty() || posting.docs.back() != row) {
+                    posting.docs.push_back(row);
+                    posting.frequencies.push_back(0);
+                    posting.last_position = 0;
+                }
+                AssertInfo(position >= posting.last_position &&
+                               posting.frequencies.back() < UINT32_MAX,
+                           "invalid analyzer position sequence or frequency");
+                ++posting.frequencies.back();
+                posting.deltas.push_back(position - posting.last_position);
+                posting.last_position = position;
             }
         }
         std::vector<std::string> terms;
         terms.reserve(postings.size());
         std::map<uint32_t, std::vector<uint32_t>> ordinal_postings;
-        for (auto& [term, ids] : postings) {
+        KnowherePositionIndex next_positions;
+        for (auto& [term, posting] : postings) {
             AssertInfo(terms.size() < UINT32_MAX,
                        "text term count exceeds uint32");
-            ordinal_postings.emplace(terms.size(), std::move(ids));
+            ordinal_postings.emplace(terms.size(), std::move(posting.docs));
+            next_positions.AppendTerm(posting.frequencies, posting.deltas);
+            posting.frequencies.clear();
+            posting.deltas.clear();
             terms.push_back(term);
         }
+        next_positions.Seal();
         auto dictionary = FstTermDictionary::Build(terms);
         Core next(format_);
         next.BuildFromPostings(n, ordinal_postings, nulls);
         // Publish both together only after every build stage succeeds.
         core_ = std::move(next);
         dictionary_ = std::move(dictionary);
+        positions_ = std::move(next_positions);
     }
     int64_t
     Count() override {
@@ -87,7 +108,8 @@ class TextMatchIndexKnowhere final : public TextMatchIndexBase {
     }
     int64_t
     ByteSize() const override {
-        return core_.ByteSize() + dictionary_.ByteSize();
+        return core_.ByteSize() + dictionary_.ByteSize() +
+               positions_.ByteSize();
     }
     int64_t
     ValidityBitmapByteSize() const override {
@@ -147,6 +169,103 @@ class TextMatchIndexKnowhere final : public TextMatchIndexBase {
         }
         return result;
     }
+    TargetBitmap
+    PhraseMatchQuery(const std::string& query, uint32_t slop) override {
+        CheckText(query);
+        auto tokenizer = analyzer_->Clone();
+        auto stream = tokenizer->CreateTokenStreamCopyText(query);
+        struct Clause {
+            size_t term;
+            uint32_t position;
+        };
+        std::vector<Clause> clauses;
+        uint32_t max_position = 0;
+        TargetBitmap result(core_.Count());
+        while (stream->advance()) {
+            auto [text, position] = DetailedToken(*stream);
+            auto id = dictionary_.Lookup(text);
+            if (!id)
+                return result;
+            clauses.push_back({*id, position});
+            max_position = std::max(max_position, position);
+        }
+        if (clauses.empty())
+            return result;
+        if (clauses.size() == 1) {
+            core_.DecodeInto(clauses[0].term, result);
+            return result;
+        }
+        // Match the pinned PhraseQuery's offset ordering, then Intersection's
+        // stable DF ordering. Keep repeated clauses and their position offsets.
+        std::stable_sort(clauses.begin(), clauses.end(), [](auto a, auto b) {
+            return a.position < b.position;
+        });
+        std::stable_sort(clauses.begin(), clauses.end(), [&](auto a, auto b) {
+            return core_.DocFreq(a.term) < core_.DocFreq(b.term);
+        });
+        std::vector<size_t> terms;
+        std::vector<KnowhereSparsePostingCodec::Cursor> docs;
+        std::vector<KnowherePositionIndex::Reader> readers;
+        struct DecodeClause {
+            size_t clause;
+            uint64_t offset;
+        };
+        struct CopyClause {
+            size_t source, target;
+            uint64_t source_offset, target_offset;
+        };
+        std::vector<DecodeClause> decode;
+        std::vector<CopyClause> copies;
+        // Resolve sharing once per query. The row loop decodes unique terms
+        // without a per-clause duplicate branch, then aligns duplicate buffers.
+        for (size_t i = 0; i < clauses.size(); ++i) {
+            const uint64_t offset =
+                uint64_t(max_position) - clauses[i].position;
+            auto found = std::find(terms.begin(), terms.end(), clauses[i].term);
+            if (found == terms.end()) {
+                terms.push_back(clauses[i].term);
+                decode.push_back({i, offset});
+            } else {
+                const auto first = decode[found - terms.begin()];
+                copies.push_back({first.clause, i, first.offset, offset});
+            }
+        }
+        docs.reserve(terms.size());
+        readers.reserve(terms.size());
+        for (auto term : terms) {
+            docs.push_back(core_.NewCursor(term));
+            readers.emplace_back(positions_, term);
+        }
+        TargetBitmap candidates(core_.Count());
+        core_.IntersectInto(std::move(terms), candidates);
+        std::vector<std::vector<uint64_t>> positions(clauses.size());
+        KnowherePhraseScratch scratch;
+        for (auto row = candidates.find_first(); row;
+             row = candidates.find_next(*row)) {
+            for (size_t i = 0; i < decode.size(); ++i) {
+                AssertInfo(docs[i].Seek(*row) == *row,
+                           "phrase candidate missing from posting");
+                readers[i].Read(docs[i].PostingOrdinal(),
+                                decode[i].offset,
+                                positions[decode[i].clause]);
+            }
+            for (auto copy : copies) {
+                const auto& source = positions[copy.source];
+                auto& target = positions[copy.target];
+                target.resize(source.size());
+                for (size_t j = 0; j < source.size(); ++j)
+                    target[j] =
+                        source[j] - copy.source_offset + copy.target_offset;
+            }
+            if (KnowherePhraseExists(positions, slop, scratch))
+                result.set(*row);
+        }
+        return result;
+    }
+    size_t
+    PositionBytesForUT() const {
+        return positions_.LogicalBytes();
+    }
     const FstTermDictionary&
     Dictionary() const {
         return dictionary_;
@@ -167,6 +286,17 @@ class TextMatchIndexKnowhere final : public TextMatchIndexBase {
     }
 
  private:
+    static std::pair<std::string, uint32_t>
+    DetailedToken(milvus::tantivy::TokenStream& stream) {
+        auto token = stream.get_detailed_token();
+        auto release = [](const char* ptr) { free_rust_string(ptr); };
+        std::unique_ptr<const char, decltype(release)> text(token.token,
+                                                            release);
+        AssertInfo(
+            token.position >= 0 && uint64_t(token.position) <= UINT32_MAX,
+            "analyzer position exceeds uint32 domain");
+        return {std::string(text.get()), static_cast<uint32_t>(token.position)};
+    }
     static void
     CheckText(const std::string& text) {
         if (text.find('\0') != std::string::npos)
@@ -176,5 +306,6 @@ class TextMatchIndexKnowhere final : public TextMatchIndexBase {
     Core core_;
     KnowhereSparsePostingCodec::Format format_;
     FstTermDictionary dictionary_;
+    KnowherePositionIndex positions_;
 };
 }  // namespace milvus::index

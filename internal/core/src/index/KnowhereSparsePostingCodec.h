@@ -81,6 +81,10 @@ class KnowhereSparsePostingCodec {
         uint32_t
         Next();
         size_t
+        PostingOrdinal() const {
+            return block_ * kBlockSize + position_;
+        }
+        size_t
         DecodedBlocksForUT() const {
             return decoded_blocks_;
         }

@@ -164,6 +164,12 @@ class InvertedIndexKnowhereCore {
             for (size_t i = 0; i < n; ++i) callback(ids[i]);
         }
     }
+    KnowhereSparsePostingCodec::Cursor
+    NewCursor(size_t term) const {
+        const auto& meta = posting_metas_.at(term);
+        return KnowhereSparsePostingCodec::Cursor(
+            posting_bytes_.data() + meta.doc_stream_offset, format_);
+    }
     // Add the intersection of existing term ordinals to a caller-owned bitmap.
     // Sort by posting length; cursor seeks skip compressed blocks using max IDs.
     void

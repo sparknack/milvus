@@ -162,6 +162,12 @@ KnowhereSparsePostingCodec::Cursor::Seek(uint32_t target) {
     }
     if (started_ && target <= Doc())
         return Doc();
+    // Dense candidate iteration usually asks for the next posting. Avoid a
+    // block-directory lookup and binary search in that already decoded case.
+    if (started_ && position_ + 1 < size_ && ids_[position_ + 1] >= target) {
+        ++position_;
+        return Doc();
+    }
     size_t block = started_ ? block_ : 0;
     if (view_.MaxDoc(block) < target) {
         size_t lo = block + 1, hi = view_.Blocks();

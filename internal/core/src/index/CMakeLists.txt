@@ -24,7 +24,7 @@ add_library(milvus_index OBJECT ${SOURCE_FILES})
 target_link_libraries(milvus_index PUBLIC milvus_conan_deps libsais)
 
 # The experimental posting adapter calls the dependency implementation directly.
-set_source_files_properties(KnowhereSparsePostingCodec.cpp PROPERTIES
+set_source_files_properties(KnowhereSparsePostingCodec.cpp KnowherePositionIndex.cpp PROPERTIES
     INCLUDE_DIRECTORIES "${knowhere_SOURCE_DIR}/src")
 
 target_link_libraries(milvus_index PRIVATE milvus_cpp_fstlib)

@@ -6,7 +6,8 @@ Extend the existing StreamVByte docID-only PoC to tokenized `TEXT_MATCH` over
 sealed resident documents. Retain Milvus's Tantivy analyzer; replace only the
 term dictionary, postings and matching execution. This is not a production
 IndexFactory option, growing implementation, persisted format, BM25 scorer,
-phrase matcher or fuzzy matcher.
+fuzzy matcher. The resident phrase extension is described in
+[the positions design](knowhere-phrase-match-poc.md).
 
 The scalar `InvertedIndexKnowhere<T>` remains separate. Text uses
 `TextMatchIndexKnowhere` and the same `InvertedIndexKnowhereCore` posting codec.
@@ -40,8 +41,9 @@ UnaryExpr text-index path, validity handling and vector search for both backends
   scalar retains StreamVByte. The selected format stays with the core through
   transactional rebuilds and is passed explicitly to each block reader. Adaptive
   calls encode_doc_ids, selecting bitpacking, all-equal or StreamVByte, without
-  adding TF or the upstream singleton short form. No positions, weights
-  or per-document term frequencies are stored.
+  adding TF to the docID stream or the upstream singleton short form. Text now
+  stores TF and positions in a separate adaptive sidecar; scalar stays docID-only.
+  No BM25 weights are stored.
 - Build into temporary structures and publish only after successful analysis and
   encoding; failed builds leave the prior index intact.
 - Clone the analyzer per query; all published posting state is read-only.
@@ -67,7 +69,9 @@ UnaryExpr text-index path, validity handling and vector search for both backends
   or Knowhere limitation. Before/after measurements are retained in the report.
 - Null validity remains separate from hits so `NOT TEXT_MATCH` excludes nulls.
 - Embedded NUL is explicitly unsupported by this PoC's C-string analyzer bridge.
-  Phrase/fuzzy queries and growing mutation return typed Unsupported errors.
+  Fuzzy queries and growing mutation return typed Unsupported errors.
+  Phrase queries use document intersection followed by lazy per-document position
+  decoding, supporting exact and pinned-Tantivy-compatible slop matching.
 
 ## Correctness gate and performance method
 
@@ -87,9 +91,10 @@ order across 31 batches of four searches and report median/p95 of batch means.
 Run twice; include build/attach time and accounted index bytes. Separate strace
 runs audit query file accesses and do not supply reported performance numbers.
 
-The default Tantivy text index also stores positions for phrase match, while this
-candidate implements only TEXT_MATCH. Accounted bytes are not total heap/RSS or
-peak build memory. Results compare these implementations and capabilities, not
+The historical TEXT_MATCH reports below compared Tantivy with positions against
+an earlier docID-only candidate. The phrase extension now stores positions too;
+its new benchmarks must be used for current build/memory comparisons.
+Accounted bytes are not total heap/RSS or peak build memory. Results compare these implementations and capabilities, not
 isolated compression codecs or every possible optimization of either engine.
 
 [Results and reproduction](../../../knowhere-scalar-poc/results/2026-09-20-text-match/README.md).
