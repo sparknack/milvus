@@ -18,6 +18,8 @@
 #include "index/ScalarIndex.h"
 #include "index/InvertedIndexKnowhereCore.h"
 #include "index/InvertedIndexUtil.h"
+#include "index/FstTermDictionary.h"
+#include "common/RegexQuery.h"
 
 namespace milvus::index {
 // Resident scalar PoC. Intentionally independent of Tantivy and not factory registered.
@@ -26,7 +28,10 @@ class InvertedIndexKnowhere : public ScalarIndex<T> {
  public:
     using Core = InvertedIndexKnowhereCore<T, TargetBitmap, OpType>;
     using ScalarIndex<T>::IsNotNull;
-    InvertedIndexKnowhere() : ScalarIndex<T>(INVERTED_INDEX_TYPE) {
+    explicit InvertedIndexKnowhere(
+        KnowhereSparsePostingCodec::Format format =
+            KnowhereSparsePostingCodec::Format::StreamVByte)
+        : ScalarIndex<T>(INVERTED_INDEX_TYPE), core_(format), format_(format) {
     }
     ScalarIndexType
     GetIndexType() const override {
@@ -45,7 +50,18 @@ class InvertedIndexKnowhere : public ScalarIndex<T> {
     BuildWithNullOffsetsForUT(size_t n,
                               const T* values,
                               const std::vector<size_t>& nulls = {}) {
-        core_.Build(n, values, nulls);
+        Core next(format_);
+        next.Build(n, values, nulls);
+        FstTermDictionary dictionary;
+        if constexpr (std::is_same_v<T, std::string>) {
+            std::vector<std::string> terms;
+            terms.reserve(next.TermCount());
+            for (size_t i = 0; i < next.TermCount(); ++i)
+                terms.push_back(next.Term(i));
+            dictionary = FstTermDictionary::Build(terms);
+        }
+        core_ = std::move(next);
+        dictionary_ = std::move(dictionary);
         ComputeByteSize();
     }
     void
@@ -67,7 +83,7 @@ class InvertedIndexKnowhere : public ScalarIndex<T> {
     }
     void
     ComputeByteSize() override {
-        this->cached_byte_size_ = core_.ByteSize();
+        this->cached_byte_size_ = core_.ByteSize() + dictionary_.ByteSize();
     }
     const bool
     HasRawData() const override {
@@ -136,6 +152,58 @@ class InvertedIndexKnowhere : public ScalarIndex<T> {
         auto result = In(n, values);
         apply_hits_with_callback(result, callback);
     }
+    bool
+    SupportPatternMatch() const override {
+        return std::is_same_v<T, std::string>;
+    }
+    const TargetBitmap
+    PatternMatch(const std::string& pattern, proto::plan::OpType op) override {
+        if constexpr (!std::is_same_v<T, std::string>) {
+            return ScalarIndex<T>::PatternMatch(pattern, op);
+        } else {
+            TargetBitmap result(Count());
+            auto emit = [&](std::string_view, uint32_t id) {
+                core_.DecodeInto(id, result);
+            };
+            if (op == proto::plan::OpType::PrefixMatch) {
+                core_.ForEachStringPrefix(pattern, emit);
+            } else if (op == proto::plan::OpType::RegexMatch) {
+                PartialRegexMatcher matcher(pattern);
+                core_.ForEachStringPrefix(
+                    "", [&](std::string_view term, uint32_t id) {
+                        if (matcher(term))
+                            core_.DecodeInto(id, result);
+                    });
+            } else {
+                std::string like;
+                switch (op) {
+                    case proto::plan::OpType::Match:
+                        like = pattern;
+                        break;
+                    case proto::plan::OpType::PostfixMatch:
+                        like = "%" + EscapeLikePattern(pattern);
+                        break;
+                    case proto::plan::OpType::InnerMatch:
+                        like = "%" + EscapeLikePattern(pattern) + "%";
+                        break;
+                    default:
+                        return ScalarIndex<T>::PatternMatch(pattern, op);
+                }
+                // Validate the WHOLE pattern before any empty-index/prefix exit.
+                RegexMatcher matcher(PatternMatchTranslator{}(like));
+                // The resident core already owns sorted unique values. Scan
+                // views inside the literal prefix range, without reconstructing
+                // long strings through the FST. This does not read raw rows.
+                core_.ForEachStringPrefix(
+                    extract_fixed_prefix_from_pattern(like),
+                    [&](std::string_view term, uint32_t id) {
+                        if (matcher(term))
+                            core_.DecodeInto(id, result);
+                    });
+            }
+            return result;
+        }
+    }
     std::optional<T>
     Reverse_Lookup(size_t) const override {
         ThrowInfo(Unsupported,
@@ -175,5 +243,7 @@ class InvertedIndexKnowhere : public ScalarIndex<T> {
 
  private:
     Core core_;
+    KnowhereSparsePostingCodec::Format format_;
+    FstTermDictionary dictionary_;
 };
 }  // namespace milvus::index

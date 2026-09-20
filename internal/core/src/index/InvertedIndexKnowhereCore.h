@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -276,6 +277,24 @@ class InvertedIndexKnowhereCore {
     T
     Term(size_t i) const {
         return terms_.at(i);
+    }
+    // Immutable unique-term views, valid until the next Build/destruction.
+    // Do not return const T& generically: vector<bool> has proxy elements.
+    template <typename Visitor>
+    void
+    ForEachStringPrefix(std::string_view prefix, Visitor&& visitor) const
+        requires(std::is_same_v<T, std::string>) {
+        auto begin = std::lower_bound(
+            terms_.begin(), terms_.end(), prefix,
+            [](const std::string& term, std::string_view key) {
+                return std::string_view(term) < key;
+            });
+        for (auto it = begin; it != terms_.end(); ++it) {
+            const std::string_view term(*it);
+            if (!term.starts_with(prefix))
+                break;
+            visitor(term, static_cast<uint32_t>(it - terms_.begin()));
+        }
     }
     uint32_t
     DocFreq(size_t i) const {

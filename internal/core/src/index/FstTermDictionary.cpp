@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <array>
 #include <cerrno>
 #include <cstring>
 #include <sstream>
@@ -43,6 +44,143 @@ void
 Append64(std::string& s, uint64_t v) {
     for (size_t i = 0; i < 8; ++i) s.push_back(char(v >> (8 * i)));
 }
+// Small LIKE NFA: one bit per token plus the accepting state. Programs
+// are immutable and live on the querying stack; branch states only hold a
+// pointer and small integers. Longer patterns use the caller's RE2 fallback.
+struct LikeProgram {
+    static constexpr uint32_t kMany = 0x110000, kOne = 0x110001;
+    std::array<uint32_t, 63> tokens{};
+    size_t size = 0;
+    uint64_t many = 0, one = 0;
+};
+struct Utf8State {
+    uint32_t code = 0, minimum = 0;
+    uint8_t remaining = 0;
+    bool valid = true;
+    bool
+    Feed(uint8_t b) {
+        if (!valid)
+            return false;
+        if (remaining) {
+            if ((b & 0xc0) != 0x80) {
+                valid = false;
+                return false;
+            }
+            code = (code << 6) | (b & 63);
+            if (--remaining)
+                return false;
+            valid = code >= minimum && code <= 0x10ffff &&
+                    !(code >= 0xd800 && code <= 0xdfff);
+            return valid;
+        }
+        if (b < 128) {
+            code = b;
+            return true;
+        }
+        if (b >= 0xc2 && b <= 0xdf) {
+            code = b & 31;
+            minimum = 0x80;
+            remaining = 1;
+        } else if (b >= 0xe0 && b <= 0xef) {
+            code = b & 15;
+            minimum = 0x800;
+            remaining = 2;
+        } else if (b >= 0xf0 && b <= 0xf4) {
+            code = b & 7;
+            minimum = 0x10000;
+            remaining = 3;
+        } else
+            valid = false;
+        return false;
+    }
+};
+bool
+CompileLike(std::string_view pattern, LikeProgram& p) {
+    bool escaped = false;
+    Utf8State utf8;
+    for (uint8_t b : pattern) {
+        if (!utf8.Feed(b)) {
+            if (!utf8.valid)
+                return false;
+            continue;
+        }
+        uint32_t token = utf8.code;
+        if (!escaped && token == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (!escaped && token == '%')
+            token = LikeProgram::kMany;
+        else if (!escaped && token == '_')
+            token = LikeProgram::kOne;
+        escaped = false;
+        if (token == LikeProgram::kMany && p.size &&
+            p.tokens[p.size - 1] == token)
+            continue;
+        if (p.size == p.tokens.size())
+            return false;
+        if (token == LikeProgram::kMany)
+            p.many |= uint64_t(1) << p.size;
+        if (token == LikeProgram::kOne)
+            p.one |= uint64_t(1) << p.size;
+        p.tokens[p.size++] = token;
+    }
+    return !escaped && utf8.valid && !utf8.remaining;
+}
+struct LikeState {
+    const LikeProgram* program;
+    uint64_t active = 1;
+    Utf8State utf8;
+    explicit LikeState(const LikeProgram& p) : program(&p) {
+        Close();
+    }
+    void
+    Close() {
+        active |= (active & program->many) << 1;
+    }
+    void
+    step(char c) {
+        if (!utf8.Feed(uint8_t(c))) {
+            if (!utf8.valid)
+                active = 0;
+            return;
+        }
+        uint64_t next = active & program->many;
+        next |= (active & program->one) << 1;
+        uint64_t literals = active & ~(program->many | program->one);
+        // The accepting bit has no outgoing transition.
+        literals &= (uint64_t(1) << program->size) - 1;
+        while (literals) {
+            unsigned bit = std::countr_zero(literals);
+            if (program->tokens[bit] == utf8.code)
+                next |= uint64_t(1) << (bit + 1);
+            literals &= literals - 1;
+        }
+        active = next;
+        Close();
+    }
+    bool
+    is_match() const {
+        return !utf8.remaining && (active & (uint64_t(1) << program->size));
+    }
+    bool
+    can_match() const {
+        return active != 0;
+    }
+};
+class PatternFst : public fst::map<uint32_t> {
+ public:
+    using fst::map<uint32_t>::map;
+    void
+    Like(const LikeProgram& program,
+         const FstTermDictionary::Visitor& visitor) const {
+        this->depth_first_visit(this->header_.start_address,
+                                std::string(),
+                                uint32_t{},
+                                LikeState(program),
+                                visitor);
+    }
+};
 struct Region {
     std::string owned;
     void* mapping = MAP_FAILED;
@@ -65,7 +203,7 @@ struct FstTermDictionary::State {
     std::shared_ptr<Region> region;
     size_t count;
     bool empty_key;
-    std::unique_ptr<fst::map<uint32_t>> reader;
+    std::unique_ptr<PatternFst> reader;
     explicit State(std::shared_ptr<Region> r) : region(std::move(r)) {
         static_assert(std::endian::native == std::endian::little,
                       "Pinned cpp-fstlib bytecode is little endian");
@@ -95,8 +233,8 @@ struct FstTermDictionary::State {
                 fst::get_output_type(payload.data(), payload.size()) !=
                     fst::OutputType::uint32_t)
                 ThrowInfo(ErrorCode::DataFormatBroken, "invalid FST bytecode");
-            reader = std::make_unique<fst::map<uint32_t>>(payload.data(),
-                                                          payload.size());
+            reader =
+                std::make_unique<PatternFst>(payload.data(), payload.size());
             if (!*reader)
                 ThrowInfo(ErrorCode::DataFormatBroken,
                           "cannot open FST bytecode");
@@ -203,7 +341,7 @@ FstTermDictionary::ByteSize() const {
     if (!state_)
         return 0;
     return sizeof(State) + sizeof(Region) +
-           (state_->reader ? sizeof(fst::map<uint32_t>) : 0) +
+           (state_->reader ? sizeof(PatternFst) : 0) +
            (IsMapped() ? state_->region->length
                        : state_->region->owned.capacity());
 }
@@ -224,5 +362,30 @@ FstTermDictionary::Enumerate() const {
         return a.second < b.second;
     });
     return result;
+}
+
+void
+FstTermDictionary::ForEachPrefix(std::string_view prefix,
+                                 const Visitor& visitor) const {
+    if (!state_)
+        return;
+    if (prefix.empty() && state_->empty_key)
+        visitor("", 0);
+    if (state_->reader)
+        state_->reader->predictive_search(prefix, visitor);
+}
+bool
+FstTermDictionary::ForEachLike(std::string_view pattern,
+                               const Visitor& visitor) const {
+    LikeProgram program;
+    if (!CompileLike(pattern, program))
+        return false;
+    if (!state_)
+        return true;
+    if (state_->empty_key && LikeState(program).is_match())
+        visitor("", 0);
+    if (state_->reader)
+        state_->reader->Like(program, visitor);
+    return true;
 }
 }  // namespace milvus::index

@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -47,6 +48,14 @@ class FstTermDictionary {
     SerializedBytes() const;
     std::vector<std::pair<std::string, uint32_t>>
     Enumerate() const;
+    using Visitor = std::function<void(std::string_view, uint32_t)>;
+    // Views are valid only for the duration of the callback.
+    void
+    ForEachPrefix(std::string_view prefix, const Visitor& visitor) const;
+    // False means unsupported/over-budget pattern, with no callbacks made.
+    // Caller must validate LIKE syntax and use an equivalent fallback.
+    bool
+    ForEachLike(std::string_view pattern, const Visitor& visitor) const;
 
  private:
     struct State;
