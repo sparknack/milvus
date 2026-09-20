@@ -179,10 +179,17 @@ NgramInvertedIndex::BuildWithJsonFieldData(
             if (data && size > 0) {
                 total_bytes += data->size();
                 total_rows++;
+            } else {
+                // JSON string predicates are invalid for every row without a
+                // string at this path, not just SQL-NULL JSON rows. Keep empty
+                // strings valid (size == 1) even when they emit no ngrams.
+                // The existing null-offset metadata carries this mask through
+                // finalization and serialization, including non-nullable fields.
+                this->null_offset_.push_back(offset);
             }
         },
-        // handle null
-        [this](int64_t offset) { this->null_offset_.push_back(offset); },
+        // SQL NULL also reaches data_adder(nullptr, 0); record it only once.
+        [](int64_t offset) {},
         // handle non exist
         [](int64_t offset) {},
         // handle error (silently skip — error stats not tracked)

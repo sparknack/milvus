@@ -52,6 +52,23 @@ class InvertedIndexKnowhere : public ScalarIndex<T> {
                               const std::vector<size_t>& nulls = {}) {
         Core next(format_);
         next.Build(n, values, nulls);
+        PublishCore(std::move(next));
+    }
+    // Resident multi-value adapters supply unique, increasing docIDs per term.
+    // The codec flattens these temporary lists before publishing the index.
+    template <typename PostingMap>
+    void
+    BuildFromPostingsForPoC(size_t n,
+                           const PostingMap& postings,
+                           const std::vector<size_t>& nulls = {}) {
+        Core next(format_);
+        next.BuildFromPostings(n, postings, nulls);
+        PublishCore(std::move(next));
+    }
+
+ private:
+    void
+    PublishCore(Core&& next) {
         FstTermDictionary dictionary;
         if constexpr (std::is_same_v<T, std::string>) {
             std::vector<std::string> terms;
@@ -64,6 +81,8 @@ class InvertedIndexKnowhere : public ScalarIndex<T> {
         dictionary_ = std::move(dictionary);
         ComputeByteSize();
     }
+
+ public:
     void
     BuildWithRawDataForUT(size_t n,
                           const void* values,

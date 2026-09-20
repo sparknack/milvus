@@ -38,6 +38,7 @@
 #include "folly/FBVector.h"
 #include "monitor/Monitor.h"
 #include "index/ScalarIndex.h"
+#include "index/ArrayConjunctionIndex.h"
 #include "index/json_stats/JsonKeyStats.h"
 #include "index/json_stats/utils.h"
 #include "opentelemetry/trace/span.h"
@@ -2493,6 +2494,10 @@ PhyJsonContainsFilterExpr::ExecArrayContainsForIndexSegmentImpl() {
                 return query_in(vals.size(), vals.data());
 
             case proto::plan::JSONContainsExpr_JSONOp_ContainsAll: {
+                if (auto* conjunction = index::GetArrayConjunctionIndex(
+                        index_ptr, field_type_, active_count_)) {
+                    return conjunction->All(vals.size(), vals.data());
+                }
                 TargetBitmap result(active_count_);
                 result.set();
                 for (size_t i = 0; i < vals.size(); i++) {
