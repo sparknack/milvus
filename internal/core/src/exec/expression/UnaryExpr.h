@@ -1174,7 +1174,7 @@ class PhyUnaryRangeFilterExpr : public SegmentExpr {
     std::shared_ptr<const milvus::expr::UnaryRangeFilterExpr> expr_;
     bool arg_inited_{false};
     SingleElement value_arg_;
-    PinWrapper<index::NgramInvertedIndex*> pinned_ngram_index_{nullptr};
+    PinWrapper<index::NgramIndexBase*> pinned_ngram_index_{nullptr};
     PinWrapper<index::BsonInvertedIndex*> bson_index_{nullptr};
     bool enable_sub_expr_cache_write_{true};
 

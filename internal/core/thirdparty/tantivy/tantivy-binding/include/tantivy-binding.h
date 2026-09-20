@@ -644,6 +644,9 @@ void tantivy_free_analyzer(void *tokenizer);
 
 RustResult tantivy_set_analyzer_options(const char *params);
 
+/// Reuse the sealed ngram writer's tokenizer through the existing token-stream API.
+RustResult tantivy_create_ngram_analyzer(uintptr_t min_gram, uintptr_t max_gram);
+
 bool tantivy_index_exist(const char *path);
 
 RustResult tantivy_compute_phrase_match_slop(const char *tokenizer_params,

@@ -3777,29 +3777,29 @@ ChunkedSegmentSealedImpl::chunk_array_value_views_by_offsets(
               "ARRAY column field ");
 }
 
-cachinglayer::PinWrapper<index::NgramInvertedIndex*>
+cachinglayer::PinWrapper<index::NgramIndexBase*>
 ChunkedSegmentSealedImpl::GetNgramIndex(milvus::OpContext* op_ctx,
                                         FieldId field_id) const {
     auto runtime = CaptureRuntimeResourceState();
     if (runtime->ngram_fields.find(field_id) == runtime->ngram_fields.end()) {
-        return cachinglayer::PinWrapper<index::NgramInvertedIndex*>(nullptr);
+        return cachinglayer::PinWrapper<index::NgramIndexBase*>(nullptr);
     }
 
     auto iter = runtime->scalar_indexings.find(field_id);
     if (iter == runtime->scalar_indexings.end()) {
-        return cachinglayer::PinWrapper<index::NgramInvertedIndex*>(nullptr);
+        return cachinglayer::PinWrapper<index::NgramIndexBase*>(nullptr);
     }
 
     auto ca = cachinglayer::SemiInlineGet(iter->second->PinCells(op_ctx, {0}));
-    auto index = dynamic_cast<index::NgramInvertedIndex*>(ca->get_cell_of(0));
+    auto index = dynamic_cast<index::NgramIndexBase*>(ca->get_cell_of(0));
     AssertInfo(index != nullptr,
                "ngram index cache is corrupted, field_id: {}",
                field_id.get());
-    return cachinglayer::PinWrapper<index::NgramInvertedIndex*>(std::move(ca),
+    return cachinglayer::PinWrapper<index::NgramIndexBase*>(std::move(ca),
                                                                 index);
 }
 
-cachinglayer::PinWrapper<index::NgramInvertedIndex*>
+cachinglayer::PinWrapper<index::NgramIndexBase*>
 ChunkedSegmentSealedImpl::GetNgramIndexForJson(
     milvus::OpContext* op_ctx,
     FieldId field_id,
@@ -3807,22 +3807,22 @@ ChunkedSegmentSealedImpl::GetNgramIndexForJson(
     auto runtime = CaptureRuntimeResourceState();
     auto iter = runtime->ngram_indexings.find(field_id);
     if (iter == runtime->ngram_indexings.end()) {
-        return cachinglayer::PinWrapper<index::NgramInvertedIndex*>(nullptr);
+        return cachinglayer::PinWrapper<index::NgramIndexBase*>(nullptr);
     }
     auto nested_iter = iter->second.find(nested_path);
     if (nested_iter == iter->second.end()) {
-        return cachinglayer::PinWrapper<index::NgramInvertedIndex*>(nullptr);
+        return cachinglayer::PinWrapper<index::NgramIndexBase*>(nullptr);
     }
 
     auto ca =
         cachinglayer::SemiInlineGet(nested_iter->second->PinCells(op_ctx, {0}));
-    auto index = dynamic_cast<index::NgramInvertedIndex*>(ca->get_cell_of(0));
+    auto index = dynamic_cast<index::NgramIndexBase*>(ca->get_cell_of(0));
     AssertInfo(index != nullptr,
                "ngram index cache for json is corrupted, field_id: {}, "
                "nested_path: {}",
                field_id.get(),
                nested_path);
-    return cachinglayer::PinWrapper<index::NgramInvertedIndex*>(std::move(ca),
+    return cachinglayer::PinWrapper<index::NgramIndexBase*>(std::move(ca),
                                                                 index);
 }
 

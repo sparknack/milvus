@@ -2623,6 +2623,66 @@ class SegmentExpr : public Expr {
         return processed_size;
     }
 
+    // NGRAM candidates are already validity-filtered. Gather sparse candidates
+    // without materializing views for rejected rows; keep the pin until the
+    // predicate finishes. This does not advance the expression scan cursor.
+    template <typename Predicate>
+    void
+    FilterStringCandidatesForRange(Predicate predicate,
+                                   TargetBitmapView candidates,
+                                   int64_t segment_offset,
+                                   int64_t size) {
+        auto [start_chunk, start_offset] =
+            GetChunkByOffset(field_id_, segment_offset);
+        int64_t processed = 0;
+        FixedVector<int32_t> offsets;
+        for (size_t chunk = start_chunk;
+             chunk < num_data_chunk_ && processed < size;
+             ++chunk) {
+            const auto chunk_size = ChunkSize(field_id_, chunk);
+            int64_t offset = chunk == start_chunk ? start_offset : 0;
+            while (offset < chunk_size && processed < size) {
+                const auto n =
+                    std::min({batch_size_, chunk_size - offset, size - processed});
+                auto bits = candidates.view(processed, n);
+                offsets.clear();
+                // Stop collecting when dense, and avoid narrowing large chunk
+                // offsets to the int32 domain of get_views_by_offsets.
+                bool sparse = offset + n <= std::numeric_limits<int32_t>::max();
+                if (sparse) {
+                    for (auto i = bits.find_first(); i && *i < size_t(n);
+                         i = bits.find_next(*i)) {
+                        offsets.push_back(offset + *i);
+                        if (offsets.size() * 8 > size_t(n)) {
+                            sparse = false;
+                            break;
+                        }
+                    }
+                }
+                if (sparse) {
+                    if (!offsets.empty()) {
+                        auto pin = segment_->get_views_by_offsets<std::string_view>(
+                            op_ctx_, field_id_, chunk, offsets);
+                        const auto& views = pin.get().first;
+                        for (size_t i = 0; i < offsets.size(); ++i)
+                            if (!predicate(views[i]))
+                                bits[offsets[i] - offset] = false;
+                    }
+                } else {
+                    auto pin = segment_->get_batch_views<std::string_view>(
+                        op_ctx_, field_id_, chunk, offset, n);
+                    const auto& views = pin.get().first;
+                    for (auto i = bits.find_first(); i && *i < size_t(n);
+                         i = bits.find_next(*i))
+                        if (!predicate(views[*i]))
+                            bits[*i] = false;
+                }
+                offset += n;
+                processed += n;
+            }
+        }
+    }
+
     enum class IndexValidityMode {
         Default,
         JsonExactPath,

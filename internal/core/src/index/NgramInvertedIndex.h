@@ -10,6 +10,7 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
 #pragma once
+#include "index/NgramIndexBase.h"
 #include <string>
 #include <boost/filesystem.hpp>
 #include <optional>
@@ -28,8 +29,10 @@ namespace milvus::index {
 std::vector<std::string>
 extract_literals_from_regex(const std::string& pattern);
 
-class NgramInvertedIndex : public InvertedIndexTantivy<std::string> {
+class NgramInvertedIndex : public InvertedIndexTantivy<std::string>, public NgramIndexBase {
  public:
+    int64_t Count() override { return InvertedIndexTantivy<std::string>::Count(); }
+    TargetBitmap IsNotNull() override { return InvertedIndexTantivy<std::string>::IsNotNull(); }
     // for string/varchar type
     explicit NgramInvertedIndex(const storage::FileManagerContext& ctx,
                                 const NgramParams& params);
@@ -71,7 +74,7 @@ class NgramInvertedIndex : public InvertedIndexTantivy<std::string> {
     // Check if literal can be handled by ngram index (length >= min_gram)
     bool
     CanHandleLiteral(const std::string& literal,
-                     proto::plan::OpType op_type) const;
+                     proto::plan::OpType op_type) const override;
 
     // Phase1: Execute ngram index query, AND-merge result into candidates
     // Requires: CanHandleLiteral(literal, op_type) == true
@@ -80,7 +83,7 @@ class NgramInvertedIndex : public InvertedIndexTantivy<std::string> {
     void
     ExecutePhase1(const std::string& literal,
                   proto::plan::OpType op_type,
-                  TargetBitmap& candidates);
+                  TargetBitmap& candidates) override;
 
     // Phase2: Execute post-filter verification on a specific range
     // - segment_offset: starting position in segment
@@ -93,7 +96,7 @@ class NgramInvertedIndex : public InvertedIndexTantivy<std::string> {
                   exec::SegmentExpr* segment,
                   TargetBitmap& candidates,
                   int64_t segment_offset,
-                  int64_t batch_size);
+                  int64_t batch_size) override;
 
     ScalarIndexType
     GetIndexType() const override {

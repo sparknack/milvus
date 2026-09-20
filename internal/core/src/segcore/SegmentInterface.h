@@ -300,10 +300,10 @@ class SegmentInterface {
                     const int64_t* offsets,
                     int64_t count) const = 0;
 
-    virtual PinWrapper<index::NgramInvertedIndex*>
+    virtual PinWrapper<index::NgramIndexBase*>
     GetNgramIndex(milvus::OpContext* op_ctx, FieldId field_id) const = 0;
 
-    virtual PinWrapper<index::NgramInvertedIndex*>
+    virtual PinWrapper<index::NgramIndexBase*>
     GetNgramIndexForJson(milvus::OpContext* op_ctx,
                          FieldId field_id,
                          const std::string& nested_path) const = 0;
@@ -683,10 +683,10 @@ class SegmentInternalInterface : public SegmentInterface {
     PinWrapper<index::TextMatchIndexBase*>
     GetTextIndex(milvus::OpContext* op_ctx, FieldId field_id) const override;
 
-    PinWrapper<index::NgramInvertedIndex*>
+    PinWrapper<index::NgramIndexBase*>
     GetNgramIndex(milvus::OpContext* op_ctx, FieldId field_id) const override;
 
-    PinWrapper<index::NgramInvertedIndex*>
+    PinWrapper<index::NgramIndexBase*>
     GetNgramIndexForJson(milvus::OpContext* op_ctx,
                          FieldId field_id,
                          const std::string& nested_path) const override;

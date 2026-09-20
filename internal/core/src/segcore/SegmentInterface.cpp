@@ -981,18 +981,18 @@ SegmentInternalInterface::bulk_subscript_not_exist_field(
 }
 
 // Only sealed segment has ngram index
-PinWrapper<index::NgramInvertedIndex*>
+PinWrapper<index::NgramIndexBase*>
 SegmentInternalInterface::GetNgramIndex(milvus::OpContext* op_ctx,
                                         FieldId field_id) const {
-    return PinWrapper<index::NgramInvertedIndex*>(nullptr);
+    return PinWrapper<index::NgramIndexBase*>(nullptr);
 }
 
-PinWrapper<index::NgramInvertedIndex*>
+PinWrapper<index::NgramIndexBase*>
 SegmentInternalInterface::GetNgramIndexForJson(
     milvus::OpContext* op_ctx,
     FieldId field_id,
     const std::string& nested_path) const {
-    return PinWrapper<index::NgramInvertedIndex*>(nullptr);
+    return PinWrapper<index::NgramIndexBase*>(nullptr);
 }
 
 std::shared_ptr<index::JsonKeyStats>

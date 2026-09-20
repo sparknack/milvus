@@ -51,11 +51,11 @@ class SegmentSealed : public SegmentInternalInterface {
                const int64_t* ids,
                int64_t count) const = 0;
 
-    virtual PinWrapper<index::NgramInvertedIndex*>
+    virtual PinWrapper<index::NgramIndexBase*>
     GetNgramIndex(milvus::OpContext* op_ctx,
                   FieldId field_id) const override = 0;
 
-    virtual PinWrapper<index::NgramInvertedIndex*>
+    virtual PinWrapper<index::NgramIndexBase*>
     GetNgramIndexForJson(milvus::OpContext* op_ctx,
                          FieldId field_id,
                          const std::string& nested_path) const override = 0;

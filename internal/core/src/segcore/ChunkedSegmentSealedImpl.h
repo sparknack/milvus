@@ -253,10 +253,10 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     std::shared_ptr<index::JsonKeyStats>
     GetJsonStats(milvus::OpContext* op_ctx, FieldId field_id) const override;
 
-    PinWrapper<index::NgramInvertedIndex*>
+    PinWrapper<index::NgramIndexBase*>
     GetNgramIndex(milvus::OpContext* op_ctx, FieldId field_id) const override;
 
-    PinWrapper<index::NgramInvertedIndex*>
+    PinWrapper<index::NgramIndexBase*>
     GetNgramIndexForJson(milvus::OpContext* op_ctx,
                          FieldId field_id,
                          const std::string& nested_path) const override;

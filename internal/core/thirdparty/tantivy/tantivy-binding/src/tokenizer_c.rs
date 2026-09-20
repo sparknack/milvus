@@ -78,3 +78,15 @@ pub extern "C" fn tantivy_set_analyzer_options(params: *const c_char) -> RustRes
         |_| RustResult::from_success(),
     )
 }
+
+/// Reuse the sealed ngram writer's tokenizer through the existing token-stream API.
+#[no_mangle]
+pub extern "C" fn tantivy_create_ngram_analyzer(min_gram: usize, max_gram: usize) -> RustResult {
+    match tantivy::tokenizer::NgramTokenizer::new(min_gram, max_gram, false) {
+        Ok(tokenizer) => RustResult::from_ptr(create_binding(TextAnalyzer::builder(tokenizer).build())),
+        Err(err) => {
+            let err: crate::error::TantivyBindingError = err.into();
+            RustResult::from_binding_error_msg(&err, format!("create ngram tokenizer failed: {}", err))
+        }
+    }
+}
