@@ -15,6 +15,7 @@
 // limitations under the License.
 
 #include "index/KnowhereSparsePostingCodec.h"
+#include "index/KnowherePoCIO.h"
 
 #include <algorithm>
 #include <cstring>
@@ -99,6 +100,100 @@ KnowhereSparsePostingCodec::Append(const uint32_t* ids,
         if (b + 1 < blocks)
             WriteWord(out, ends + b * 4, out.size() - start);
     }
+}
+
+std::array<uint32_t, KnowhereSparsePostingCodec::kBlockSize>
+KnowhereSparsePostingCodec::DecodeChecked(std::span<const uint8_t> bytes,
+                                          size_t count,
+                                          Format format) {
+    using poc_io::Check;
+    Check(count > 0 && count <= kBlockSize, "invalid persisted block count");
+    Check(format == Format::Adaptive || format == Format::StreamVByte,
+          "unknown persisted block codec");
+    size_t offset = 0;
+    auto byte = [&]() {
+        Check(offset < bytes.size(), "truncated persisted block header");
+        return bytes[offset++];
+    };
+    auto skip = [&](size_t length) {
+        Check(length <= bytes.size() - offset,
+              "truncated persisted block payload");
+        offset += length;
+    };
+    auto streamvbyte = [&]() {
+        const size_t controls = (count + 3) / 4;
+        Check(controls <= bytes.size() - offset,
+              "truncated streamvbyte controls");
+        const auto begin = offset;
+        skip(controls);
+        constexpr size_t lengths[4] = {0, 1, 2, 4};
+        size_t payload = 0;
+        for (size_t i = 0; i < count; ++i)
+            payload += lengths[(bytes[begin + i / 4] >> (2 * (i % 4))) & 3];
+        skip(payload);
+    };
+    if (format == Format::StreamVByte) {
+        streamvbyte();
+    } else {
+        const uint8_t tag = byte();
+        if (tag <= 32) {
+            skip((count * tag + 7) / 8);
+        } else if (tag >= 33 && tag <= 35) {
+            skip(size_t{1} << (tag - 33));
+        } else if (tag == 36) {
+            streamvbyte();
+        } else if (tag == 37) {
+            const uint8_t token = byte(), bits = token & 31,
+                          exceptions = token >> 5;
+            if (bits) {
+                skip((count * bits + 7) / 8);
+            } else {
+                // PFor uses ordinary continuation-high-bit vint (unlike the
+                // outer posting count's stop-high-bit encoding).
+                for (unsigned group = 0;; ++group) {
+                    Check(group < 5, "overflowing adaptive base vint");
+                    const uint8_t value = byte();
+                    Check(group < 4 || (value & 0xf0) == 0,
+                          "overflowing adaptive base vint");
+                    if (!(value & 128))
+                        break;
+                }
+            }
+            int previous = -1;
+            for (unsigned i = 0; i < exceptions; ++i) {
+                const auto position = byte(), patch = byte();
+                Check(position < count && position > previous,
+                      "invalid adaptive exception position");
+                Check(patch != 0 && (uint64_t(patch) << bits) <= UINT32_MAX,
+                      "overflowing adaptive exception patch");
+                previous = position;
+            }
+        } else {
+            Check(false, "unknown adaptive encoding tag");
+        }
+    }
+    Check(offset == bytes.size(), "trailing persisted block bytes");
+    // The bounded structural pass precedes every trusted pointer-only decode.
+    // A private padded copy also makes an isolated last block SIMD-readable.
+    // Worst-case block is the adaptive streamvbyte tag + one control byte
+    // per four integers + four payload bytes per integer. Avoid allocating a
+    // temporary vector for each validated block during index loading.
+    constexpr size_t max_block_bytes = 1 + (kBlockSize + 3) / 4 + 4 * kBlockSize;
+    Check(bytes.size() <= max_block_bytes, "persisted block exceeds codec bound");
+    std::array<uint8_t, max_block_bytes + kPadding> padded{};
+    std::copy(bytes.begin(), bytes.end(), padded.begin());
+    std::array<uint32_t, kBlockSize> output{};
+    const uint8_t* end;
+    if (format == Format::Adaptive) {
+        end = knowhere::sparse::inverted::AdaptiveBlockCodec{}.decode(
+            padded.data(), output.data(), count);
+    } else {
+        end = padded.data() +
+              streamvbyte_decode_0124(padded.data(), output.data(), count);
+    }
+    Check(end == padded.data() + bytes.size(),
+          "persisted decoder length mismatch");
+    return output;
 }
 
 KnowhereSparsePostingCodec::View::View(const uint8_t* data, Format format)

@@ -29,6 +29,7 @@
 
 #include "common/EasyAssert.h"
 #include "index/KnowhereSparsePostingCodec.h"
+#include "index/KnowherePoCIO.h"
 
 namespace milvus::index {
 // Experimental heap-only scalar backend. Only the UT builder creates one.
@@ -41,6 +42,190 @@ class InvertedIndexKnowhereCore {
         PostingFormat format = PostingFormat::StreamVByte)
         : format_(format) {
     }
+    PostingFormat
+    PostingFormatForPoC() const {
+        return format_;
+    }
+
+    // Persists the actual compressed bytes. Load validates them in place and
+    // never reconstructs postings from source values or a temporary map.
+    std::vector<uint8_t>
+    SerializeForPoC() const {
+        poc_io::Writer writer;
+        writer.U64(count_);
+        writer.U64(terms_.size());
+        for (size_t i = 0; i < terms_.size(); ++i) {
+            const T value = terms_[i];
+            if constexpr (std::is_same_v<T, std::string>)
+                writer.String(value);
+            else if constexpr (std::is_same_v<T, bool>)
+                writer.U8(value);
+            else if constexpr (std::is_same_v<T, float>)
+                writer.U32(std::bit_cast<uint32_t>(value));
+            else if constexpr (std::is_same_v<T, double>)
+                writer.U64(std::bit_cast<uint64_t>(value));
+            else
+                writer.U64(static_cast<std::make_unsigned_t<T>>(value));
+        }
+        for (const auto& meta : posting_metas_) {
+            writer.U64(meta.doc_stream_offset);
+            writer.U64(meta.doc_stream_length);
+            writer.U32(meta.doc_freq);
+            writer.U32(meta.format_version);
+        }
+        writer.U64(null_offsets_.size());
+        for (auto row : null_offsets_) writer.U32(row);
+        writer.Bytes(std::span<const uint8_t>(posting_bytes_.data(),
+                                              PostingLogicalBytes()));
+        return poc_io::Pack("KWPCCORE",
+                            poc_io::TypeTag<T>(),
+                            format_ == PostingFormat::Adaptive ? 1 : 0,
+                            writer.data);
+    }
+
+    void
+    LoadForPoC(std::span<const uint8_t> blob) {
+        using poc_io::Check;
+        uint32_t codec = 0;
+        poc_io::Reader reader(
+            poc_io::Unpack(blob, "KWPCCORE", poc_io::TypeTag<T>(), &codec));
+        Check(codec <= 1, "unknown persisted posting format");
+        Check(std::endian::native == std::endian::little,
+              "persisted posting codec requires little endian");
+        InvertedIndexKnowhereCore next(codec == 1 ? PostingFormat::Adaptive
+                                                  : PostingFormat::StreamVByte);
+        const uint64_t count = reader.U64(), term_count = reader.U64();
+        Check(count <= INT32_MAX && term_count <= UINT32_MAX,
+              "persisted core domain exceeds limits");
+        // Every entry has at least one term byte and 24 metadata bytes.
+        Check(term_count <= reader.Remaining() / 25,
+              "persisted term count exceeds payload");
+        next.count_ = count;
+        next.terms_.reserve(term_count);
+        for (size_t i = 0; i < term_count; ++i) {
+            T value;
+            if constexpr (std::is_same_v<T, std::string>) {
+                value = reader.String();
+                Check(value.find('\0') == std::string::npos,
+                      "persisted term contains NUL");
+            } else if constexpr (std::is_same_v<T, bool>) {
+                auto raw = reader.U8();
+                Check(raw <= 1, "invalid persisted bool term");
+                value = raw;
+            } else if constexpr (std::is_same_v<T, float>) {
+                value = std::bit_cast<float>(reader.U32());
+                Check(!std::isnan(value), "NaN in ordinary persisted core");
+            } else if constexpr (std::is_same_v<T, double>) {
+                value = std::bit_cast<double>(reader.U64());
+                Check(!std::isnan(value), "NaN in ordinary persisted core");
+            } else {
+                using Unsigned = std::make_unsigned_t<T>;
+                auto raw = reader.U64();
+                Check(raw <= std::numeric_limits<Unsigned>::max(),
+                      "persisted integer term exceeds type width");
+                value = std::bit_cast<T>(static_cast<Unsigned>(raw));
+            }
+            Check(next.terms_.empty() || next.terms_.back() < value,
+                  "persisted terms are not strictly ordered");
+            next.terms_.push_back(std::move(value));
+        }
+        Check(term_count <= reader.Remaining() / 24,
+              "truncated persisted term metadata");
+        next.posting_metas_.reserve(term_count);
+        for (size_t i = 0; i < term_count; ++i) {
+            TermPostingMeta meta;
+            meta.doc_stream_offset = reader.U64();
+            meta.doc_stream_length = reader.U64();
+            meta.doc_freq = reader.U32();
+            meta.format_version = reader.U32();
+            Check(meta.format_version == 1 && meta.doc_freq > 0 &&
+                      meta.doc_freq <= count,
+                  "invalid persisted posting metadata");
+            next.posting_metas_.push_back(meta);
+        }
+        const uint64_t null_count = reader.U64();
+        Check(null_count <= count && null_count <= reader.Remaining() / 4,
+              "invalid persisted null count");
+        next.null_offsets_.reserve(null_count);
+        for (size_t i = 0; i < null_count; ++i) {
+            auto row = reader.U32();
+            Check(row < count && (next.null_offsets_.empty() ||
+                                  next.null_offsets_.back() < row),
+                  "invalid persisted null offset");
+            next.null_offsets_.push_back(row);
+        }
+        auto bytes = reader.Bytes();
+        reader.Finish();
+        uint64_t expected_offset = 0;
+        for (const auto& meta : next.posting_metas_) {
+            Check(meta.doc_stream_offset == expected_offset &&
+                      expected_offset <= bytes.size() &&
+                      meta.doc_stream_length <= bytes.size() - expected_offset,
+                  "persisted posting extent is invalid");
+            auto posting =
+                bytes.subspan(expected_offset, meta.doc_stream_length);
+            expected_offset += meta.doc_stream_length;
+            size_t header = 0;
+            uint32_t df = 0;
+            for (unsigned group = 0;; ++group) {
+                Check(group < 5 && header < posting.size(),
+                      "invalid persisted posting count vint");
+                const auto byte = posting[header++];
+                Check(group < 4 || (byte & 0x78) == 0,
+                      "overflowing persisted posting count");
+                df |= uint32_t(byte & 127) << (group * 7);
+                if (byte & 128)
+                    break;
+            }
+            Check(df == meta.doc_freq, "persisted posting DF mismatch");
+            const size_t blocks = (size_t(df) + 255) / 256;
+            const size_t directory = (2 * blocks - 1) * 4;
+            Check(directory <= posting.size() - header,
+                  "truncated persisted block directory");
+            auto word = [&](size_t position) {
+                poc_io::Reader word_reader(posting.subspan(position, 4));
+                return word_reader.U32();
+            };
+            const size_t data_begin = header + directory;
+            const size_t data_size = posting.size() - data_begin;
+            size_t start = 0;
+            uint64_t next_id = 0;
+            for (size_t block = 0; block < blocks; ++block) {
+                const uint64_t end =
+                    block + 1 == blocks ? data_size
+                                        : word(header + blocks * 4 + block * 4);
+                Check(end > start && end <= data_size,
+                      "invalid persisted block extent");
+                const size_t n = std::min<size_t>(256, df - block * 256);
+                auto gaps = KnowhereSparsePostingCodec::DecodeChecked(
+                    posting.subspan(data_begin + start, end - start),
+                    n,
+                    next.format_);
+                uint32_t last = 0;
+                for (size_t j = 0; j < n; ++j) {
+                    const uint64_t id = next_id + gaps[j];
+                    Check(id < count, "persisted document ID out of range");
+                    Check(!std::binary_search(next.null_offsets_.begin(),
+                                              next.null_offsets_.end(),
+                                              id),
+                          "persisted posting contains NULL row");
+                    last = id;
+                    next_id = id + 1;
+                }
+                Check(last == word(header + block * 4),
+                      "persisted block maximum mismatch");
+                start = end;
+            }
+        }
+        Check(expected_offset == bytes.size(),
+              "unreferenced persisted posting bytes");
+        next.posting_bytes_.assign(bytes.begin(), bytes.end());
+        next.posting_bytes_.resize(
+            next.posting_bytes_.size() + KnowhereSparsePostingCodec::kPadding,
+            0);
+        *this = std::move(next);
+    }
+
     size_t
     PostingLogicalBytes() const {
         return posting_bytes_.size() >= KnowhereSparsePostingCodec::kPadding

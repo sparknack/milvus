@@ -18,11 +18,12 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace milvus::index {
-// Resident, immutable after publication. Trusted builder output only; not a
-// persisted-file parser. Flat streams shared by all terms; offsets are bytes.
+// Resident, immutable after publication. LoadForPoC validates persisted streams
+// before publication. Flat streams are shared by all terms; offsets are bytes.
 class KnowherePositionIndex {
  public:
     struct Term {
@@ -45,6 +46,13 @@ class KnowherePositionIndex {
     ByteSize() const;
     size_t
     LogicalBytes() const;
+
+    // Private, versioned PoC format; no production index registration.
+    std::vector<uint8_t>
+    SerializeForPoC() const;
+    void
+    LoadForPoC(std::span<const uint8_t> bytes,
+               const std::vector<uint32_t>& expected_dfs);
 
     class Reader {
      public:

@@ -15,8 +15,10 @@
 // limitations under the License.
 
 #pragma once
-#include "index/NgramIndexKnowhere.h"
+#include "common/FieldData.h"
 #include "index/JsonIndexBuilder.h"
+#include "index/JsonKnowherePoCIO.h"
+#include "index/NgramIndexKnowhere.h"
 
 namespace milvus::index {
 // One explicitly selected JSON string path, not a flattened whole-JSON index.
@@ -27,9 +29,37 @@ class JsonNgramIndexKnowhere : public NgramIndexKnowhere {
                            std::string path,
                            proto::schema::FieldSchema schema)
         : NgramIndexKnowhere(min_gram, max_gram),
+          min_gram_(min_gram),
           max_gram_(max_gram),
           path_(std::move(path)),
           schema_(std::move(schema)) {
+    }
+
+    std::vector<uint8_t>
+    SerializeForPoC() const override {
+        poc_io::Writer out;
+        out.String(path_);
+        out.String(schema_.SerializeAsString());
+        out.U64(max_gram_);
+        out.Bytes(NgramIndexKnowhere::SerializeForPoC());
+        return poc_io::Pack(
+            "KWJSONN1", poc_io::TypeTag<std::string>(), 0, out.data);
+    }
+    void
+    LoadForPoC(std::span<const uint8_t> bytes) override {
+        uint32_t codec = 0;
+        poc_io::Reader in(poc_io::Unpack(
+            bytes, "KWJSONN1", poc_io::TypeTag<std::string>(), &codec));
+        poc_io::Check(codec == 0, "unsupported JSON wrapper codec");
+        poc_io::Check(in.String() == path_, "JSON ngram path mismatch");
+        json_poc_io::CheckSchema(in, schema_);
+        poc_io::Check(in.U64() == max_gram_, "JSON ngram max gram mismatch");
+        const auto base_bytes = in.Bytes();
+        in.Finish();
+        NgramIndexKnowhere staged(min_gram_, max_gram_);
+        staged.LoadForPoC(base_bytes);
+        this->SwapStateForPoC(staged);
+        ComputeByteSize();
     }
 
     void
@@ -125,6 +155,7 @@ class JsonNgramIndexKnowhere : public NgramIndexKnowhere {
     }
 
  private:
+    size_t min_gram_;
     size_t max_gram_;
     std::string path_;
     proto::schema::FieldSchema schema_;

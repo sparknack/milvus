@@ -16,6 +16,7 @@
 #pragma once
 #include "index/InvertedIndexKnowhere.h"
 #include "index/JsonFlatIndexBase.h"
+#include "index/KnowherePoCAdapterIO.h"
 #include "common/Json.h"
 #include <atomic>
 #include <map>
@@ -419,6 +420,186 @@ class JsonFlatIndexKnowhere : public InvertedIndexKnowhere<std::string>,
         : InvertedIndexKnowhere<std::string>(
               KnowhereSparsePostingCodec::Format::Adaptive),
           root_path_(std::move(root_path)) {
+    }
+    std::vector<uint8_t>
+    SerializeForPoC() const override {
+        poc_io::Writer writer;
+        writer.String(root_path_);
+        writer.U64(snapshot_ ? snapshot_->rows : 0);
+        if (snapshot_)
+            poc_io::WriteBitmap(writer, snapshot_->row_valid);
+        else
+            poc_io::WriteBitmap(writer, TargetBitmap(0));
+        writer.U64(snapshot_ ? snapshot_->paths.size() : 0);
+        if (snapshot_) {
+            for (const auto& [path, store] : snapshot_->paths) {
+                writer.String(path);
+                writer.U8(store->scalar_single_value);
+                poc_io::WriteBitmap(writer, store->exists);
+                poc_io::WriteBitmap(writer, store->arrays);
+                poc_io::WriteBitmap(writer, store->scalar_bool);
+                poc_io::WriteBitmap(writer, store->scalar_numeric);
+                poc_io::WriteBitmap(writer, store->scalar_string);
+                auto columns = [&](const knowhere_json_flat::Columns& values) {
+                    writer.Bytes(values.booleans.core.SerializeForPoC());
+                    writer.Bytes(values.integers.core.SerializeForPoC());
+                    writer.Bytes(values.unsigneds.core.SerializeForPoC());
+                    writer.Bytes(values.doubles.core.SerializeForPoC());
+                    writer.Bytes(values.strings.core.SerializeForPoC());
+                };
+                columns(store->scalar);
+                columns(store->elements);
+            }
+        }
+        return poc_io::Pack("KHJFLAT1", 1, 1, writer.data);
+    }
+    void
+    LoadForPoC(std::span<const uint8_t> bytes) override {
+        using poc_io::Check;
+        uint32_t codec = 0;
+        poc_io::Reader reader(poc_io::Unpack(bytes, "KHJFLAT1", 1, &codec));
+        Check(codec == 1, "JSON flat persistence requires adaptive format");
+        const auto root = reader.String();
+        auto canonical = [](std::string_view path) {
+            if (!path.empty() && path.front() != '/')
+                return false;
+            for (size_t i = 0; i < path.size(); ++i) {
+                if (path[i] != '~')
+                    continue;
+                if (++i == path.size() || (path[i] != '0' && path[i] != '1'))
+                    return false;
+            }
+            return true;
+        };
+        Check(canonical(root) && root == root_path_,
+              "JSON flat persisted root mismatch");
+        auto next = std::make_shared<knowhere_json_flat::Snapshot>();
+        const auto rows = reader.U64();
+        Check(rows <= INT32_MAX,
+              "JSON flat persisted row domain exceeds limit");
+        next->rows = rows;
+        next->row_valid = poc_io::ReadBitmap(reader);
+        Check(next->row_valid.size() == rows,
+              "JSON flat row validity domain mismatch");
+        const uint64_t path_count = reader.U64();
+        // Each path requires a string length, flag, five bitmap headers and
+        // ten length-prefixed core envelopes. Bound before allocating entries.
+        Check(path_count <= reader.Remaining() / (8 + 1 + 5 * 16 + 10 * 44),
+              "JSON flat path count exceeds payload");
+        std::string previous;
+        for (size_t i = 0; i < path_count; ++i) {
+            auto path = reader.String();
+            Check(canonical(path) && (i == 0 ? path.empty() : previous < path),
+                  "JSON flat paths must be canonical, ordered and rooted");
+            previous = path;
+            auto store = std::make_shared<knowhere_json_flat::Path>(0);
+            const auto single = reader.U8();
+            Check(single <= 1, "invalid JSON flat single-value flag");
+            store->scalar_single_value = single;
+            store->exists = poc_io::ReadBitmap(reader);
+            store->arrays = poc_io::ReadBitmap(reader);
+            store->scalar_bool = poc_io::ReadBitmap(reader);
+            store->scalar_numeric = poc_io::ReadBitmap(reader);
+            store->scalar_string = poc_io::ReadBitmap(reader);
+            for (const auto* mask : {&store->exists,
+                                     &store->arrays,
+                                     &store->scalar_bool,
+                                     &store->scalar_numeric,
+                                     &store->scalar_string}) {
+                poc_io::CheckSubset(*mask,
+                                    next->row_valid,
+                                    "JSON flat mask exceeds valid rows");
+            }
+            TargetBitmap scalar_seen(rows);
+            bool duplicate_scalar = false;
+            auto column = [&](auto& values, bool scalar) {
+                values.core.LoadForPoC(reader.Bytes());
+                Check(values.core.Count() == rows &&
+                          values.core.IsNull().count() == 0 &&
+                          values.core.PostingFormatForPoC() ==
+                              KnowhereSparsePostingCodec::Format::Adaptive,
+                      "JSON flat column domain/format mismatch");
+                TargetBitmap coverage(rows);
+                for (size_t term = 0; term < values.core.TermCount(); ++term) {
+                    values.core.ForEachDoc(term, [&](size_t row) {
+                        coverage.set(row);
+                        if (scalar) {
+                            duplicate_scalar |= bool(scalar_seen[row]);
+                            scalar_seen.set(row);
+                        }
+                    });
+                }
+                // Prefix sums are query acceleration metadata, reconstructed
+                // from validated DF without rebuilding/recompressing postings.
+                using Value =
+                    std::decay_t<decltype(values.pending.begin()->first)>;
+                if constexpr (std::is_arithmetic_v<Value> &&
+                              !std::is_same_v<Value, bool>) {
+                    values.docfreq_prefix.reserve(values.core.TermCount() + 1);
+                    values.docfreq_prefix.push_back(0);
+                    for (size_t term = 0; term < values.core.TermCount();
+                         ++term) {
+                        Check(values.core.DocFreq(term) <=
+                                  SIZE_MAX - values.docfreq_prefix.back(),
+                              "JSON flat DF prefix overflow");
+                        values.docfreq_prefix.push_back(
+                            values.docfreq_prefix.back() +
+                            values.core.DocFreq(term));
+                    }
+                }
+                poc_io::CheckSubset(coverage,
+                                    scalar ? store->exists : store->arrays,
+                                    "JSON flat posting shape/exists mismatch");
+                if (!scalar)
+                    poc_io::CheckSubset(coverage,
+                                        store->exists,
+                                        "JSON flat array term is absent");
+                return coverage;
+            };
+            auto scalar_bool = column(store->scalar.booleans, true);
+            auto scalar_numeric = column(store->scalar.integers, true);
+            scalar_numeric |= column(store->scalar.unsigneds, true);
+            scalar_numeric |= column(store->scalar.doubles, true);
+            auto scalar_string = column(store->scalar.strings, true);
+            poc_io::CheckEqual(scalar_bool,
+                               store->scalar_bool,
+                               "JSON flat boolean validity mismatch");
+            poc_io::CheckEqual(scalar_numeric,
+                               store->scalar_numeric,
+                               "JSON flat numeric validity mismatch");
+            poc_io::CheckEqual(scalar_string,
+                               store->scalar_string,
+                               "JSON flat string validity mismatch");
+            Check(!single || !duplicate_scalar,
+                  "JSON flat scalar flag hides multiple values");
+            for (size_t row = 0; row < rows; ++row) {
+                Check(unsigned(bool(scalar_bool[row])) +
+                              unsigned(bool(scalar_numeric[row])) +
+                              unsigned(bool(scalar_string[row])) +
+                              unsigned(bool(store->arrays[row])) <=
+                          1,
+                      "JSON flat scalar and array shapes overlap");
+            }
+            column(store->elements.booleans, false);
+            column(store->elements.integers, false);
+            column(store->elements.unsigneds, false);
+            column(store->elements.doubles, false);
+            column(store->elements.strings, false);
+            next->paths.emplace(std::move(path), std::move(store));
+        }
+        reader.Finish();
+        for (const auto& [path, store] : next->paths) {
+            if (path.empty())
+                continue;
+            auto parent = next->paths.find(path.substr(0, path.rfind('/')));
+            Check(parent != next->paths.end(),
+                  "JSON flat persisted path has no parent");
+            poc_io::CheckSubset(store->exists,
+                                parent->second->exists,
+                                "JSON flat child exists outside parent");
+        }
+        snapshot_ = std::move(next);
+        ComputeByteSize();
     }
     std::string
     GetNestedPath() const override {

@@ -15,6 +15,7 @@
 // limitations under the License.
 
 #pragma once
+#include "index/KnowherePoCAdapterIO.h"
 #include <map>
 #include <memory>
 #include "index/TextMatchIndexBase.h"
@@ -29,6 +30,51 @@ namespace milvus::index {
 // term dictionary, docID compression and query execution are independent.
 class TextMatchIndexKnowhere final : public TextMatchIndexBase {
  public:
+    std::vector<uint8_t>
+    SerializeForPoC() const {
+        poc_io::Writer w;
+        w.String(analyzer_params_);
+        w.Bytes(core_.SerializeForPoC());
+        auto terms = dictionary_.Enumerate();
+        w.U64(terms.size());
+        for (const auto& [term, id] : terms) w.String(term);
+        w.Bytes(positions_.SerializeForPoC());
+        return poc_io::Pack("KTEXT001", 3, 0, w.data);
+    }
+    void
+    LoadForPoC(std::span<const uint8_t> bytes) {
+        poc_io::Reader r(poc_io::UnpackAdapter(bytes, "KTEXT001", 3));
+        auto params = r.String();
+        // Schema/analyzer binding is supplied by the segment, like other PoC
+        // adapter configuration. Refuse a snapshot for a different analyzer.
+        poc_io::Check(params == analyzer_params_, "text analyzer configuration mismatch");
+        Core next;
+        next.LoadForPoC(r.Bytes());
+        const auto count = r.U64();
+        poc_io::Check(count == next.TermCount() && count <= r.Remaining() / 8,
+                      "text dictionary count mismatch");
+        std::vector<std::string> terms;
+        std::vector<uint32_t> dfs;
+        terms.reserve(count);
+        dfs.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            terms.push_back(r.String());
+            poc_io::Check(next.Term(i) == i &&
+                          (i == 0 || terms[i-1] < terms[i]) &&
+                          terms[i].find('\0') == std::string::npos,
+                          "invalid text dictionary ordinal/order");
+            dfs.push_back(next.DocFreq(i));
+        }
+        auto dictionary = FstTermDictionary::Build(terms);
+        KnowherePositionIndex positions;
+        positions.LoadForPoC(r.Bytes(), dfs);
+        r.Finish();
+        format_ = next.PostingFormatForPoC();
+        core_ = std::move(next);
+        dictionary_ = std::move(dictionary);
+        positions_ = std::move(positions);
+    }
+
     using Core = InvertedIndexKnowhereCore<uint32_t, TargetBitmap, OpType>;
     explicit TextMatchIndexKnowhere(
         const std::string& analyzer_params = "{}",
@@ -37,7 +83,8 @@ class TextMatchIndexKnowhere final : public TextMatchIndexBase {
         : analyzer_(std::make_unique<milvus::tantivy::Tokenizer>(
               std::string(analyzer_params))),
           core_(format),
-          format_(format) {
+          format_(format),
+          analyzer_params_(analyzer_params) {
     }
     void
     Build(size_t n,
@@ -335,6 +382,7 @@ class TextMatchIndexKnowhere final : public TextMatchIndexBase {
     std::unique_ptr<milvus::tantivy::Tokenizer> analyzer_;
     Core core_;
     KnowhereSparsePostingCodec::Format format_;
+    std::string analyzer_params_;
     FstTermDictionary dictionary_;
     KnowherePositionIndex positions_;
 };

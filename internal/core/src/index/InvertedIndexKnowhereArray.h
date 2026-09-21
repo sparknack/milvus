@@ -14,6 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #pragma once
+#include "index/KnowherePoCAdapterIO.h"
 #include "index/InvertedIndexKnowhere.h"
 #include "index/ArrayConjunctionIndex.h"
 #include "common/Array.h"
@@ -54,6 +55,26 @@ class InvertedIndexKnowhereArray : public InvertedIndexKnowhere<T>,
                   "unsupported ARRAY scalar element type");
 
  public:
+    std::vector<uint8_t>
+    SerializeForPoC() const override {
+        poc_io::Writer w;
+        w.U8(nested_);
+        w.Bytes(InvertedIndexKnowhere<T>::SerializeForPoC());
+        return poc_io::Pack("KARRAY01", 2, 0, w.data);
+    }
+    void
+    LoadForPoC(std::span<const uint8_t> bytes) override {
+        poc_io::Reader r(poc_io::UnpackAdapter(bytes, "KARRAY01", 2));
+        poc_io::Check(r.U8() == uint8_t(nested_), "ARRAY row/element domain mismatch");
+        InvertedIndexKnowhere<T> next;
+        next.LoadForPoC(r.Bytes());
+        r.Finish();
+        if (nested_)
+            poc_io::Check(next.IsNotNull().count() == size_t(next.Count()),
+                          "nested ARRAY snapshot contains NULL elements");
+        this->SwapStateForPoC(next);
+    }
+
     explicit InvertedIndexKnowhereArray(bool nested = false)
         : InvertedIndexKnowhere<T>(
               KnowhereSparsePostingCodec::Format::Adaptive),

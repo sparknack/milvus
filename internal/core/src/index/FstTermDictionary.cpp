@@ -241,22 +241,112 @@ struct FuzzyState {
                (minimum <= limit || previous_minimum < limit);
     }
 };
+/*
+The MIT License (MIT)
+
+Copyright (c) 2015 yhirose
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+// Bytecode arc iteration adapted from cpp-fstlib (MIT),
+// Copyright (c) 2022 Yuji Hirose. The same opcode/output semantics are used,
+// but traversal keeps pending siblings on the heap and one mutable word buffer.
+// No call-stack frame or copied partial string is retained per token byte.
 class PatternFst : public fst::map<uint32_t> {
  public:
     using fst::map<uint32_t>::map;
+    template <typename Automaton>
+    void Visit(Automaton initial, const FstTermDictionary::Visitor& visitor,
+               std::string_view prefix = {}) const {
+        struct Frame {
+            uint32_t address;
+            size_t depth;
+            uint32_t output;
+            Automaton automaton;
+            const char* labels = nullptr;
+            size_t label_index = 0;
+        };
+        std::vector<Frame> stack;
+        stack.reserve(64);
+        stack.push_back({this->header_.start_address, 0, 0, std::move(initial)});
+        std::string word;
+        while (!stack.empty()) {
+            auto& frame = stack.back();
+            const char* end = this->byte_code_ + frame.address;
+            auto p = end;
+            const fst::FstOpe op(*p--);
+            if (op.has_jump_table()) {
+                size_t count = 0;
+                p -= fst::vb_decode_value_reverse(p, count);
+                p -= count * op.jump_table_element_size();
+                if (this->header_.flags.data.jump_table_labels) {
+                    frame.labels = p + 1 - count;
+                    frame.label_index = 0;
+                    p -= count;
+                }
+                frame.address -= std::distance(p, end);
+                continue;
+            }
+            const char arc = frame.labels ? frame.labels[frame.label_index++]
+                                          : this->read_arc(op, p);
+            uint32_t delta, hub;
+            bool has_hub;
+            this->read_delta(op, p, delta, hub, has_hub);
+            uint32_t suffix = 0, state_output = 0;
+            if (op.data.has_output)
+                p -= fst::OutputTraits<uint32_t>::read_byte_value(p, suffix);
+            if (this->header_.need_state_output && op.data.has_state_output)
+                p -= fst::OutputTraits<uint32_t>::read_byte_value(p, state_output);
+            const auto size = std::distance(p, end);
+            uint32_t child = 0;
+            if (op.data.no_address) child = frame.address - size;
+            else if (has_hub) child = hub;
+            else if (delta) child = frame.address - size - delta + 1;
+            const auto depth = frame.depth;
+            const auto output = frame.output + suffix;
+            auto automaton = frame.automaton;
+            // Advance/pop the parent before pushing a child: vector growth must
+            // never invalidate a still-live reference used by the traversal.
+            if (op.data.last_transition) stack.pop_back();
+            else frame.address -= size;
+            if (depth < prefix.size() && prefix[depth] != arc) continue;
+            automaton.step(arc);
+            word.resize(depth);
+            word.push_back(arc);
+            if (op.data.final && word.size() >= prefix.size() && automaton.is_match())
+                visitor(word, output + state_output);
+            if (child && automaton.can_match())
+                stack.push_back({child, word.size(), output, std::move(automaton)});
+        }
+    }
+    void Prefix(std::string_view prefix,
+                const FstTermDictionary::Visitor& visitor) const {
+        Visit(fst::DummyAutomaton(), visitor, prefix);
+    }
     void Fuzzy(const std::vector<uint32_t>& query, uint32_t edits,
                const FstTermDictionary::Visitor& visitor) const {
-        this->depth_first_visit(this->header_.start_address, std::string(),
-                                uint32_t{}, FuzzyState(query, edits), std::ref(visitor));
+        Visit(FuzzyState(query, edits), visitor);
     }
-    void
-    Like(const LikeProgram& program,
-         const FstTermDictionary::Visitor& visitor) const {
-        this->depth_first_visit(this->header_.start_address,
-                                std::string(),
-                                uint32_t{},
-                                LikeState(program),
-                                visitor);
+    void Like(const LikeProgram& program,
+              const FstTermDictionary::Visitor& visitor) const {
+        Visit(LikeState(program), visitor);
     }
 };
 struct Region {
@@ -431,10 +521,9 @@ FstTermDictionary::Enumerate() const {
     if (state_->empty_key)
         result.emplace_back("", 0);
     if (state_->reader) {
-        auto terms = state_->reader->predictive_search("");
-        result.insert(result.end(),
-                      std::make_move_iterator(terms.begin()),
-                      std::make_move_iterator(terms.end()));
+        state_->reader->Prefix("", [&](std::string_view term, uint32_t id) {
+            result.emplace_back(term, id);
+        });
     }
     std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) {
         return a.second < b.second;
@@ -450,7 +539,7 @@ FstTermDictionary::ForEachPrefix(std::string_view prefix,
     if (prefix.empty() && state_->empty_key)
         visitor("", 0);
     if (state_->reader)
-        state_->reader->predictive_search(prefix, visitor);
+        state_->reader->Prefix(prefix, visitor);
 }
 bool
 FstTermDictionary::ForEachLike(std::string_view pattern,

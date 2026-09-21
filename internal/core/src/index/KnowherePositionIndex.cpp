@@ -15,12 +15,13 @@
 // limitations under the License.
 
 #include "index/KnowherePositionIndex.h"
+#include "common/EasyAssert.h"
+#include "index/KnowherePoCIO.h"
+#include "index/KnowhereSparsePostingCodec.h"
+#include "index/sparse/codec/adaptive.h"
 #include <algorithm>
 #include <limits>
 #include <numeric>
-#include "common/EasyAssert.h"
-#include "index/KnowhereSparsePostingCodec.h"
-#include "index/sparse/codec/adaptive.h"
 
 namespace milvus::index {
 thread_local KnowherePositionIndex::DecodeStats
@@ -119,6 +120,182 @@ KnowherePositionIndex::Reader::Read(size_t ordinal,
             output.push_back(position);
         }
     }
+}
+
+namespace {
+constexpr std::string_view kPositionMagic = "KHPOS001";
+constexpr uint32_t kPositionType = 1;
+constexpr uint32_t kPositionCodec = 1;  // Adaptive integer blocks.
+void
+PositionRequire(bool ok, const char* detail) {
+    if (!ok)
+        ThrowInfo(
+            ErrorCode::DataFormatBroken, "invalid PoC positions: {}", detail);
+}
+size_t
+PositionBlocks(uint64_t values) {
+    return values / 256 + (values % 256 != 0);
+}
+}  // namespace
+
+std::vector<uint8_t>
+KnowherePositionIndex::SerializeForPoC() const {
+    AssertInfo(sealed_, "cannot serialize unsealed positions");
+    poc_io::Writer out;
+    out.U64(terms_.size());
+    out.U64(doc_blocks_.size());
+    out.U64(position_offsets_.size());
+    for (const auto& term : terms_) {
+        out.U64(term.doc_block_begin);
+        out.U64(term.pos_block_begin);
+        out.U64(term.positions);
+        out.U32(term.docs);
+    }
+    for (const auto& block : doc_blocks_) {
+        out.U64(block.freq_offset);
+        out.U64(block.position_base);
+    }
+    for (auto offset : position_offsets_) out.U64(offset);
+    // SIMD over-read padding is an allocation detail, not persisted payload.
+    out.Bytes(
+        std::span(frequencies_)
+            .first(frequencies_.size() - KnowhereSparsePostingCodec::kPadding));
+    out.Bytes(
+        std::span(positions_)
+            .first(positions_.size() - KnowhereSparsePostingCodec::kPadding));
+    return poc_io::Pack(
+        kPositionMagic, kPositionType, kPositionCodec, out.data);
+}
+
+void
+KnowherePositionIndex::LoadForPoC(std::span<const uint8_t> bytes,
+                                  const std::vector<uint32_t>& expected_dfs) {
+    uint32_t codec;
+    const auto payload =
+        poc_io::Unpack(bytes, kPositionMagic, kPositionType, &codec);
+    PositionRequire(codec == kPositionCodec, "unsupported codec");
+    poc_io::Reader input(payload);
+    const auto terms = input.U64(), blocks = input.U64(), offsets = input.U64();
+    PositionRequire(terms == expected_dfs.size(),
+                    "term count differs from postings");
+    // Validate each count against the bytes remaining before allocating.
+    PositionRequire(terms <= input.Remaining() / 28, "term metadata truncated");
+    KnowherePositionIndex next;
+    next.terms_.reserve(terms);
+    uint64_t expected_blocks = 0, expected_offsets = 0;
+    for (size_t i = 0; i < terms; ++i) {
+        Term term{input.U64(), input.U64(), input.U64(), input.U32()};
+        PositionRequire(term.docs == expected_dfs[i] && term.docs <= INT32_MAX,
+                        "document frequency differs from postings");
+        PositionRequire(term.positions <= uint64_t(term.docs) * UINT32_MAX &&
+                            term.positions >= term.docs,
+                        "invalid total term frequency");
+        PositionRequire(term.doc_block_begin == expected_blocks &&
+                            term.pos_block_begin == expected_offsets,
+                        "non-contiguous term block ranges");
+        const auto db = PositionBlocks(term.docs),
+                   pb = PositionBlocks(term.positions);
+        PositionRequire(
+            expected_blocks <= blocks && db <= blocks - expected_blocks &&
+                expected_offsets <= offsets && pb <= offsets - expected_offsets,
+            "term block range exceeds metadata");
+        expected_blocks += db;
+        expected_offsets += pb;
+        next.terms_.push_back(term);
+    }
+    PositionRequire(expected_blocks == blocks && expected_offsets == offsets,
+                    "unowned blocks");
+    PositionRequire(blocks <= input.Remaining() / 16, "doc metadata truncated");
+    next.doc_blocks_.reserve(blocks);
+    for (size_t i = 0; i < blocks; ++i)
+        next.doc_blocks_.push_back({input.U64(), input.U64()});
+    PositionRequire(offsets <= input.Remaining() / 8,
+                    "position offsets truncated");
+    next.position_offsets_.reserve(offsets);
+    for (size_t i = 0; i < offsets; ++i)
+        next.position_offsets_.push_back(input.U64());
+    const auto freq_bytes = input.Bytes(), pos_bytes = input.Bytes();
+    input.Finish();
+    auto validate_offsets = [&](size_t count, auto offset_at, size_t size) {
+        PositionRequire((count == 0) == (size == 0),
+                        "empty block/stream mismatch");
+        if (!count)
+            return;
+        PositionRequire(offset_at(0) == 0, "unowned stream prefix");
+        for (size_t i = 0; i < count; ++i) {
+            const auto current = offset_at(i);
+            const uint64_t end = i + 1 < count ? offset_at(i + 1) : size;
+            PositionRequire(current < end && end <= size,
+                            "invalid block byte interval");
+        }
+    };
+    validate_offsets(
+        blocks,
+        [&](size_t i) { return next.doc_blocks_[i].freq_offset; },
+        freq_bytes.size());
+    validate_offsets(
+        offsets,
+        [&](size_t i) { return next.position_offsets_[i]; },
+        pos_bytes.size());
+    auto checked_freq = [&](size_t index, size_t n) {
+        const auto begin = next.doc_blocks_[index].freq_offset;
+        const auto end = index + 1 < blocks
+                             ? next.doc_blocks_[index + 1].freq_offset
+                             : freq_bytes.size();
+        return KnowhereSparsePostingCodec::DecodeChecked(
+            freq_bytes.subspan(begin, end - begin),
+            n,
+            KnowhereSparsePostingCodec::Format::Adaptive);
+    };
+    auto checked_pos = [&](size_t index, size_t n) {
+        const auto begin = next.position_offsets_[index];
+        const auto end = index + 1 < offsets ? next.position_offsets_[index + 1]
+                                             : pos_bytes.size();
+        return KnowhereSparsePostingCodec::DecodeChecked(
+            pos_bytes.subspan(begin, end - begin),
+            n,
+            KnowhereSparsePostingCodec::Format::Adaptive);
+    };
+    // Validate with bounded block decoders before any trusted Reader is exposed.
+    // Only two 256-value buffers are needed, even for a huge/high-TF term.
+    for (const auto& term : next.terms_) {
+        uint64_t consumed = 0;
+        size_t decoded_position_block = SIZE_MAX;
+        std::array<uint32_t, 256> deltas{};
+        for (size_t b = 0; b < PositionBlocks(term.docs); ++b) {
+            const auto global = term.doc_block_begin + b;
+            PositionRequire(
+                next.doc_blocks_[global].position_base == consumed,
+                "doc block position base differs from frequency prefix");
+            const size_t count = std::min<size_t>(256, term.docs - b * 256);
+            const auto frequencies = checked_freq(global, count);
+            for (size_t d = 0; d < count; ++d) {
+                const auto frequency = frequencies[d];
+                PositionRequire(
+                    frequency > 0 && frequency <= term.positions - consumed,
+                    "frequency sum differs from position count");
+                uint64_t position = 0;
+                for (uint32_t j = 0; j < frequency; ++j, ++consumed) {
+                    const auto pb = consumed / 256;
+                    if (decoded_position_block != pb) {
+                        deltas = checked_pos(
+                            term.pos_block_begin + pb,
+                            std::min<uint64_t>(256, term.positions - pb * 256));
+                        decoded_position_block = pb;
+                    }
+                    position += deltas[consumed % 256];
+                    PositionRequire(position <= UINT32_MAX,
+                                    "document token position overflows uint32");
+                }
+            }
+        }
+        PositionRequire(consumed == term.positions, "unused term positions");
+    }
+    next.frequencies_.assign(freq_bytes.begin(), freq_bytes.end());
+    next.positions_.assign(pos_bytes.begin(), pos_bytes.end());
+    next.Seal();
+    // Publication is atomic with respect to load failure: old index untouched.
+    *this = std::move(next);
 }
 
 // The span matcher below is adapted from Tantivy (MIT):

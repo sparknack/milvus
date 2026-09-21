@@ -15,6 +15,7 @@
 // limitations under the License.
 
 #pragma once
+#include "index/KnowherePoCAdapterIO.h"
 #include "index/ScalarIndex.h"
 #include "index/InvertedIndexKnowhereCore.h"
 #include "index/InvertedIndexUtil.h"
@@ -26,6 +27,37 @@ namespace milvus::index {
 template <typename T>
 class InvertedIndexKnowhere : public ScalarIndex<T> {
  public:
+    virtual std::vector<uint8_t>
+    SerializeForPoC() const {
+        poc_io::Writer w;
+        w.Bytes(core_.SerializeForPoC());
+        return poc_io::Pack("KSCLIDX1", 1, 0, w.data);
+    }
+    virtual void
+    LoadForPoC(std::span<const uint8_t> bytes) {
+        poc_io::Reader r(poc_io::UnpackAdapter(bytes, "KSCLIDX1", 1));
+        Core next;
+        next.LoadForPoC(r.Bytes());
+        r.Finish();
+        const auto format = next.PostingFormatForPoC();
+        PublishCore(std::move(next));
+        format_ = format;
+    }
+
+ protected:
+    // Derived adapters validate a complete staged base before committing their
+    // own masks/configuration. This swap cannot invoke virtual publication.
+    void
+    SwapStateForPoC(InvertedIndexKnowhere& other) noexcept {
+        using std::swap;
+        swap(core_, other.core_);
+        swap(format_, other.format_);
+        swap(dictionary_, other.dictionary_);
+        swap(this->cached_byte_size_, other.cached_byte_size_);
+    }
+
+ public:
+
     using Core = InvertedIndexKnowhereCore<T, TargetBitmap, OpType>;
     using ScalarIndex<T>::IsNotNull;
     explicit InvertedIndexKnowhere(
@@ -229,13 +261,12 @@ class InvertedIndexKnowhere : public ScalarIndex<T> {
                   "Knowhere scalar PoC does not support Reverse_Lookup");
     }
     BinarySet
-    Serialize(const Config&) override {
-        ThrowInfo(Unsupported,
-                  "Knowhere scalar PoC does not support Serialize");
+    Serialize(const Config& = {}) override {
+        return poc_io::ToBinarySet(SerializeForPoC());
     }
     void
-    Load(const BinarySet&, const Config& = {}) override {
-        ThrowInfo(Unsupported, "Knowhere scalar PoC does not support Load");
+    Load(const BinarySet& set, const Config& = {}) override {
+        LoadForPoC(poc_io::FromBinarySet(set));
     }
     void
     Load(tracer::TraceContext, const Config& = {}) override {

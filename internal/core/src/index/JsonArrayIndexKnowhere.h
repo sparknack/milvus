@@ -16,9 +16,10 @@
 
 #pragma once
 
+#include "index/ArrayConjunctionIndex.h"
 #include "index/InvertedIndexKnowhere.h"
 #include "index/JsonIndexBuilder.h"
-#include "index/ArrayConjunctionIndex.h"
+#include "index/JsonKnowherePoCIO.h"
 #include <map>
 
 namespace milvus::index {
@@ -47,6 +48,52 @@ class JsonArrayIndexKnowhere : public InvertedIndexKnowhere<T>,
         if (cast_type.ToString() != expected)
             ThrowInfo(Unsupported,
                       "JSON array cast must match its typed backend");
+    }
+
+    std::vector<uint8_t>
+    SerializeForPoC() const override {
+        poc_io::Writer out;
+        out.String(path_);
+        out.String(cast_type_.ToString());
+        out.String(schema_.SerializeAsString());
+        out.U8(cast_function_.match<double>());
+        out.Bytes(InvertedIndexKnowhere<T>::SerializeForPoC());
+        json_poc_io::WriteBitmap(out, valid_);
+        json_poc_io::WriteBitmap(out, exists_);
+        return poc_io::Pack("KWJSONA1", poc_io::TypeTag<T>(), 0, out.data);
+    }
+    void
+    LoadForPoC(std::span<const uint8_t> bytes) override {
+        uint32_t codec = 0;
+        poc_io::Reader in(
+            poc_io::Unpack(bytes, "KWJSONA1", poc_io::TypeTag<T>(), &codec));
+        poc_io::Check(codec == 0, "unsupported JSON wrapper codec");
+        poc_io::Check(in.String() == path_, "JSON path mismatch");
+        poc_io::Check(in.String() == cast_type_.ToString(),
+                      "JSON cast type mismatch");
+        json_poc_io::CheckSchema(in, schema_);
+        poc_io::Check(in.U8() == uint8_t(cast_function_.match<double>()),
+                      "JSON cast function mismatch");
+        const auto base_bytes = in.Bytes();
+        auto valid = json_poc_io::ReadBitmap(in);
+        auto exists = json_poc_io::ReadBitmap(in);
+        in.Finish();
+        InvertedIndexKnowhere<T> staged(
+            KnowhereSparsePostingCodec::Format::Adaptive);
+        staged.LoadForPoC(base_bytes);
+        const auto rows = size_t(staged.Count());
+        poc_io::Check(valid.size() == rows && exists.size() == rows,
+                      "JSON bitmap row count mismatch");
+        json_poc_io::CheckEqual(
+            valid, staged.IsNotNull(), "JSON ARRAY shape validity mismatch");
+        auto posting_rows =
+            json_poc_io::PostingRows(*staged.CoreForUT(), false);
+        json_poc_io::CheckSubset(
+            posting_rows, exists, "JSON ARRAY posting marked nonexistent");
+        this->SwapStateForPoC(staged);
+        valid_ = std::move(valid);
+        exists_ = std::move(exists);
+        ComputeByteSize();
     }
 
     void

@@ -19,6 +19,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace milvus::index {
@@ -34,6 +35,13 @@ class KnowhereSparsePostingCodec {
            size_t count,
            std::vector<uint8_t>& bytes,
            Format format = Format::StreamVByte);
+
+    // Validate the exact bounded block before invoking the trusted SIMD reader.
+    // Returns raw unsigned values; document gaps are not integrated here.
+    static std::array<uint32_t, kBlockSize>
+    DecodeChecked(std::span<const uint8_t> bytes,
+                  size_t count,
+                  Format format = Format::Adaptive);
 
     // Trusted in-process output of Append only; not a persisted-data parser.
     // The backing allocation must have kPadding readable bytes after the blob.
