@@ -352,9 +352,25 @@ class JsonScalarIndexWrapper : public BaseIndex {
         }
 
         int64_t total_rows = 0;
+        // Membership is UNKNOWN when the JSON path is absent or not an array.
+        // Empty arrays and arrays containing only other element types remain
+        // valid FALSE. Track shape independently from path existence, which
+        // must stay true for present scalar/object values.
+        std::vector<size_t> array_invalid_offsets;
         for (const auto& data : field_datas) {
-            total_rows += data->get_num_rows();
+            for (int64_t i = 0; i < data->get_num_rows(); ++i, ++total_rows) {
+                if (json_schema_.nullable() && !data->is_valid(i)) {
+                    array_invalid_offsets.push_back(total_rows);
+                    continue;
+                }
+                const auto* json = static_cast<const Json*>(data->RawValue(i));
+                auto array =
+                    json->dom_doc().at_pointer(nested_path_).get_array();
+                if (array.error() != simdjson::SUCCESS)
+                    array_invalid_offsets.push_back(total_rows);
+            }
         }
+        this->null_offset_ = std::move(array_invalid_offsets);
 
         ProcessJsonFieldData<T>(
             field_datas,
@@ -372,7 +388,7 @@ class JsonScalarIndexWrapper : public BaseIndex {
                             data, size);
                 }
             },
-            [this](int64_t offset) { this->null_offset_.push_back(offset); },
+            [](int64_t) {},  // SQL NULL was already included in shape validity.
             [this](int64_t offset) { non_exist_offsets_.push_back(offset); },
             [](const Json&, const std::string&, simdjson::error_code) {});
 

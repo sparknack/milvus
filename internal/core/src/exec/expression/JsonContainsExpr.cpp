@@ -2475,17 +2475,12 @@ PhyJsonContainsFilterExpr::ExecArrayContainsForIndexSegmentImpl() {
             AssertInfo(array_offsets != nullptr,
                        "array offsets not found for field {}",
                        expr_->column_.field_id_.get());
-            return array_offsets->ForEachRowElementRange(
-                [&element_bitset](int32_t elem_start, int32_t elem_end) {
-                    for (int32_t i = elem_start; i < elem_end; ++i) {
-                        if (element_bitset[i]) {
-                            return true;
-                        }
-                    }
-                    return false;
-                },
-                0,
-                active_count_);
+            // Project each term independently before the row-level ALL.
+            // The shared reducer skips zero words in sparse element bitmaps.
+            TargetBitmap rows(active_count_);
+            array_offsets->ElementBitsetToRowBitsetAny(
+                TargetBitmapView(element_bitset), 0, 0, TargetBitmapView(rows));
+            return rows;
         };
 
         switch (expr_->op_) {

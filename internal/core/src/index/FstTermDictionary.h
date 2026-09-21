@@ -56,6 +56,12 @@ class FstTermDictionary {
     // Caller must validate LIKE syntax and use an equivalent fallback.
     bool
     ForEachLike(std::string_view pattern, const Visitor& visitor) const;
+    // Whole-term Unicode optimal-string-alignment distance, including adjacent
+    // transpositions at cost one. max_edits must be in [0, 2].
+    void
+    ForEachFuzzy(std::string_view term,
+                 uint32_t max_edits,
+                 const Visitor& visitor) const;
 
  private:
     struct State;

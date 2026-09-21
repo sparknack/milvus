@@ -632,3 +632,41 @@ TEST(JsonPathIndexTest, Factory_SortBool_Rejected) {
     EXPECT_THROW(IndexFactory::GetInstance().CreateJsonIndex(info, ctx),
                  std::exception);
 }
+
+// ARRAY casts have membership validity separate from path existence. In
+// particular, no accepted elements does not mean the array itself is null.
+TEST(JsonPathIndexTest, InvertedArrayDouble_ShapeValidityAndExists) {
+    auto field = MakeJsonFieldData({R"({"a":[1,2,2]})",
+                                    R"({"a":[]})",
+                                    R"({"a":["wrong",true,null]})",
+                                    R"({"a":1})",
+                                    R"({"a":{"x":1}})",
+                                    R"({"a":null})",
+                                    "{}"});
+    auto schema = MakeJsonSchema();
+    auto ctx = MakeTestContext();
+    JsonInvertedIndex<double> index(JsonCastType::FromString("ARRAY_DOUBLE"),
+                                    "/a",
+                                    JsonCastFunction::FromString("unknown"),
+                                    schema,
+                                    ctx,
+                                    TANTIVY_INDEX_LATEST_VERSION);
+    index.BuildWithFieldData({field});
+    index.finish();
+    index.create_reader(SetBitsetSealed);
+    ASSERT_EQ(index.Count(), 7);
+    auto valid = index.IsNotNull();
+    auto exists = index.Exists();
+    for (size_t i = 0; i < 7; ++i) {
+        EXPECT_EQ(bool(valid[i]), i < 3) << i;
+        EXPECT_EQ(bool(exists[i]), i < 5 && i != 1) << i;
+    }
+    double term = 1;
+    auto hits = index.In(1, &term);
+    EXPECT_EQ(hits.count(), 1);
+    EXPECT_TRUE(hits[0]);
+    auto negative = index.NotIn(1, &term);
+    EXPECT_EQ(negative.count(), 2);
+    EXPECT_TRUE(negative[1]);
+    EXPECT_TRUE(negative[2]);
+}

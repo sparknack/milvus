@@ -18,7 +18,7 @@
 
 namespace milvus::index {
 // Optional query capability for exact row-domain ARRAY membership conjunctions.
-// It deliberately does not alter ScalarIndex or imply nested/JSON semantics.
+// Implementations must explicitly provide row-domain membership semantics.
 template <typename T>
 class ArrayConjunctionIndex {
  public:
@@ -33,8 +33,11 @@ ArrayConjunctionIndex<T>*
 GetArrayConjunctionIndex(ScalarIndex<T>* index,
                          DataType field_type,
                          int64_t active_count) {
-    if (field_type != DataType::ARRAY || index->IsNestedIndex() ||
-        index->Count() != active_count)
+    const bool row_array =
+        field_type == DataType::ARRAY ||
+        (field_type == DataType::JSON &&
+         index->GetCastType().data_type() == JsonCastType::DataType::ARRAY);
+    if (!row_array || index->IsNestedIndex() || index->Count() != active_count)
         return nullptr;
     return dynamic_cast<ArrayConjunctionIndex<T>*>(index);
 }

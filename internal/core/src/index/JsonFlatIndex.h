@@ -21,6 +21,7 @@
 #include "common/JsonCastType.h"
 #include "common/Types.h"
 #include "index/Index.h"
+#include "index/JsonFlatIndexBase.h"
 #include "index/InvertedIndexTantivy.h"
 #include "index/InvertedIndexUtil.h"
 #include "index/ScalarIndex.h"
@@ -28,10 +29,10 @@
 namespace milvus::index {
 
 class JsonFlatIndex;
-using JsonValueType = ::JsonExistValueType;
 // JsonFlatIndexQueryExecutor is used to execute queries on a specified json path, and can be constructed by JsonFlatIndex
 template <typename T>
-class JsonFlatIndexQueryExecutor : public InvertedIndexTantivy<T> {
+class JsonFlatIndexQueryExecutor : public InvertedIndexTantivy<T>,
+                                   public JsonFlatExecutorBase {
  public:
     JsonFlatIndexQueryExecutor(std::string& json_path,
                                const JsonFlatIndex& json_flat_index,
@@ -60,7 +61,7 @@ class JsonFlatIndexQueryExecutor : public InvertedIndexTantivy<T> {
     }
 
     TargetBitmap
-    ExactPathExists(JsonValueType value_type = JsonValueType::Any) {
+    ExactPathExists(JsonValueType value_type = JsonValueType::Any) override {
         tracer::AutoSpan span("JsonFlatIndexQueryExecutor::ExactPathExists",
                               tracer::GetRootSpan());
         TargetBitmap bitset(this->Count());
@@ -736,7 +737,8 @@ class JsonFlatIndexQueryExecutor : public InvertedIndexTantivy<T> {
 // JsonFlatIndex is not bound to any specific type,
 // we need to reuse InvertedIndexTantivy's Build and Load implementation, so we specify the template parameter as std::string
 // JsonFlatIndex should not be used to execute queries, use JsonFlatIndexQueryExecutor instead
-class JsonFlatIndex : public InvertedIndexTantivy<std::string> {
+class JsonFlatIndex : public InvertedIndexTantivy<std::string>,
+                      public JsonFlatIndexBase {
     template <typename T>
     friend class JsonFlatIndexQueryExecutor;
 
@@ -756,6 +758,11 @@ class JsonFlatIndex : public InvertedIndexTantivy<std::string> {
     void
     build_index_for_json(const std::vector<std::shared_ptr<FieldDataBase>>&
                              field_datas) override;
+
+    std::shared_ptr<IndexBase>
+    CreateExecutor(std::string path,
+                   std::type_index type,
+                   bool comparable) const override;
 
     template <typename T>
     std::shared_ptr<JsonFlatIndexQueryExecutor<T>>
@@ -777,7 +784,7 @@ class JsonFlatIndex : public InvertedIndexTantivy<std::string> {
     }
 
     std::string
-    GetNestedPath() const {
+    GetNestedPath() const override {
         return nested_path_;
     }
 

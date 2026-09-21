@@ -25,6 +25,29 @@
 
 namespace milvus::index {
 
+std::shared_ptr<IndexBase>
+JsonFlatIndex::CreateExecutor(std::string path,
+                              std::type_index type,
+                              bool comparable) const {
+    if (type == typeid(bool))
+        return create_executor<bool>(std::move(path), comparable);
+    if (type == typeid(int8_t))
+        return create_executor<int8_t>(std::move(path), comparable);
+    if (type == typeid(int16_t))
+        return create_executor<int16_t>(std::move(path), comparable);
+    if (type == typeid(int32_t))
+        return create_executor<int32_t>(std::move(path), comparable);
+    if (type == typeid(int64_t))
+        return create_executor<int64_t>(std::move(path), comparable);
+    if (type == typeid(float))
+        return create_executor<float>(std::move(path), comparable);
+    if (type == typeid(double))
+        return create_executor<double>(std::move(path), comparable);
+    if (type == typeid(std::string))
+        return create_executor<std::string>(std::move(path), comparable);
+    ThrowInfo(Unsupported, "Unsupported JSON flat executor type");
+}
+
 void
 JsonFlatIndex::build_index_for_json(
     const std::vector<std::shared_ptr<FieldDataBase>>& field_datas) {

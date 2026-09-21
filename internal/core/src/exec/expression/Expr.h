@@ -2642,8 +2642,8 @@ class SegmentExpr : public Expr {
             const auto chunk_size = ChunkSize(field_id_, chunk);
             int64_t offset = chunk == start_chunk ? start_offset : 0;
             while (offset < chunk_size && processed < size) {
-                const auto n =
-                    std::min({batch_size_, chunk_size - offset, size - processed});
+                const auto n = std::min(
+                    {batch_size_, chunk_size - offset, size - processed});
                 auto bits = candidates.view(processed, n);
                 offsets.clear();
                 // Stop collecting when dense, and avoid narrowing large chunk
@@ -2661,8 +2661,9 @@ class SegmentExpr : public Expr {
                 }
                 if (sparse) {
                     if (!offsets.empty()) {
-                        auto pin = segment_->get_views_by_offsets<std::string_view>(
-                            op_ctx_, field_id_, chunk, offsets);
+                        auto pin =
+                            segment_->get_views_by_offsets<std::string_view>(
+                                op_ctx_, field_id_, chunk, offsets);
                         const auto& views = pin.get().first;
                         for (size_t i = 0; i < offsets.size(); ++i)
                             if (!predicate(views[i]))
@@ -2774,8 +2775,8 @@ class SegmentExpr : public Expr {
         if (cached_index_chunk_id_ != 0) {
             Index* index_ptr = nullptr;
             PinWrapper<const index::IndexBase*> json_pw;
-            std::shared_ptr<index::JsonFlatIndexQueryExecutor<IndexInnerType>>
-                executor;
+            std::shared_ptr<index::ScalarIndex<IndexInnerType>> executor;
+            index::JsonFlatExecutorBase* flat_executor = nullptr;
             const auto json_pointer = field_type_ == DataType::JSON
                                           ? milvus::Json::pointer(nested_path_)
                                           : std::string();
@@ -2786,7 +2787,7 @@ class SegmentExpr : public Expr {
                 if (field_type_ == DataType::JSON) {
                     json_pw = pinned_index_[0];
                     auto json_flat_index =
-                        dynamic_cast<const index::JsonFlatIndex*>(
+                        dynamic_cast<const index::JsonFlatIndexBase*>(
                             json_pw.get());
 
                     if (json_flat_index) {
@@ -2796,6 +2797,13 @@ class SegmentExpr : public Expr {
                                 ->template create_executor<IndexInnerType>(
                                     json_pointer.substr(index_path.size()));
                         index_ptr = executor.get();
+                        flat_executor =
+                            dynamic_cast<index::JsonFlatExecutorBase*>(
+                                executor.get());
+                        AssertInfo(flat_executor != nullptr,
+                                   "Missing JSON flat query capability");
+                        flat_executor->SetArrayQuery(
+                            validity_mode == IndexValidityMode::JsonExactPath);
                     } else {
                         auto json_index =
                             const_cast<index::IndexBase*>(json_pw.get());
@@ -2850,12 +2858,12 @@ class SegmentExpr : public Expr {
                         if (ExprResCacheManager::IsEnabled()) {
                             auto validity = ExprCacheHelper::GetOrComputeBitmap(
                                 segment_, signature, active_count_, [&]() {
-                                    return executor->ExactPathExists(
+                                    return flat_executor->ExactPathExists(
                                         json_value_type.value());
                                 });
                             valid_res = std::move(*validity);
                         } else {
-                            valid_res = executor->ExactPathExists(
+                            valid_res = flat_executor->ExactPathExists(
                                 json_value_type.value());
                         }
                     } else if (cached_is_nested_index_ &&
@@ -3228,14 +3236,14 @@ class SegmentExpr : public Expr {
             Index* index_ptr = nullptr;
             PinWrapper<const index::IndexBase*> json_pw;
             // Executor for JsonFlatIndex. Must outlive index_ptr. Only used for JSON type.
-            std::shared_ptr<index::JsonFlatIndexQueryExecutor<IndexInnerType>>
-                executor;
+            std::shared_ptr<index::ScalarIndex<IndexInnerType>> executor;
 
             if (field_type_ == DataType::JSON) {
                 auto pointer = milvus::Json::pointer(nested_path_);
                 json_pw = pinned_index_[0];
                 auto json_flat_index =
-                    dynamic_cast<const index::JsonFlatIndex*>(json_pw.get());
+                    dynamic_cast<const index::JsonFlatIndexBase*>(
+                        json_pw.get());
 
                 if (json_flat_index) {
                     auto index_path = json_flat_index->GetNestedPath();
@@ -3389,7 +3397,7 @@ class SegmentExpr : public Expr {
     bool
     PinnedJsonIndexIsFlat() const {
         return field_type_ == DataType::JSON && !pinned_index_.empty() &&
-               dynamic_cast<const index::JsonFlatIndex*>(
+               dynamic_cast<const index::JsonFlatIndexBase*>(
                    pinned_index_[0].get()) != nullptr;
     }
 

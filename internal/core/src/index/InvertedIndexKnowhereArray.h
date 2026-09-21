@@ -18,24 +18,57 @@
 #include "index/ArrayConjunctionIndex.h"
 #include "common/Array.h"
 #include <map>
+#include <cmath>
 
 namespace milvus::index {
+template <typename T>
+constexpr DataType
+KnowhereArrayElementType() {
+    if constexpr (std::is_same_v<T, bool>)
+        return DataType::BOOL;
+    if constexpr (std::is_same_v<T, int8_t>)
+        return DataType::INT8;
+    if constexpr (std::is_same_v<T, int16_t>)
+        return DataType::INT16;
+    if constexpr (std::is_same_v<T, int32_t>)
+        return DataType::INT32;
+    if constexpr (std::is_same_v<T, int64_t>)
+        return DataType::INT64;
+    if constexpr (std::is_same_v<T, float>)
+        return DataType::FLOAT;
+    if constexpr (std::is_same_v<T, double>)
+        return DataType::DOUBLE;
+    return DataType::VARCHAR;
+}
 // Ordinary ARRAY membership: one document per row, not per element.
 // The resident payload is the same flat adaptive postings as scalar/text PoCs.
 template <typename T>
 class InvertedIndexKnowhereArray : public InvertedIndexKnowhere<T>,
                                    public ArrayConjunctionIndex<T> {
-    static_assert(std::is_same_v<T, int64_t> || std::is_same_v<T, std::string>,
-                  "ARRAY PoC currently validates INT64 and VARCHAR elements");
+    static_assert(std::is_same_v<T, bool> || std::is_same_v<T, int8_t> ||
+                      std::is_same_v<T, int16_t> ||
+                      std::is_same_v<T, int32_t> ||
+                      std::is_same_v<T, int64_t> || std::is_same_v<T, float> ||
+                      std::is_same_v<T, double> ||
+                      std::is_same_v<T, std::string>,
+                  "unsupported ARRAY scalar element type");
 
  public:
-    InvertedIndexKnowhereArray()
+    explicit InvertedIndexKnowhereArray(bool nested = false)
         : InvertedIndexKnowhere<T>(
-              KnowhereSparsePostingCodec::Format::Adaptive) {
+              KnowhereSparsePostingCodec::Format::Adaptive),
+          nested_(nested) {
+    }
+
+    bool
+    IsNestedIndex() const override {
+        return nested_;
     }
 
     TargetBitmap
     All(size_t n, const T* values) override {
+        AssertInfo(!nested_,
+                   "row conjunction cannot query an element-domain index");
         if (n == 0)
             return this->IsNotNull();
         const auto* core = this->CoreForUT();
@@ -61,13 +94,14 @@ class InvertedIndexKnowhereArray : public InvertedIndexKnowhere<T>,
     BuildWithFieldData(const std::vector<FieldDataPtr>& fields) override {
         std::map<T, std::vector<uint32_t>> postings;
         std::vector<size_t> nulls;
-        size_t row = 0;
+        size_t row = 0, element = 0;
         for (const auto& field : fields) {
             AssertInfo(field->get_data_type() == DataType::ARRAY,
                        "ARRAY builder requires ARRAY FieldData");
             for (int64_t i = 0; i < field->get_num_rows(); ++i, ++row) {
                 if (!field->is_valid(i)) {
-                    nulls.push_back(row);
+                    if (!nested_)
+                        nulls.push_back(row);
                     continue;
                 }
                 const auto& array =
@@ -81,20 +115,43 @@ class InvertedIndexKnowhereArray : public InvertedIndexKnowhere<T>,
                     AssertInfo(IsStringDataType(array.get_element_type()),
                                "ARRAY builder requires string elements");
                 } else {
-                    AssertInfo(array.get_element_type() == DataType::INT64,
-                               "ARRAY builder requires INT64 elements");
+                    // INT8/INT16 arrays use the protobuf int_data / INT32
+                    // physical payload; Array performs the typed conversion.
+                    constexpr auto physical_type =
+                        (std::is_same_v<T, int8_t> ||
+                         std::is_same_v<T, int16_t>)
+                            ? DataType::INT32
+                            : KnowhereArrayElementType<T>();
+                    AssertInfo(array.get_element_type() == physical_type,
+                               "ARRAY builder element physical type mismatch");
                 }
                 for (int j = 0; j < array.length(); ++j) {
                     auto value = array.template get_data_unchecked<T>(j);
+                    // Validate before std::map comparison: NaN compares
+                    // neither less nor greater than an existing finite key,
+                    // so inserting first could silently merge their postings.
+                    if constexpr (std::is_floating_point_v<T>) {
+                        if (std::isnan(value))
+                            ThrowInfo(Unsupported,
+                                      "PoC does not support NaN terms");
+                    }
                     auto& docs = postings[value];
                     // The row IDs are increasing. Checking the last ID avoids
                     // a per-row hash set and makes duplicate values idempotent.
-                    if (docs.empty() || docs.back() != row)
+                    if (nested_) {
+                        // Preserve duplicate occurrences as different element
+                        // IDs. Segcore maps the field's offsets back to rows.
+                        docs.push_back(element++);
+                    } else if (docs.empty() || docs.back() != row) {
                         docs.push_back(row);
+                    }
                 }
             }
         }
-        this->BuildFromPostingsForPoC(row, postings, nulls);
+        this->BuildFromPostingsForPoC(nested_ ? element : row, postings, nulls);
     }
+
+ private:
+    const bool nested_;
 };
 }  // namespace milvus::index

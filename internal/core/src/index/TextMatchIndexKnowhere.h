@@ -170,6 +170,36 @@ class TextMatchIndexKnowhere final : public TextMatchIndexBase {
         return result;
     }
     TargetBitmap
+    FuzzyMatchQuery(const std::string& query, uint32_t max_edits) override {
+        if (max_edits > 2)
+            ThrowInfo(ErrorCode::InvalidParameter,
+                      "max_edit_distance must be within [0, 2]");
+        if (max_edits == 0)
+            return MatchQuery(query, 1);
+        CheckText(query);
+        auto tokenizer = analyzer_->Clone();
+        auto stream = tokenizer->CreateTokenStreamCopyText(query);
+        TargetBitmap result(core_.Count());
+        std::vector<uint32_t> expanded;
+        std::vector<std::string> queries;
+        while (stream->advance()) {
+            auto term = stream->get_token();
+            if (std::find(queries.begin(), queries.end(), term) != queries.end())
+                continue;
+            queries.push_back(term);
+            dictionary_.ForEachFuzzy(term, max_edits,
+                                    [&](std::string_view, uint32_t id) {
+                                        expanded.push_back(id);
+                                    });
+        }
+        std::sort(expanded.begin(), expanded.end());
+        expanded.erase(std::unique(expanded.begin(), expanded.end()),
+                       expanded.end());
+        for (auto term : expanded)
+            core_.DecodeInto(term, result);
+        return result;
+    }
+    TargetBitmap
     PhraseMatchQuery(const std::string& query, uint32_t slop) override {
         CheckText(query);
         auto tokenizer = analyzer_->Clone();

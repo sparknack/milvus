@@ -168,9 +168,87 @@ struct LikeState {
         return active != 0;
     }
 };
+// Prefix DP intersected with FST arcs. Any cell outside |depth-column|<=k
+// costs more than k even with transpositions, which preserve string length.
+// Store only that band (at most five cells for k<=2), saturated at k+1.
+// Two rows preserve OSA transpositions; UTF-8 advances DP only per scalar.
+struct FuzzyRow {
+    size_t begin = 0;
+    std::array<uint8_t, 5> values{};
+    uint8_t size = 0;
+    uint8_t Get(size_t column, uint8_t cap) const {
+        return column >= begin && column - begin < size
+                   ? values[column - begin]
+                   : cap;
+    }
+};
+struct FuzzyState {
+    const std::vector<uint32_t>* query;
+    FuzzyRow row, previous;
+    Utf8State utf8;
+    uint32_t last = 0;
+    size_t depth = 0;
+    uint8_t limit, minimum = 0, previous_minimum = 0;
+    FuzzyState(const std::vector<uint32_t>& q, uint32_t k)
+        : query(&q), limit(k) {
+        row.size = std::min<size_t>(q.size(), k) + 1;
+        for (size_t j = 0; j < row.size; ++j) row.values[j] = j;
+        previous = row;
+    }
+    void step(char byte) {
+        if (!utf8.Feed(uint8_t(byte))) return;
+        const auto cp = utf8.code;
+        const auto cap = uint8_t(limit + 1);
+        ++depth;
+        FuzzyRow next;
+        next.begin = depth > limit ? depth - limit : 0;
+        const size_t end = std::min(query->size(), depth + limit);
+        auto next_minimum = cap;
+        if (next.begin <= end) {
+            next.size = end - next.begin + 1;
+            for (size_t j = next.begin; j <= end; ++j) {
+                unsigned value;
+                if (j == 0) {
+                    value = std::min<size_t>(depth, cap);
+                } else {
+                    value = std::min({unsigned(row.Get(j, cap)) + 1,
+                                      unsigned(next.Get(j - 1, cap)) + 1,
+                                      unsigned(row.Get(j - 1, cap)) +
+                                          (cp != (*query)[j - 1])});
+                    if (depth > 1 && j > 1 && cp == (*query)[j - 2] &&
+                        last == (*query)[j - 1])
+                        value = std::min(value,
+                                         unsigned(previous.Get(j - 2, cap)) + 1);
+                }
+                next.values[j - next.begin] = std::min<unsigned>(value, cap);
+                next_minimum = std::min(next_minimum, next.values[j - next.begin]);
+            }
+        }
+        previous = row;
+        row = next;
+        last = cp;
+        previous_minimum = minimum;
+        minimum = next_minimum;
+    }
+    bool is_match() const {
+        return utf8.valid && !utf8.remaining &&
+               row.Get(query->size(), limit + 1) <= limit;
+    }
+    bool can_match() const {
+        // Retain the previous row conservatively: a future transposition reads
+        // it, so pruning only by the current row would need a separate proof.
+        return utf8.valid && depth <= query->size() + limit &&
+               (minimum <= limit || previous_minimum < limit);
+    }
+};
 class PatternFst : public fst::map<uint32_t> {
  public:
     using fst::map<uint32_t>::map;
+    void Fuzzy(const std::vector<uint32_t>& query, uint32_t edits,
+               const FstTermDictionary::Visitor& visitor) const {
+        this->depth_first_visit(this->header_.start_address, std::string(),
+                                uint32_t{}, FuzzyState(query, edits), std::ref(visitor));
+    }
     void
     Like(const LikeProgram& program,
          const FstTermDictionary::Visitor& visitor) const {
@@ -387,5 +465,25 @@ FstTermDictionary::ForEachLike(std::string_view pattern,
     if (state_->reader)
         state_->reader->Like(program, visitor);
     return true;
+}
+void
+FstTermDictionary::ForEachFuzzy(std::string_view term,
+                               uint32_t max_edits,
+                               const Visitor& visitor) const {
+    if (max_edits > 2)
+        ThrowInfo(ErrorCode::InvalidParameter,
+                  "max_edit_distance must be within [0, 2]");
+    std::vector<uint32_t> query;
+    Utf8State utf8;
+    for (uint8_t byte : term) {
+        if (utf8.Feed(byte)) query.push_back(utf8.code);
+        if (!utf8.valid)
+            ThrowInfo(ErrorCode::InvalidParameter, "invalid UTF-8 fuzzy term");
+    }
+    if (utf8.remaining)
+        ThrowInfo(ErrorCode::InvalidParameter, "incomplete UTF-8 fuzzy term");
+    if (!state_) return;
+    if (state_->empty_key && query.size() <= max_edits) visitor("", 0);
+    if (state_->reader) state_->reader->Fuzzy(query, max_edits, visitor);
 }
 }  // namespace milvus::index
