@@ -29,8 +29,9 @@ Tantivy index compatibility, not IEEE arithmetic comparison semantics.
 
 ## Adapter change
 
-The ordinary Knowhere scalar core continues to reject NaN. The JSON path adapter
-stores only NaN postings in an optional adaptive `uint64_t` core using Tantivy's
+The ordinary Knowhere scalar core now supports NaN through Tantivy-compatible
+total ordering (see [input boundaries](knowhere-input-boundary-compat.md)). To preserve
+the existing JSON snapshot layout, the JSON path adapter still stores only NaN postings in an optional adaptive `uint64_t` core using Tantivy's
 sortable bits. Normal doubles keep the existing core. Membership and range
 queries merge the side postings; NOT IN uses the complete typed validity bitmap.
 EXISTS remains independent of conversion validity. Build publishes the ordinary

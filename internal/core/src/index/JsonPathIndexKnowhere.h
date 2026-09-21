@@ -94,6 +94,14 @@ class JsonPathIndexKnowhere : public InvertedIndexKnowhere<T> {
         const auto rows = size_t(staged.Count());
         poc_io::Check(valid.size() == rows && exists.size() == rows,
                       "JSON bitmap row count mismatch");
+        // This adapter's snapshot deliberately keeps NaNs in its side stream;
+        // the generic scalar core also supports NaN, so enforce that split here.
+        if constexpr (std::is_same_v<T, double>) {
+            for (size_t term = 0; term < staged.CoreForUT()->TermCount();
+                 ++term)
+                poc_io::Check(!std::isnan(staged.CoreForUT()->Term(term)),
+                              "NaN in JSON ordinary stream");
+        }
         auto ordinary = json_poc_io::PostingRows(*staged.CoreForUT(), true);
         json_poc_io::CheckEqual(
             ordinary, staged.IsNotNull(), "JSON scalar core validity mismatch");

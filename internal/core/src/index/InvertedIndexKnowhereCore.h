@@ -30,6 +30,7 @@
 #include "common/EasyAssert.h"
 #include "index/KnowhereSparsePostingCodec.h"
 #include "index/KnowherePoCIO.h"
+#include "index/KnowhereTermOrder.h"
 
 namespace milvus::index {
 // Experimental heap-only scalar backend. Only the UT builder creates one.
@@ -114,10 +115,10 @@ class InvertedIndexKnowhereCore {
                 value = raw;
             } else if constexpr (std::is_same_v<T, float>) {
                 value = std::bit_cast<float>(reader.U32());
-                Check(!std::isnan(value), "NaN in ordinary persisted core");
+
             } else if constexpr (std::is_same_v<T, double>) {
                 value = std::bit_cast<double>(reader.U64());
-                Check(!std::isnan(value), "NaN in ordinary persisted core");
+
             } else {
                 using Unsigned = std::make_unsigned_t<T>;
                 auto raw = reader.U64();
@@ -125,7 +126,8 @@ class InvertedIndexKnowhereCore {
                       "persisted integer term exceeds type width");
                 value = std::bit_cast<T>(static_cast<Unsigned>(raw));
             }
-            Check(next.terms_.empty() || next.terms_.back() < value,
+            Check(next.terms_.empty() ||
+                      KnowhereTermOrder<T>{}(next.terms_.back(), value),
                   "persisted terms are not strictly ordered");
             next.terms_.push_back(std::move(value));
         }
@@ -274,7 +276,12 @@ class InvertedIndexKnowhereCore {
                 CheckValue(values[i]);
                 pairs.emplace_back(values[i], i);
             }
-            std::sort(pairs.begin(), pairs.end());
+            std::sort(
+                pairs.begin(), pairs.end(), [](const auto& a, const auto& b) {
+                    if (KnowhereTermOrder<T>::Equal(a.first, b.first))
+                        return a.second < b.second;
+                    return KnowhereTermOrder<T>{}(a.first, b.first);
+                });
             std::vector<uint32_t> ids;
             for (size_t i = 0; i < pairs.size();) {
                 next.terms_.push_back(pairs[i].first);
@@ -282,7 +289,9 @@ class InvertedIndexKnowhereCore {
                 size_t j = i;
                 do {
                     ids.push_back(pairs[j++].second);
-                } while (j < pairs.size() && pairs[j].first == pairs[i].first);
+                } while (j < pairs.size() &&
+                         KnowhereTermOrder<T>::Equal(pairs[j].first,
+                                                     pairs[i].first));
                 uint64_t offset = next.posting_bytes_.size();
                 KnowhereSparsePostingCodec::Append(
                     ids.data(), ids.size(), next.posting_bytes_, format_);
@@ -318,7 +327,8 @@ class InvertedIndexKnowhereCore {
         next.null_offsets_ = nulls;
         for (const auto& [term, ids] : postings) {
             CheckValue(term);
-            AssertInfo(next.terms_.empty() || next.terms_.back() < term,
+            AssertInfo(next.terms_.empty() ||
+                           KnowhereTermOrder<T>{}(next.terms_.back(), term),
                        "text dictionary must be strictly sorted");
             AssertInfo(!ids.empty() && ids.back() < n,
                        "invalid text docID range");
@@ -451,9 +461,11 @@ class InvertedIndexKnowhereCore {
     size_t
     Lookup(const T& value) const {
         CheckValue(value);
-        auto it = std::lower_bound(terms_.begin(), terms_.end(), value);
-        return it != terms_.end() && *it == value ? it - terms_.begin()
-                                                  : terms_.size();
+        auto it = std::lower_bound(
+            terms_.begin(), terms_.end(), value, KnowhereTermOrder<T>{});
+        return it != terms_.end() && KnowhereTermOrder<T>::Equal(*it, value)
+                   ? it - terms_.begin()
+                   : terms_.size();
     }
     size_t
     TermCount() const {
@@ -469,11 +481,13 @@ class InvertedIndexKnowhereCore {
     void
     ForEachStringPrefix(std::string_view prefix, Visitor&& visitor) const
         requires(std::is_same_v<T, std::string>) {
-        auto begin = std::lower_bound(
-            terms_.begin(), terms_.end(), prefix,
-            [](const std::string& term, std::string_view key) {
-                return std::string_view(term) < key;
-            });
+        auto begin =
+            std::lower_bound(terms_.begin(),
+                             terms_.end(),
+                             prefix,
+                             [](const std::string& term, std::string_view key) {
+                                 return std::string_view(term) < key;
+                             });
         for (auto it = begin; it != terms_.end(); ++it) {
             const std::string_view term(*it);
             if (!term.starts_with(prefix))
@@ -489,14 +503,24 @@ class InvertedIndexKnowhereCore {
     Bounds(const T& lower, bool li, const T& upper, bool ui) const {
         CheckValue(lower);
         CheckValue(upper);
-        size_t begin =
-            (li ? std::lower_bound(terms_.begin(), terms_.end(), lower)
-                : std::upper_bound(terms_.begin(), terms_.end(), lower)) -
-            terms_.begin();
-        size_t end =
-            (ui ? std::upper_bound(terms_.begin(), terms_.end(), upper)
-                : std::lower_bound(terms_.begin(), terms_.end(), upper)) -
-            terms_.begin();
+        size_t begin = (li ? std::lower_bound(terms_.begin(),
+                                              terms_.end(),
+                                              lower,
+                                              KnowhereTermOrder<T>{})
+                           : std::upper_bound(terms_.begin(),
+                                              terms_.end(),
+                                              lower,
+                                              KnowhereTermOrder<T>{})) -
+                       terms_.begin();
+        size_t end = (ui ? std::upper_bound(terms_.begin(),
+                                            terms_.end(),
+                                            upper,
+                                            KnowhereTermOrder<T>{})
+                         : std::lower_bound(terms_.begin(),
+                                            terms_.end(),
+                                            upper,
+                                            KnowhereTermOrder<T>{})) -
+                     terms_.begin();
         return {begin, std::max(begin, end)};
     }
     void
@@ -547,10 +571,14 @@ class InvertedIndexKnowhereCore {
     TargetBitmap
     Range(const T& value, OpType op) const {
         CheckValue(value);
-        size_t lower = std::lower_bound(terms_.begin(), terms_.end(), value) -
-                       terms_.begin();
-        size_t upper = std::upper_bound(terms_.begin(), terms_.end(), value) -
-                       terms_.begin();
+        size_t lower =
+            std::lower_bound(
+                terms_.begin(), terms_.end(), value, KnowhereTermOrder<T>{}) -
+            terms_.begin();
+        size_t upper =
+            std::upper_bound(
+                terms_.begin(), terms_.end(), value, KnowhereTermOrder<T>{}) -
+            terms_.begin();
         switch (op) {
             case OpType::LessThan:
                 return Materialize(0, lower);
@@ -574,11 +602,6 @@ class InvertedIndexKnowhereCore {
             if (value.find('\0') != std::string::npos)
                 ThrowInfo(ErrorCode::Unsupported,
                           "PoC does not support embedded NUL strings");
-        }
-        if constexpr (std::is_floating_point_v<T>) {
-            if (std::isnan(value))
-                ThrowInfo(ErrorCode::Unsupported,
-                          "PoC does not support NaN terms");
         }
     }
     TargetBitmap

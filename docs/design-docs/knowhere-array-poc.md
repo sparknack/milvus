@@ -54,7 +54,7 @@ Additional correctness covers every newly supported ordinary type and all eight 
 
 The expanded-feature profile found nested contains-all dominated by the per-element row projection. Its shared segcore path now calls the existing `ElementBitsetToRowBitsetAny` reducer for each term before applying row-level AND. Both Tantivy and Knowhere use this optimization; final comparisons rebuild and measure both. Zero-initialized output, global element offset zero and active row range preserve empty/NULL rows and row/element domains.
 
-Floating ARRAY builders reject NaN before ordered-map insertion, following the scalar core's existing unsupported-NaN contract. Waiting until map-key validation would be too late: NaN can compare equivalent to an existing finite key and corrupt its postings. Tests cover FLOAT/DOUBLE and both row/element domains, including retention of the previous index after a failed rebuild. Split-FieldData tests also cover global IDs and NULL rows with retained nonempty physical payload.
+Floating ARRAY builders now use the scalar core's Tantivy-compatible total-order comparator before ordered-map insertion, keeping NaN terms distinct from finite keys. FLOAT is promoted to double just like the Tantivy binding. Tests cover FLOAT/DOUBLE and both row/element domains, including signed/payload NaN, infinity, zero, NULL and snapshot reload; see [input boundaries](knowhere-input-boundary-compat.md). Split-FieldData tests also cover global IDs and NULL rows with retained nonempty physical payload.
 
 ## Executed validation and measured results
 

@@ -58,14 +58,36 @@ Tantivy 比较，不声称另有独立 slop 语义证明。
 
 ## 明确边界
 
-本轮没有改 analyzer 实现，也没有引入新的 analyzer 语法。gRPC tokenizer 需要外部服务、
-TLS/参数和服务故障行为；Lindera 配置需要相应字典与构建 feature/资源；资源文件加载及
-remote dictionary、Lingua 全语言模型、每一种 filter 组合均不包含在这组测试中。
+本轮没有改 analyzer 实现，也没有引入新的 analyzer 语法。新增自包含覆盖见下节；
+gRPC tokenizer 的成功连接、TLS/参数及服务故障仍需服务 fixture。
+Lindera 的默认字典构建 feature 当前未开启（`TANTIVY_FEATURES_LIST` 为空），没有下载字典，
+因此未覆盖。远程资源名解析及资源同步、任意 filter 排列也未穷尽。
 已有接口可接收某个配置，不等于其所有外部资源及失败模式已验证。
 
 当前测试为兼容性闭环，不重新运行所有语言的性能 benchmark，也不声称这些配置的吞吐量
-已经超过 Tantivy。Growing、持久化 analyzer 配置和重载后的外部资源恢复仍不在本文件范围。
+已经超过 Tantivy。Growing 仍不在本文件范围。后续 snapshot 已绑定配置字符串；外部资源内容恢复的限制见下节。
 
 ## Executed results
 
 See the [compatibility report](../../../knowhere-scalar-poc/results/2026-09-21-compat/README.md) for passing correctness runs, scope limits, cast benchmark/perf and unified regression (326 passed, 3 existing skips).
+
+## 后续资源兼容性验证
+
+在原八种配置之外增加 whitespace、char_group（Unicode 标点/空白）、ICU、regex+length、
+inline decompounder、decimaldigit、pinyin 七种本地 pipeline；另有 Lingua 动态语言分派。
+Lingua 使用当前 Cargo 已编入的依赖数据，验证长英文、中文与 default 输入，不代表每种语言均覆盖。
+所有配置沿用 259 行、完整 bitmap/NOT/Search 与独立 oracle 的相同流程；
+`POC_SNAPSHOT_ROUNDTRIP=1` 时还经过文件写入、旧 index 与缓冲区销毁、新实例加载。
+
+本地资源 fixture 源于 Rust 自带 `analyzer/data/test` 的 synonym、stop、decompounder 三份小词典，
+测试创建临时副本并使用真实 `{"type":"local","path":...}` 配置，避免依赖运行目录。
+增加已构造 Knowhere analyzer 在文件删除后继续可用、删除文件后新构造 K/T 都失败的验证。
+这不包含远程下载，也不改变 Rust 返回的错误分类。
+
+**资源持久化有一个明确限制：** snapshot 绑定 analyzer 配置字符串，却没有绑定被引用文件的内容。
+新增 `ChangedLocalResourceIsNotBoundBySnapshot` 用同一路径的 `car,auto` → `car,truck` 词典修改
+证明旧索引可被加载，但查询分词变化会使 `auto` 从命中变为不命中。这个测试是缺口复现，不能
+计入“资源重载完全兼容”的结论。集成之前需要资源版本/内容指纹绑定或自包含资源；缺文件则在
+fresh constructor 失败，尚未进入 Load。未擅自增加新的 analyzer 公共语义。
+
+本次新增测试的执行结果见[输入边界报告](../../../knowhere-scalar-poc/results/2026-09-21-boundaries/README.md)。

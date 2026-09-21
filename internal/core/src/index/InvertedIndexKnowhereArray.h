@@ -65,7 +65,8 @@ class InvertedIndexKnowhereArray : public InvertedIndexKnowhere<T>,
     void
     LoadForPoC(std::span<const uint8_t> bytes) override {
         poc_io::Reader r(poc_io::UnpackAdapter(bytes, "KARRAY01", 2));
-        poc_io::Check(r.U8() == uint8_t(nested_), "ARRAY row/element domain mismatch");
+        poc_io::Check(r.U8() == uint8_t(nested_),
+                      "ARRAY row/element domain mismatch");
         InvertedIndexKnowhere<T> next;
         next.LoadForPoC(r.Bytes());
         r.Finish();
@@ -113,7 +114,7 @@ class InvertedIndexKnowhereArray : public InvertedIndexKnowhere<T>,
 
     void
     BuildWithFieldData(const std::vector<FieldDataPtr>& fields) override {
-        std::map<T, std::vector<uint32_t>> postings;
+        std::map<T, std::vector<uint32_t>, KnowhereTermOrder<T>> postings;
         std::vector<size_t> nulls;
         size_t row = 0, element = 0;
         for (const auto& field : fields) {
@@ -148,14 +149,6 @@ class InvertedIndexKnowhereArray : public InvertedIndexKnowhere<T>,
                 }
                 for (int j = 0; j < array.length(); ++j) {
                     auto value = array.template get_data_unchecked<T>(j);
-                    // Validate before std::map comparison: NaN compares
-                    // neither less nor greater than an existing finite key,
-                    // so inserting first could silently merge their postings.
-                    if constexpr (std::is_floating_point_v<T>) {
-                        if (std::isnan(value))
-                            ThrowInfo(Unsupported,
-                                      "PoC does not support NaN terms");
-                    }
                     auto& docs = postings[value];
                     // The row IDs are increasing. Checking the last ID avoids
                     // a per-row hash set and makes duplicate values idempotent.
