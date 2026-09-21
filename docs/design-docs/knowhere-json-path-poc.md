@@ -108,3 +108,10 @@ the adapter API. Benchmark and perf must be rerun before quantifying the gain.
 ## 实测记录
 
 [完整性能报告、正确性 XML、优化前后 perf 和逐项 workload](../../../knowhere-scalar-poc/results/2026-09-20-structured/README.md)。
+
+## Resident space update (2026-09-21)
+
+The later [space compaction](knowhere-space-poc.md) removes the unused scalar
+FST and stores ordered scalar strings in a contiguous pool. Earlier FST/space
+statements above describe the original implementation. TEXT/NGRAM retain their
+actively used FSTs; query semantics and snapshot bytes are unchanged.

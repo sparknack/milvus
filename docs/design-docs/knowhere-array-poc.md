@@ -65,3 +65,10 @@ That report distinguishes index-only timings, native raw fallbacks, known
 Tantivy/raw compatibility differences and accounted payload sizes. Earlier
 baseline/proposal sections describe the optimization process, not additional
 claims of production coverage.
+
+## Resident space update (2026-09-21)
+
+The later [space compaction](knowhere-space-poc.md) removes the unused scalar
+FST and stores ordered scalar strings in a contiguous pool. Earlier FST/space
+statements above describe the original implementation. TEXT/NGRAM retain their
+actively used FSTs; query semantics and snapshot bytes are unchanged.

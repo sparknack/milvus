@@ -69,3 +69,12 @@ That report distinguishes index-only timings, native raw fallbacks, known
 Tantivy/raw compatibility differences and accounted payload sizes. Earlier
 baseline/proposal sections describe the optimization process, not additional
 claims of production coverage.
+
+## Resident space update (2026-09-21)
+
+The [space compaction](knowhere-space-poc.md) pools scalar strings, compacts core
+metadata/capacity and replaces numeric DF prefix arrays with one checkpoint per
+64 terms. Range costing sums at most 63 DF entries per boundary; it no longer
+retains an 8-byte prefix for every term. Snapshot bytes and selection semantics
+are unchanged. Paired root-index timings and allocated-space breakdowns are in
+the linked results.

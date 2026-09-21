@@ -181,3 +181,10 @@ FST 的 Unicode NFA API 仍有独立测试，但不再用于 scalar PatternMatch
 该策略依赖 resident 唯一值已存在，不能把结果外推至未来仅 FST / mmap 词典。
 若后续删除排序字符串，需要重新评估无字符串重建的 ordinal-only walker、
 连续词条字节存储或按块解码；本轮没有实现这些存储改造。
+
+## Resident space update (2026-09-21)
+
+The later [space compaction](knowhere-space-poc.md) removes the unused scalar
+FST and stores ordered scalar strings in a contiguous pool. Earlier FST/space
+statements above describe the original implementation. TEXT/NGRAM retain their
+actively used FSTs; query semantics and snapshot bytes are unchanged.

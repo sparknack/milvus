@@ -39,7 +39,10 @@ its compressed streams; it is not a cross-endian production specification.
   cores for BOOL/I64/U64/F64/string and five shape/validity masks per path. Numeric
   DF prefixes are reconstructed from validated term metadata.
 
-The memory FST is rebuilt from the persisted ordered terms. This never analyzes
+TEXT/NGRAM rebuild their memory FST from persisted ordered terms; scalar
+strings use an owned contiguous pool after the [space update](knowhere-space-poc.md).
+Numeric DF prefixes now use 64-term checkpoints. These resident changes preserve
+the snapshot format. Loading never analyzes
 source documents or rebuilds compressed postings. Direct loading/mapping of FST
 bytecode needs a separately validated format; this PoC does not treat a checksum
 as proof that arbitrary FST bytecode is safe. A single snapshot file is adequate

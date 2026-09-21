@@ -64,6 +64,11 @@ KnowherePositionIndex::Seal() {
         frequencies_.size() + KnowhereSparsePostingCodec::kPadding, 0);
     positions_.resize(positions_.size() + KnowhereSparsePostingCodec::kPadding,
                       0);
+    terms_.shrink_to_fit();
+    doc_blocks_.shrink_to_fit();
+    position_offsets_.shrink_to_fit();
+    frequencies_.shrink_to_fit();
+    positions_.shrink_to_fit();
     sealed_ = true;
 }
 size_t
@@ -291,6 +296,8 @@ KnowherePositionIndex::LoadForPoC(std::span<const uint8_t> bytes,
         }
         PositionRequire(consumed == term.positions, "unused term positions");
     }
+    next.frequencies_.reserve(freq_bytes.size() + KnowhereSparsePostingCodec::kPadding);
+    next.positions_.reserve(pos_bytes.size() + KnowhereSparsePostingCodec::kPadding);
     next.frequencies_.assign(freq_bytes.begin(), freq_bytes.end());
     next.positions_.assign(pos_bytes.begin(), pos_bytes.end());
     next.Seal();

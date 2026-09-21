@@ -30,7 +30,11 @@ using Core = InvertedIndexKnowhereCore<T, TargetBitmap, OpType>;
 template <typename T>
 struct Column {
     std::map<T, std::vector<uint32_t>> pending;
+    // One checkpoint per 64 terms. Boundary sums use the core's existing DF
+    // array, instead of duplicating an 8-byte prefix value for every term.
+    static constexpr size_t kDFBlock = 64;
     std::vector<size_t> docfreq_prefix;
+    size_t total_docfreq = 0;
     Core<T> core{KnowhereSparsePostingCodec::Format::Adaptive};
     void
     Add(const T& value, uint32_t row) {
@@ -40,15 +44,34 @@ struct Column {
     }
     void
     Finish(size_t rows) {
+        core.BuildFromPostings(rows, pending);
+        RebuildFrequencies();
+        decltype(pending)().swap(pending);
+    }
+    void
+    RebuildFrequencies() {
         if constexpr (std::is_arithmetic_v<T> && !std::is_same_v<T, bool>) {
             docfreq_prefix.clear();
-            docfreq_prefix.reserve(pending.size() + 1);
+            docfreq_prefix.reserve(core.TermCount() / kDFBlock + 1);
             docfreq_prefix.push_back(0);
-            for (const auto& [term, ids] : pending)
-                docfreq_prefix.push_back(docfreq_prefix.back() + ids.size());
+            total_docfreq = 0;
+            for (size_t i = 0; i < core.TermCount(); ++i) {
+                poc_io::Check(core.DocFreq(i) <= SIZE_MAX - total_docfreq,
+                              "JSON flat DF prefix overflow");
+                total_docfreq += core.DocFreq(i);
+                if ((i + 1) % kDFBlock == 0)
+                    docfreq_prefix.push_back(total_docfreq);
+            }
         }
-        core.BuildFromPostings(rows, pending);
-        decltype(pending)().swap(pending);
+    }
+    size_t
+    Prefix(size_t end) const {
+        if (end == core.TermCount())
+            return total_docfreq;
+        const size_t block = end / kDFBlock;
+        size_t sum = docfreq_prefix[block];
+        for (size_t i = block * kDFBlock; i < end; ++i) sum += core.DocFreq(i);
+        return sum;
     }
     size_t
     Bytes() const {
@@ -368,9 +391,9 @@ class JsonFlatKnowhereExecutor : public InvertedIndexKnowhere<T>,
         const auto matched = (ib.second - ib.first) + (ub.second - ub.first) +
                              (db.second - db.first);
         auto frequencies = [](const auto& column, auto bounds) {
-            const auto& prefix = column.docfreq_prefix;
-            const size_t hits = prefix[bounds.second] - prefix[bounds.first];
-            return std::pair<size_t, size_t>{hits, prefix.back() - hits};
+            const size_t hits =
+                column.Prefix(bounds.second) - column.Prefix(bounds.first);
+            return std::pair<size_t, size_t>{hits, column.total_docfreq - hits};
         };
         const auto idf = frequencies(cols.integers, ib);
         const auto udf = frequencies(cols.unsigneds, ub);
@@ -531,22 +554,7 @@ class JsonFlatIndexKnowhere : public InvertedIndexKnowhere<std::string>,
                 }
                 // Prefix sums are query acceleration metadata, reconstructed
                 // from validated DF without rebuilding/recompressing postings.
-                using Value =
-                    std::decay_t<decltype(values.pending.begin()->first)>;
-                if constexpr (std::is_arithmetic_v<Value> &&
-                              !std::is_same_v<Value, bool>) {
-                    values.docfreq_prefix.reserve(values.core.TermCount() + 1);
-                    values.docfreq_prefix.push_back(0);
-                    for (size_t term = 0; term < values.core.TermCount();
-                         ++term) {
-                        Check(values.core.DocFreq(term) <=
-                                  SIZE_MAX - values.docfreq_prefix.back(),
-                              "JSON flat DF prefix overflow");
-                        values.docfreq_prefix.push_back(
-                            values.docfreq_prefix.back() +
-                            values.core.DocFreq(term));
-                    }
-                }
+                values.RebuildFrequencies();
                 poc_io::CheckSubset(coverage,
                                     scalar ? store->exists : store->arrays,
                                     "JSON flat posting shape/exists mismatch");
@@ -634,6 +642,35 @@ class JsonFlatIndexKnowhere : public InvertedIndexKnowhere<std::string>,
         auto r = IsNotNull();
         r.flip();
         return r;
+    }
+    // Allocated payload by category, excluding allocator/map node overhead.
+    std::map<std::string, size_t>
+    MemoryForPoC() const {
+        std::map<std::string, size_t> out;
+        if (!snapshot_)
+            return out;
+        out["masks"] = snapshot_->row_valid.size_in_bytes();
+        for (const auto& [path, store] : snapshot_->paths) {
+            out["paths"] += path.capacity();
+            out["masks"] += store->exists.size_in_bytes() * 5;
+            auto column = [&](const auto& c) {
+                const auto m = c.core.Memory();
+                out["terms"] += m.terms;
+                out["posting_metadata"] += m.metadata;
+                out["postings"] += m.postings;
+                out["null_offsets"] += m.nulls;
+                out["df_prefix"] +=
+                    c.docfreq_prefix.capacity() * sizeof(size_t);
+            };
+            for (const auto* cols : {&store->scalar, &store->elements}) {
+                column(cols->booleans);
+                column(cols->integers);
+                column(cols->unsigneds);
+                column(cols->doubles);
+                column(cols->strings);
+            }
+        }
+        return out;
     }
     void
     ComputeByteSize() override {

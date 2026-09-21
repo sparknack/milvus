@@ -31,10 +31,11 @@
 #include "index/KnowhereSparsePostingCodec.h"
 #include "index/KnowherePoCIO.h"
 #include "index/KnowhereTermOrder.h"
+#include "index/KnowhereTermStorage.h"
 
 namespace milvus::index {
 // Experimental heap-only scalar backend. Only the UT builder creates one.
-// Kept separate from ScalarIndex: persistence and production build are absent.
+// Kept separate from ScalarIndex; versioned local snapshots are supported.
 template <typename T, typename TargetBitmap, typename OpType>
 class InvertedIndexKnowhereCore {
  public:
@@ -56,7 +57,7 @@ class InvertedIndexKnowhereCore {
         writer.U64(count_);
         writer.U64(terms_.size());
         for (size_t i = 0; i < terms_.size(); ++i) {
-            const T value = terms_[i];
+            const auto value = terms_[i];
             if constexpr (std::is_same_v<T, std::string>)
                 writer.String(value);
             else if constexpr (std::is_same_v<T, bool>)
@@ -68,11 +69,16 @@ class InvertedIndexKnowhereCore {
             else
                 writer.U64(static_cast<std::make_unsigned_t<T>>(value));
         }
-        for (const auto& meta : posting_metas_) {
-            writer.U64(meta.doc_stream_offset);
-            writer.U64(meta.doc_stream_length);
-            writer.U32(meta.doc_freq);
-            writer.U32(meta.format_version);
+        // Preserve the existing wire layout; only the resident representation
+        // is compact. Length and per-term version are redundant in memory.
+        for (size_t i = 0; i < posting_offsets_.size(); ++i) {
+            writer.U64(posting_offsets_[i]);
+            writer.U64((i + 1 < posting_offsets_.size()
+                            ? posting_offsets_[i + 1]
+                            : PostingLogicalBytes()) -
+                       posting_offsets_[i]);
+            writer.U32(doc_freqs_[i]);
+            writer.U32(1);
         }
         writer.U64(null_offsets_.size());
         for (auto row : null_offsets_) writer.U32(row);
@@ -126,14 +132,16 @@ class InvertedIndexKnowhereCore {
                       "persisted integer term exceeds type width");
                 value = std::bit_cast<T>(static_cast<Unsigned>(raw));
             }
-            Check(next.terms_.empty() ||
-                      KnowhereTermOrder<T>{}(next.terms_.back(), value),
+            Check(next.terms_.empty() || TermLess(next.terms_.back(), value),
                   "persisted terms are not strictly ordered");
             next.terms_.push_back(std::move(value));
         }
         Check(term_count <= reader.Remaining() / 24,
               "truncated persisted term metadata");
-        next.posting_metas_.reserve(term_count);
+        std::vector<TermPostingMeta> wire_metas;
+        wire_metas.reserve(term_count);
+        next.posting_offsets_.reserve(term_count);
+        next.doc_freqs_.reserve(term_count);
         for (size_t i = 0; i < term_count; ++i) {
             TermPostingMeta meta;
             meta.doc_stream_offset = reader.U64();
@@ -143,7 +151,9 @@ class InvertedIndexKnowhereCore {
             Check(meta.format_version == 1 && meta.doc_freq > 0 &&
                       meta.doc_freq <= count,
                   "invalid persisted posting metadata");
-            next.posting_metas_.push_back(meta);
+            wire_metas.push_back(meta);
+            next.posting_offsets_.push_back(meta.doc_stream_offset);
+            next.doc_freqs_.push_back(meta.doc_freq);
         }
         const uint64_t null_count = reader.U64();
         Check(null_count <= count && null_count <= reader.Remaining() / 4,
@@ -159,7 +169,7 @@ class InvertedIndexKnowhereCore {
         auto bytes = reader.Bytes();
         reader.Finish();
         uint64_t expected_offset = 0;
-        for (const auto& meta : next.posting_metas_) {
+        for (const auto& meta : wire_metas) {
             Check(meta.doc_stream_offset == expected_offset &&
                       expected_offset <= bytes.size() &&
                       meta.doc_stream_length <= bytes.size() - expected_offset,
@@ -221,10 +231,12 @@ class InvertedIndexKnowhereCore {
         }
         Check(expected_offset == bytes.size(),
               "unreferenced persisted posting bytes");
+        next.posting_bytes_.reserve(bytes.size() + KnowhereSparsePostingCodec::kPadding);
         next.posting_bytes_.assign(bytes.begin(), bytes.end());
         next.posting_bytes_.resize(
             next.posting_bytes_.size() + KnowhereSparsePostingCodec::kPadding,
             0);
+        next.Compact();
         *this = std::move(next);
     }
 
@@ -295,17 +307,15 @@ class InvertedIndexKnowhereCore {
                 uint64_t offset = next.posting_bytes_.size();
                 KnowhereSparsePostingCodec::Append(
                     ids.data(), ids.size(), next.posting_bytes_, format_);
-                next.posting_metas_.push_back(
-                    {offset,
-                     next.posting_bytes_.size() - offset,
-                     static_cast<uint32_t>(ids.size()),
-                     1});
+                next.posting_offsets_.push_back(offset);
+                next.doc_freqs_.push_back(static_cast<uint32_t>(ids.size()));
                 i = j;
             }
         }
         next.posting_bytes_.resize(
             next.posting_bytes_.size() + KnowhereSparsePostingCodec::kPadding,
             0);
+        next.Compact();
         *this = std::move(next);
     }
     // Text builders provide a sorted dictionary of unique increasing docIDs per term.
@@ -327,23 +337,22 @@ class InvertedIndexKnowhereCore {
         next.null_offsets_ = nulls;
         for (const auto& [term, ids] : postings) {
             CheckValue(term);
-            AssertInfo(next.terms_.empty() ||
-                           KnowhereTermOrder<T>{}(next.terms_.back(), term),
-                       "text dictionary must be strictly sorted");
+            AssertInfo(
+                next.terms_.empty() || TermLess(next.terms_.back(), term),
+                "text dictionary must be strictly sorted");
             AssertInfo(!ids.empty() && ids.back() < n,
                        "invalid text docID range");
             uint64_t offset = next.posting_bytes_.size();
             KnowhereSparsePostingCodec::Append(
                 ids.data(), ids.size(), next.posting_bytes_, format_);
             next.terms_.push_back(term);
-            next.posting_metas_.push_back({offset,
-                                           next.posting_bytes_.size() - offset,
-                                           static_cast<uint32_t>(ids.size()),
-                                           1});
+            next.posting_offsets_.push_back(offset);
+            next.doc_freqs_.push_back(static_cast<uint32_t>(ids.size()));
         }
         next.posting_bytes_.resize(
             next.posting_bytes_.size() + KnowhereSparsePostingCodec::kPadding,
             0);
+        next.Compact();
         *this = std::move(next);
     }
     template <typename Callback>
@@ -351,9 +360,9 @@ class InvertedIndexKnowhereCore {
     ForEachDoc(size_t term, Callback&& callback) const {
         if (term == terms_.size())
             return;
-        const auto& meta = posting_metas_.at(term);
-        KnowhereSparsePostingCodec::View posting(
-            posting_bytes_.data() + meta.doc_stream_offset, format_);
+        const auto offset = posting_offsets_.at(term);
+        KnowhereSparsePostingCodec::View posting(posting_bytes_.data() + offset,
+                                                 format_);
         std::array<uint32_t, KnowhereSparsePostingCodec::kBlockSize> ids;
         for (size_t b = 0; b < posting.Blocks(); ++b) {
             auto n = posting.DecodeBlock(b, ids.data());
@@ -362,9 +371,9 @@ class InvertedIndexKnowhereCore {
     }
     KnowhereSparsePostingCodec::Cursor
     NewCursor(size_t term) const {
-        const auto& meta = posting_metas_.at(term);
+        const auto offset = posting_offsets_.at(term);
         return KnowhereSparsePostingCodec::Cursor(
-            posting_bytes_.data() + meta.doc_stream_offset, format_);
+            posting_bytes_.data() + offset, format_);
     }
     // Add the intersection of existing term ordinals to a caller-owned bitmap.
     // Sort by posting length; cursor seeks skip compressed blocks using max IDs.
@@ -376,7 +385,7 @@ class InvertedIndexKnowhereCore {
         std::sort(terms.begin(), terms.end());
         terms.erase(std::unique(terms.begin(), terms.end()), terms.end());
         for (auto term : terms)
-            AssertInfo(term < posting_metas_.size(),
+            AssertInfo(term < posting_offsets_.size(),
                        "invalid intersection term ordinal");
         if (terms.size() == 1) {
             DecodeInto(terms.front(), result);
@@ -406,9 +415,8 @@ class InvertedIndexKnowhereCore {
         std::vector<Cursor> cursors;
         cursors.reserve(terms.size());
         for (auto term : terms)
-            cursors.emplace_back(
-                posting_bytes_.data() + posting_metas_[term].doc_stream_offset,
-                format_);
+            cursors.emplace_back(posting_bytes_.data() + posting_offsets_[term],
+                                 format_);
         auto& lead = cursors.front();
         auto candidate = lead.Seek(0);
         while (candidate != Cursor::kEnd) {
@@ -435,20 +443,9 @@ class InvertedIndexKnowhereCore {
     }
     MemoryStats
     Memory() const {
-        size_t terms = terms_.capacity() * sizeof(T);
-        if constexpr (std::is_same_v<T, bool>)
-            terms = (terms_.capacity() + 7) / 8;
-        if constexpr (std::is_same_v<T, std::string>) {
-            // Include only out-of-object storage (exclude short-string storage).
-            for (const auto& term : terms_) {
-                auto p = reinterpret_cast<uintptr_t>(term.data());
-                auto object = reinterpret_cast<uintptr_t>(&term);
-                if (p < object || p >= object + sizeof(term))
-                    terms += term.capacity() + 1;
-            }
-        }
-        return {terms,
-                posting_metas_.capacity() * sizeof(TermPostingMeta),
+        return {terms_.Bytes(),
+                posting_offsets_.capacity() * sizeof(uint64_t) +
+                    doc_freqs_.capacity() * sizeof(uint32_t),
                 posting_bytes_.capacity(),
                 null_offsets_.capacity() * sizeof(size_t)};
     }
@@ -461,11 +458,9 @@ class InvertedIndexKnowhereCore {
     size_t
     Lookup(const T& value) const {
         CheckValue(value);
-        auto it = std::lower_bound(
-            terms_.begin(), terms_.end(), value, KnowhereTermOrder<T>{});
-        return it != terms_.end() && KnowhereTermOrder<T>::Equal(*it, value)
-                   ? it - terms_.begin()
-                   : terms_.size();
+        auto i = Bound(value, false);
+        return i < terms_.size() && !TermLess(value, terms_[i]) ? i
+                                                                : terms_.size();
     }
     size_t
     TermCount() const {
@@ -473,7 +468,7 @@ class InvertedIndexKnowhereCore {
     }
     T
     Term(size_t i) const {
-        return terms_.at(i);
+        return T(terms_.at(i));
     }
     // Immutable unique-term views, valid until the next Build/destruction.
     // Do not return const T& generically: vector<bool> has proxy elements.
@@ -481,46 +476,23 @@ class InvertedIndexKnowhereCore {
     void
     ForEachStringPrefix(std::string_view prefix, Visitor&& visitor) const
         requires(std::is_same_v<T, std::string>) {
-        auto begin =
-            std::lower_bound(terms_.begin(),
-                             terms_.end(),
-                             prefix,
-                             [](const std::string& term, std::string_view key) {
-                                 return std::string_view(term) < key;
-                             });
-        for (auto it = begin; it != terms_.end(); ++it) {
-            const std::string_view term(*it);
+        for (size_t i = Bound(prefix, false); i < terms_.size(); ++i) {
+            const auto term = terms_[i];
             if (!term.starts_with(prefix))
                 break;
-            visitor(term, static_cast<uint32_t>(it - terms_.begin()));
+            visitor(term, static_cast<uint32_t>(i));
         }
     }
     uint32_t
     DocFreq(size_t i) const {
-        return posting_metas_.at(i).doc_freq;
+        return doc_freqs_.at(i);
     }
     std::pair<size_t, size_t>
     Bounds(const T& lower, bool li, const T& upper, bool ui) const {
         CheckValue(lower);
         CheckValue(upper);
-        size_t begin = (li ? std::lower_bound(terms_.begin(),
-                                              terms_.end(),
-                                              lower,
-                                              KnowhereTermOrder<T>{})
-                           : std::upper_bound(terms_.begin(),
-                                              terms_.end(),
-                                              lower,
-                                              KnowhereTermOrder<T>{})) -
-                       terms_.begin();
-        size_t end = (ui ? std::upper_bound(terms_.begin(),
-                                            terms_.end(),
-                                            upper,
-                                            KnowhereTermOrder<T>{})
-                         : std::lower_bound(terms_.begin(),
-                                            terms_.end(),
-                                            upper,
-                                            KnowhereTermOrder<T>{})) -
-                     terms_.begin();
+        size_t begin = Bound(lower, !li);
+        size_t end = Bound(upper, ui);
         return {begin, std::max(begin, end)};
     }
     void
@@ -528,9 +500,9 @@ class InvertedIndexKnowhereCore {
         AssertInfo(result.size() == count_, "PoC result bitmap size mismatch");
         if (term == terms_.size())
             return;
-        const auto& meta = posting_metas_.at(term);
-        KnowhereSparsePostingCodec::View posting(
-            posting_bytes_.data() + meta.doc_stream_offset, format_);
+        const auto offset = posting_offsets_.at(term);
+        KnowhereSparsePostingCodec::View posting(posting_bytes_.data() + offset,
+                                                 format_);
         std::array<uint32_t, KnowhereSparsePostingCodec::kBlockSize> ids;
         for (size_t b = 0; b < posting.Blocks(); ++b) {
             size_t n = posting.DecodeBlock(b, ids.data());
@@ -571,14 +543,8 @@ class InvertedIndexKnowhereCore {
     TargetBitmap
     Range(const T& value, OpType op) const {
         CheckValue(value);
-        size_t lower =
-            std::lower_bound(
-                terms_.begin(), terms_.end(), value, KnowhereTermOrder<T>{}) -
-            terms_.begin();
-        size_t upper =
-            std::upper_bound(
-                terms_.begin(), terms_.end(), value, KnowhereTermOrder<T>{}) -
-            terms_.begin();
+        size_t lower = Bound(value, false);
+        size_t upper = Bound(value, true);
         switch (op) {
             case OpType::LessThan:
                 return Materialize(0, lower);
@@ -595,6 +561,37 @@ class InvertedIndexKnowhereCore {
     }
 
  private:
+    template <typename A, typename B>
+    static bool
+    TermLess(const A& a, const B& b) {
+        if constexpr (std::is_same_v<T, std::string>)
+            return std::string_view(a) < std::string_view(b);
+        else
+            return KnowhereTermOrder<T>{}(a, b);
+    }
+    template <typename Value>
+    size_t
+    Bound(const Value& value, bool upper) const {
+        size_t lo = 0, hi = terms_.size();
+        while (lo < hi) {
+            const size_t mid = lo + (hi - lo) / 2;
+            const bool advance = upper ? !TermLess(value, terms_[mid])
+                                       : TermLess(terms_[mid], value);
+            if (advance)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        return lo;
+    }
+    void
+    Compact() {
+        terms_.Compact();
+        posting_offsets_.shrink_to_fit();
+        doc_freqs_.shrink_to_fit();
+        posting_bytes_.shrink_to_fit();
+        null_offsets_.shrink_to_fit();
+    }
     PostingFormat format_;
     static void
     CheckValue(const T& value) {
@@ -611,8 +608,9 @@ class InvertedIndexKnowhereCore {
         return result;
     }
     size_t count_ = 0;
-    std::vector<T> terms_;
-    std::vector<TermPostingMeta> posting_metas_;
+    KnowhereTermStorage<T> terms_;
+    std::vector<uint64_t> posting_offsets_;
+    std::vector<uint32_t> doc_freqs_;
     std::vector<uint8_t> posting_bytes_;
     std::vector<size_t> null_offsets_;
 };

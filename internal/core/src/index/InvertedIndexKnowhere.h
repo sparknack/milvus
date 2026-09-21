@@ -52,7 +52,6 @@ class InvertedIndexKnowhere : public ScalarIndex<T> {
         using std::swap;
         swap(core_, other.core_);
         swap(format_, other.format_);
-        swap(dictionary_, other.dictionary_);
         swap(this->cached_byte_size_, other.cached_byte_size_);
     }
 
@@ -101,16 +100,9 @@ class InvertedIndexKnowhere : public ScalarIndex<T> {
  private:
     void
     PublishCore(Core&& next) {
-        FstTermDictionary dictionary;
-        if constexpr (std::is_same_v<T, std::string>) {
-            std::vector<std::string> terms;
-            terms.reserve(next.TermCount());
-            for (size_t i = 0; i < next.TermCount(); ++i)
-                terms.push_back(next.Term(i));
-            dictionary = FstTermDictionary::Build(terms);
-        }
+        // Exact/range/pattern scalar queries use the core's ordered term views.
+        // A second FST was constructed but never used by this adapter.
         core_ = std::move(next);
-        dictionary_ = std::move(dictionary);
         ComputeByteSize();
     }
 
@@ -134,7 +126,7 @@ class InvertedIndexKnowhere : public ScalarIndex<T> {
     }
     void
     ComputeByteSize() override {
-        this->cached_byte_size_ = core_.ByteSize() + dictionary_.ByteSize();
+        this->cached_byte_size_ = core_.ByteSize();
     }
     const bool
     HasRawData() const override {
@@ -294,6 +286,5 @@ class InvertedIndexKnowhere : public ScalarIndex<T> {
  private:
     Core core_;
     KnowhereSparsePostingCodec::Format format_;
-    FstTermDictionary dictionary_;
 };
 }  // namespace milvus::index
