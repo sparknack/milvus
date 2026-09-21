@@ -18,6 +18,9 @@
 
 #include "index/InvertedIndexKnowhere.h"
 #include "index/JsonIndexBuilder.h"
+#include <bit>
+#include <cmath>
+#include <map>
 
 namespace milvus::index {
 // Resident, one-path scalar JSON PoC. Extraction and casting deliberately use
@@ -50,19 +53,36 @@ class JsonPathIndexKnowhere : public InvertedIndexKnowhere<T> {
         FixedVector<T> values(n);
         std::vector<size_t> invalid;
         TargetBitmap exists(n, true), valid(n, true);
+        std::map<uint64_t, std::vector<uint32_t>> nan_postings;
         for (size_t row = 0; row < n; ++row) {
-            if (field->is_valid(row))
+            if (field->is_valid(row)) {
                 values[row] = *static_cast<const T*>(field->RawValue(row));
-            else {
+                if constexpr (std::is_same_v<T, double>) {
+                    if (std::isnan(values[row])) {
+                        nan_postings[OrderedDouble(values[row])].push_back(row);
+                        invalid.push_back(row);
+                    }
+                }
+            } else {
                 invalid.push_back(row);
                 valid.reset(row);
             }
         }
         for (auto row : converted.non_exist_offsets) exists.reset(row);
+        std::unique_ptr<
+            InvertedIndexKnowhereCore<uint64_t, TargetBitmap, OpType>>
+            next_nan;
+        if (!nan_postings.empty()) {
+            next_nan = std::make_unique<
+                InvertedIndexKnowhereCore<uint64_t, TargetBitmap, OpType>>(
+                KnowhereSparsePostingCodec::Format::Adaptive);
+            next_nan->BuildFromPostings(n, nan_postings);
+        }
         // All allocations precede publication. Base construction is transactional;
         // bitmap moves below cannot allocate. Rebuilds require exclusive access.
         InvertedIndexKnowhere<T>::BuildWithNullOffsetsForUT(
             n, values.data(), invalid);
+        nan_ = std::move(next_nan);
         exists_ = std::move(exists);
         valid_ = std::move(valid);
         ComputeByteSize();
@@ -90,10 +110,84 @@ class JsonPathIndexKnowhere : public InvertedIndexKnowhere<T> {
     }
     const TargetBitmap
     NotIn(size_t n, const T* values) override {
-        auto result = InvertedIndexKnowhere<T>::In(n, values);
+        auto result = In(n, values);
         result.flip();
         result &= valid_;
         return result;
+    }
+    const TargetBitmap
+    In(size_t n, const T* values) override {
+        if constexpr (std::is_same_v<T, double>) {
+            bool has_nan = false;
+            for (size_t i = 0; i < n; ++i) has_nan |= std::isnan(values[i]);
+            if (has_nan) {
+                std::vector<double> finite;
+                std::vector<uint64_t> special;
+                for (size_t i = 0; i < n; ++i)
+                    if (std::isnan(values[i]))
+                        special.push_back(OrderedDouble(values[i]));
+                    else
+                        finite.push_back(values[i]);
+                auto result =
+                    InvertedIndexKnowhere<T>::In(finite.size(), finite.data());
+                if (nan_)
+                    result |= nan_->In(special.size(), special.data());
+                return result;
+            }
+        }
+        return InvertedIndexKnowhere<T>::In(n, values);
+    }
+    const TargetBitmap
+    Range(const T& value, OpType op) override {
+        if constexpr (std::is_same_v<T, double>) {
+            if (op != OpType::LessThan && op != OpType::LessEqual &&
+                op != OpType::GreaterThan && op != OpType::GreaterEqual)
+                return InvertedIndexKnowhere<T>::Range(T{}, op);
+            if (!nan_ && !std::isnan(value))
+                return InvertedIndexKnowhere<T>::Range(value, op);
+            TargetBitmap result(this->Count());
+            if (std::isnan(value)) {
+                // The ordinary domain lies strictly between negative/positive NaNs.
+                const bool less =
+                    op == OpType::LessThan || op == OpType::LessEqual;
+                const bool greater =
+                    op == OpType::GreaterThan || op == OpType::GreaterEqual;
+                if ((less && !std::signbit(value)) ||
+                    (greater && std::signbit(value)))
+                    result = InvertedIndexKnowhere<T>::IsNotNull();
+            } else {
+                result =
+                    InvertedIndexKnowhere<T>::CoreForUT()->Range(value, op);
+            }
+            if (nan_)
+                result |= nan_->Range(OrderedDouble(value), op);
+            return result;
+        }
+        return InvertedIndexKnowhere<T>::Range(value, op);
+    }
+    const TargetBitmap
+    Range(const T& lo, bool li, const T& hi, bool ui) override {
+        if constexpr (std::is_same_v<T, double>) {
+            if (!nan_ && !std::isnan(lo) && !std::isnan(hi))
+                return InvertedIndexKnowhere<T>::Range(lo, li, hi, ui);
+            TargetBitmap result(this->Count());
+            if ((!std::isnan(lo) || std::signbit(lo)) &&
+                (!std::isnan(hi) || !std::signbit(hi))) {
+                const double lower =
+                    std::isnan(lo) ? -std::numeric_limits<double>::infinity()
+                                   : lo;
+                const double upper =
+                    std::isnan(hi) ? std::numeric_limits<double>::infinity()
+                                   : hi;
+                result = InvertedIndexKnowhere<T>::CoreForUT()->Range(
+                    lower, std::isnan(lo) || li, upper, std::isnan(hi) || ui);
+            }
+            if (nan_)
+                result |=
+                    nan_->Range(OrderedDouble(lo), li, OrderedDouble(hi), ui);
+            return result;
+        }
+        return InvertedIndexKnowhere<T>::Range(lo, li, hi, ui);
     }
     JsonCastType
     GetCastType() const override {
@@ -106,11 +200,24 @@ class JsonPathIndexKnowhere : public InvertedIndexKnowhere<T> {
     void
     ComputeByteSize() override {
         InvertedIndexKnowhere<T>::ComputeByteSize();
-        this->cached_byte_size_ +=
-            exists_.size_in_bytes() + valid_.size_in_bytes();
+        this->cached_byte_size_ += exists_.size_in_bytes() +
+                                   valid_.size_in_bytes() +
+                                   (nan_ ? nan_->ByteSize() : 0);
     }
 
  private:
+    // Same sortable IEEE-754 mapping as Tantivy common::f64_to_u64, including
+    // signed NaNs and payloads. Keep ordinary scalar core's NaN contract intact.
+    static uint64_t
+    OrderedDouble(double value) {
+        if (value == 0)
+            value = 0;
+        const auto bits = std::bit_cast<uint64_t>(value);
+        constexpr uint64_t sign = uint64_t{1} << 63;
+        return (bits & sign) ? ~bits : bits ^ sign;
+    }
+    std::unique_ptr<InvertedIndexKnowhereCore<uint64_t, TargetBitmap, OpType>>
+        nan_;
     // Hide nonvirtual scalar-only PoC entry points on the JSON adapter.
     using InvertedIndexKnowhere<T>::BuildWithNullOffsetsForUT;
     using InvertedIndexKnowhere<T>::BuildFromPostingsForPoC;
