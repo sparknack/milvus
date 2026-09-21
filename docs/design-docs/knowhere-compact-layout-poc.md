@@ -104,3 +104,18 @@ See [measured results](../../../knowhere-scalar-poc/results/2026-09-21-compact/R
 for old/new file and resident space, same-run Tantivy timings, full segcore parity,
 sanitizers, and legacy snapshot allocation/query probes. Do not mix the historical
 Tantivy wrapper's file-plus-NULL accounting with process RSS.
+
+## Position materialization follow-up
+
+The full matrix exposed a long-TF phrase slowdown absent from the earlier news
+sample. Gated perf localized the main cost to `Reader::Read`'s per-position
+`push_back` loop; AArch64 annotation showed repeated prefix-sum stack traffic and
+vector tail/capacity bookkeeping. The reader now resizes output once from the
+known document TF and writes the cumulative positions directly, retaining buffer
+capacity across documents. Packed metadata, persisted bytes and phrase/slop
+semantics are unchanged.
+
+All 90 phrase and 74 text workloads were rerun with snapshot reload and complete
+result parity. The long-TF group improved from T/K 0.952 to 1.520; real-news phrase
+groups remained approximately unchanged. Snapshot byte counts match for all five
+fixtures. See the external [performance and validation evidence](../../../knowhere-scalar-poc/results/2026-09-21-phrase-packed/README.md).

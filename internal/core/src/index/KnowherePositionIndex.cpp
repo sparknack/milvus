@@ -102,8 +102,10 @@ KnowherePositionIndex::Reader::Read(size_t ordinal,
         freq_block_ = block;
     }
     const uint64_t start = prefix_[in_block], end = prefix_[in_block + 1];
-    output.clear();
-    output.reserve(end - start);
+    // The document's TF gives the exact output length. Reuse the existing
+    // buffer and avoid push_back's capacity branch/tail update for every
+    // position (and the escaping reference to the running prefix sum).
+    output.resize(end - start);
     uint64_t position = offset;
     for (uint64_t i = start; i < end;) {
         const size_t pb = i / 256;
@@ -117,9 +119,11 @@ KnowherePositionIndex::Reader::Read(size_t ordinal,
             ++decode_stats_for_ut.position_blocks;
         }
         const uint64_t stop = std::min(end, (uint64_t(pb) + 1) * 256);
+        const auto* delta = deltas_.data() + i % 256;
+        auto* destination = output.data() + (i - start);
         for (; i < stop; ++i) {
-            position += deltas_[i % 256];
-            output.push_back(position);
+            position += *delta++;
+            *destination++ = position;
         }
     }
 }
