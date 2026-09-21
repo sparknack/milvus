@@ -51,3 +51,10 @@ called equivalent resident memory. Query benchmarks use the same sealed segcore
 Build → snapshot reload → attach → expression / Search flow, complete bitmaps
 and Search results checked against Tantivy. Growing/mmap/production factory
 integration remain outside this resident PoC.
+
+## Follow-up: compressed layouts
+
+The subsequent [compact layout revision](knowhere-compact-layout-poc.md) also
+compresses resident and persisted metadata/keys/position directories and removes
+short-list skip metadata. The unchanged-wire statements above describe only the
+initial capacity-compaction revision.

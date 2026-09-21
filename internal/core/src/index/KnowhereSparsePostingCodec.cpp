@@ -71,9 +71,10 @@ KnowhereSparsePostingCodec::Append(const uint32_t* ids,
     if (count == 0)
         return;
     const size_t blocks = (count + 255) / 256;
+    const bool short_list = format == Format::Adaptive && count <= kBlockSize;
     const size_t maxima = out.size();
-    const size_t ends = maxima + blocks * 4;
-    const size_t start = ends + (blocks - 1) * 4;
+    const size_t ends = maxima + (short_list ? 0 : blocks * 4);
+    const size_t start = ends + (short_list ? 0 : (blocks - 1) * 4);
     out.resize(start);
     std::array<uint32_t, kBlockSize> deltas;
     // Both encode and decode implementations may use 16-byte SIMD accesses.
@@ -86,8 +87,9 @@ KnowhereSparsePostingCodec::Append(const uint32_t* ids,
             deltas[j] = id - previous - 1;
             previous = id;
         }
-        WriteWord(out, maxima + b * 4, previous);
-        if (format == Format::Adaptive) {
+        if (!short_list)
+            WriteWord(out, maxima + b * 4, previous);
+        if (format != Format::StreamVByte) {
             knowhere::sparse::inverted::AdaptiveBlockCodec{}.encode_doc_ids(
                 deltas.data(), size, out);
         } else {
@@ -108,7 +110,8 @@ KnowhereSparsePostingCodec::DecodeChecked(std::span<const uint8_t> bytes,
                                           Format format) {
     using poc_io::Check;
     Check(count > 0 && count <= kBlockSize, "invalid persisted block count");
-    Check(format == Format::Adaptive || format == Format::StreamVByte,
+    Check(format == Format::Adaptive || format == Format::AdaptiveLegacy ||
+              format == Format::StreamVByte,
           "unknown persisted block codec");
     size_t offset = 0;
     auto byte = [&]() {
@@ -178,13 +181,15 @@ KnowhereSparsePostingCodec::DecodeChecked(std::span<const uint8_t> bytes,
     // Worst-case block is the adaptive streamvbyte tag + one control byte
     // per four integers + four payload bytes per integer. Avoid allocating a
     // temporary vector for each validated block during index loading.
-    constexpr size_t max_block_bytes = 1 + (kBlockSize + 3) / 4 + 4 * kBlockSize;
-    Check(bytes.size() <= max_block_bytes, "persisted block exceeds codec bound");
+    constexpr size_t max_block_bytes =
+        1 + (kBlockSize + 3) / 4 + 4 * kBlockSize;
+    Check(bytes.size() <= max_block_bytes,
+          "persisted block exceeds codec bound");
     std::array<uint8_t, max_block_bytes + kPadding> padded{};
     std::copy(bytes.begin(), bytes.end(), padded.begin());
     std::array<uint32_t, kBlockSize> output{};
     const uint8_t* end;
-    if (format == Format::Adaptive) {
+    if (format != Format::StreamVByte) {
         end = knowhere::sparse::inverted::AdaptiveBlockCodec{}.decode(
             padded.data(), output.data(), count);
     } else {
@@ -205,6 +210,11 @@ KnowhereSparsePostingCodec::View::View(const uint8_t* data, Format format)
         if (byte & 128)
             break;
     }
+    short_ = format == Format::Adaptive && count_ <= kBlockSize;
+    if (short_) {
+        blocks_ = data;
+        return;
+    }
     maxima_ = data;
     ends_ = maxima_ + Blocks() * 4;
     blocks_ = ends_ + (Blocks() ? Blocks() - 1 : 0) * 4;
@@ -212,6 +222,11 @@ KnowhereSparsePostingCodec::View::View(const uint8_t* data, Format format)
 uint32_t
 KnowhereSparsePostingCodec::View::MaxDoc(size_t block) const {
     AssertInfo(block < Blocks(), "invalid posting block");
+    if (short_) {
+        std::array<uint32_t, kBlockSize> ids;
+        auto n = DecodeBlock(0, ids.data());
+        return ids[n - 1];
+    }
     return ReadWord(maxima_ + block * 4);
 }
 uint32_t
@@ -226,7 +241,7 @@ KnowhereSparsePostingCodec::View::DecodeBlock(size_t block,
     const size_t size =
         std::min(kBlockSize, size_t(count_) - block * kBlockSize);
     const auto* start = blocks_ + (block ? EndOffset(block - 1) : 0);
-    if (format_ == Format::Adaptive)
+    if (format_ != Format::StreamVByte)
         knowhere::sparse::inverted::AdaptiveBlockCodec{}.decode(
             start, ids, size);
     else
@@ -264,7 +279,7 @@ KnowhereSparsePostingCodec::Cursor::Seek(uint32_t target) {
         return Doc();
     }
     size_t block = started_ ? block_ : 0;
-    if (view_.MaxDoc(block) < target) {
+    if (!view_.Short() && view_.MaxDoc(block) < target) {
         size_t lo = block + 1, hi = view_.Blocks();
         while (lo < hi) {
             size_t mid = lo + (hi - lo) / 2;
@@ -281,10 +296,14 @@ KnowhereSparsePostingCodec::Cursor::Seek(uint32_t target) {
     }
     if (!started_ || block != block_)
         LoadBlock(block);
-    // The block maximum guarantees a result inside this decoded block.
+    // Directory-free short lists may seek past their last document.
     position_ = std::lower_bound(
                     ids_.begin() + position_, ids_.begin() + size_, target) -
                 ids_.begin();
+    if (position_ == size_) {
+        ended_ = true;
+        return kEnd;
+    }
     return Doc();
 }
 

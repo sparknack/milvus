@@ -27,7 +27,7 @@ namespace milvus::index {
 // No value payload or singleton shortcut. Integers use native little endian.
 class KnowhereSparsePostingCodec {
  public:
-    enum class Format { StreamVByte, Adaptive };
+    enum class Format { StreamVByte, Adaptive, AdaptiveLegacy };
     static constexpr size_t kBlockSize = 256;
     static constexpr size_t kPadding = 16;
     static void
@@ -48,6 +48,10 @@ class KnowhereSparsePostingCodec {
     class View {
      public:
         explicit View(const uint8_t* data, Format format = Format::StreamVByte);
+        bool
+        Short() const {
+            return short_;
+        }
         uint32_t
         Count() const {
             return count_;
@@ -65,6 +69,7 @@ class KnowhereSparsePostingCodec {
 
      private:
         Format format_;
+        bool short_ = false;
         uint32_t count_ = 0;
         const uint8_t* maxima_ = nullptr;
         const uint8_t* ends_ = nullptr;

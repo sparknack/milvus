@@ -38,26 +38,36 @@ class NgramIndexKnowhere : public ScalarIndex<std::string>,
         w.Bytes(core_.SerializeForPoC());
         auto terms = dictionary_.Enumerate();
         w.U64(terms.size());
-        for (const auto& [term, id] : terms) w.String(term);
-        return poc_io::Pack("KNGRAM01", 4, 0, w.data);
+        KnowhereTermStorage<std::string> keys;
+        for (const auto& [term, id] : terms) keys.push_back(term);
+        keys.Compact();
+        keys.Save(w);
+        return poc_io::Pack("KNGRAM01", 4, 1, w.data);
     }
     virtual void
     LoadForPoC(std::span<const uint8_t> bytes) {
-        poc_io::Reader r(poc_io::UnpackAdapter(bytes, "KNGRAM01", 4));
+        uint32_t codec = 0;
+        poc_io::Reader r(poc_io::Unpack(bytes, "KNGRAM01", 4, &codec));
+        poc_io::Check(codec <= 1, "unsupported dictionary snapshot format");
         poc_io::Check(r.U64() == min_, "ngram minimum mismatch");
         poc_io::Check(r.U64() == max_, "ngram maximum mismatch");
         const auto average = r.U64();
         Core next;
         next.LoadForPoC(r.Bytes());
         const auto count = r.U64();
-        poc_io::Check(count == next.TermCount() && count <= r.Remaining()/8,
+        poc_io::Check(count == next.TermCount() &&
+                          (codec == 1 || count <= r.Remaining() / 8),
                       "ngram dictionary count mismatch");
+        KnowhereTermStorage<std::string> keys;
+        if (codec == 1)
+            keys.Load(r, count);
         std::vector<std::string> terms;
         terms.reserve(count);
-        for (size_t i=0; i<count; ++i) {
-            terms.push_back(r.String());
-            poc_io::Check(next.Term(i)==i && (i==0 || terms[i-1]<terms[i]) &&
-                          terms[i].find('\0') == std::string::npos,
+        for (size_t i = 0; i < count; ++i) {
+            terms.push_back(codec == 1 ? keys[i] : r.String());
+            poc_io::Check(next.Term(i) == i &&
+                              (i == 0 || terms[i - 1] < terms[i]) &&
+                              terms[i].find('\0') == std::string::npos,
                           "invalid ngram dictionary");
         }
         r.Finish();
@@ -67,6 +77,7 @@ class NgramIndexKnowhere : public ScalarIndex<std::string>,
         average_row_bytes_ = average;
         ComputeByteSize();
     }
+
  protected:
     void
     SwapStateForPoC(NgramIndexKnowhere& other) noexcept {
@@ -80,8 +91,8 @@ class NgramIndexKnowhere : public ScalarIndex<std::string>,
         swap(query_analyzer_, other.query_analyzer_);
         swap(cached_byte_size_, other.cached_byte_size_);
     }
- public:
 
+ public:
     using Core = InvertedIndexKnowhereCore<uint32_t, TargetBitmap, OpType>;
     NgramIndexKnowhere(size_t min_gram, size_t max_gram)
         : ScalarIndex<std::string>(NGRAM_INDEX_TYPE),
@@ -360,7 +371,8 @@ class NgramIndexKnowhere : public ScalarIndex<std::string>,
                 // Keep the character/segment matcher in this predicate's
                 // compiled body. The two gather paths otherwise make GCC
                 // outline SegmentMatchesAt inside its per-character loop.
-                apply([&](auto s) __attribute__((flatten)) { return matcher(s); });
+                apply([&](auto s)
+                          __attribute__((flatten)) { return matcher(s); });
                 break;
             }
             case OpType::RegexMatch: {

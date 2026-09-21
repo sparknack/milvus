@@ -20,6 +20,8 @@
 #include <cstdint>
 #include <span>
 #include <vector>
+#include <type_traits>
+#include "index/KnowherePackedVector.h"
 
 namespace milvus::index {
 // Resident, immutable after publication. LoadForPoC validates persisted streams
@@ -74,9 +76,71 @@ class KnowherePositionIndex {
     };
 
  private:
-    std::vector<Term> terms_;
-    std::vector<DocBlock> doc_blocks_;
-    std::vector<uint64_t> position_offsets_;
+    template <typename Record>
+    struct Records {
+        static constexpr size_t N = std::is_same_v<Record, Term> ? 4 : 2;
+        std::array<KnowherePackedVector, N> columns;
+        size_t
+        size() const {
+            return columns[0].size();
+        }
+        void
+        reserve(size_t n) {
+            for (auto& c : columns) c.reserve(n);
+        }
+        void
+        push_back(Record value) {
+            if constexpr (std::is_same_v<Record, Term>) {
+                columns[0].push_back(value.doc_block_begin);
+                columns[1].push_back(value.pos_block_begin);
+                columns[2].push_back(value.positions);
+                columns[3].push_back(value.docs);
+            } else {
+                columns[0].push_back(value.freq_offset);
+                columns[1].push_back(value.position_base);
+            }
+        }
+        Record
+        operator[](size_t i) const {
+            if constexpr (std::is_same_v<Record, Term>)
+                return {columns[0][i],
+                        columns[1][i],
+                        columns[2][i],
+                        uint32_t(columns[3][i])};
+            else
+                return {columns[0][i], columns[1][i]};
+        }
+        Record
+        at(size_t i) const {
+            (void)columns[0].at(i);
+            return (*this)[i];
+        }
+        void
+        Compact() {
+            for (auto& c : columns) c.Compact();
+        }
+        size_t
+        Bytes() const {
+            size_t n = 0;
+            for (auto& c : columns) n += c.Bytes();
+            return n;
+        }
+        void
+        Save(poc_io::Writer& w) const {
+            for (auto& c : columns) c.Save(w);
+        }
+        void
+        Load(poc_io::Reader& r, size_t n) {
+            for (auto& c : columns) c.Load(r, n);
+            if constexpr (std::is_same_v<Record, Term>)
+                for (size_t i = 0; i < n; ++i)
+                    poc_io::Check(columns[3][i] <= UINT32_MAX,
+                                  "packed position DF overflow");
+        }
+    };
+    Records<Term> terms_;
+    Records<DocBlock> doc_blocks_;
+    KnowherePackedVector position_offsets_;
     std::vector<uint8_t> frequencies_, positions_;
     bool sealed_ = false;
 };

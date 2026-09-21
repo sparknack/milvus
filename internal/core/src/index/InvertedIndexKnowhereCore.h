@@ -56,38 +56,19 @@ class InvertedIndexKnowhereCore {
         poc_io::Writer writer;
         writer.U64(count_);
         writer.U64(terms_.size());
-        for (size_t i = 0; i < terms_.size(); ++i) {
-            const auto value = terms_[i];
-            if constexpr (std::is_same_v<T, std::string>)
-                writer.String(value);
-            else if constexpr (std::is_same_v<T, bool>)
-                writer.U8(value);
-            else if constexpr (std::is_same_v<T, float>)
-                writer.U32(std::bit_cast<uint32_t>(value));
-            else if constexpr (std::is_same_v<T, double>)
-                writer.U64(std::bit_cast<uint64_t>(value));
-            else
-                writer.U64(static_cast<std::make_unsigned_t<T>>(value));
-        }
-        // Preserve the existing wire layout; only the resident representation
-        // is compact. Length and per-term version are redundant in memory.
-        for (size_t i = 0; i < posting_offsets_.size(); ++i) {
-            writer.U64(posting_offsets_[i]);
-            writer.U64((i + 1 < posting_offsets_.size()
-                            ? posting_offsets_[i + 1]
-                            : PostingLogicalBytes()) -
-                       posting_offsets_[i]);
-            writer.U32(doc_freqs_[i]);
-            writer.U32(1);
-        }
+        terms_.Save(writer);
+        posting_offsets_.Save(writer);
+        doc_freqs_.Save(writer);
         writer.U64(null_offsets_.size());
         for (auto row : null_offsets_) writer.U32(row);
         writer.Bytes(std::span<const uint8_t>(posting_bytes_.data(),
                                               PostingLogicalBytes()));
-        return poc_io::Pack("KWPCCORE",
-                            poc_io::TypeTag<T>(),
-                            format_ == PostingFormat::Adaptive ? 1 : 0,
-                            writer.data);
+        return poc_io::Pack(
+            "KWPCCORE",
+            poc_io::TypeTag<T>(),
+            2 | (format_ != PostingFormat::StreamVByte ? 1 : 0) |
+                (format_ == PostingFormat::Adaptive ? 4 : 0),
+            writer.data);
     }
 
     void
@@ -96,64 +77,86 @@ class InvertedIndexKnowhereCore {
         uint32_t codec = 0;
         poc_io::Reader reader(
             poc_io::Unpack(blob, "KWPCCORE", poc_io::TypeTag<T>(), &codec));
-        Check(codec <= 1, "unknown persisted posting format");
+        Check(
+            codec == 0 || codec == 1 || codec == 2 || codec == 3 || codec == 7,
+            "unknown persisted posting format");
+        const bool compact = codec & 2;
         Check(std::endian::native == std::endian::little,
               "persisted posting codec requires little endian");
-        InvertedIndexKnowhereCore next(codec == 1 ? PostingFormat::Adaptive
-                                                  : PostingFormat::StreamVByte);
+        InvertedIndexKnowhereCore next((codec & 4) ? PostingFormat::Adaptive
+                                       : (codec & 1)
+                                           ? PostingFormat::AdaptiveLegacy
+                                           : PostingFormat::StreamVByte);
         const uint64_t count = reader.U64(), term_count = reader.U64();
         Check(count <= INT32_MAX && term_count <= UINT32_MAX,
               "persisted core domain exceeds limits");
-        // Every entry has at least one term byte and 24 metadata bytes.
-        Check(term_count <= reader.Remaining() / 25,
-              "persisted term count exceeds payload");
         next.count_ = count;
-        next.terms_.reserve(term_count);
-        for (size_t i = 0; i < term_count; ++i) {
-            T value;
-            if constexpr (std::is_same_v<T, std::string>) {
-                value = reader.String();
-                Check(value.find('\0') == std::string::npos,
-                      "persisted term contains NUL");
-            } else if constexpr (std::is_same_v<T, bool>) {
-                auto raw = reader.U8();
-                Check(raw <= 1, "invalid persisted bool term");
-                value = raw;
-            } else if constexpr (std::is_same_v<T, float>) {
-                value = std::bit_cast<float>(reader.U32());
-
-            } else if constexpr (std::is_same_v<T, double>) {
-                value = std::bit_cast<double>(reader.U64());
-
-            } else {
-                using Unsigned = std::make_unsigned_t<T>;
-                auto raw = reader.U64();
-                Check(raw <= std::numeric_limits<Unsigned>::max(),
-                      "persisted integer term exceeds type width");
-                value = std::bit_cast<T>(static_cast<Unsigned>(raw));
-            }
-            Check(next.terms_.empty() || TermLess(next.terms_.back(), value),
-                  "persisted terms are not strictly ordered");
-            next.terms_.push_back(std::move(value));
-        }
-        Check(term_count <= reader.Remaining() / 24,
-              "truncated persisted term metadata");
         std::vector<TermPostingMeta> wire_metas;
-        wire_metas.reserve(term_count);
-        next.posting_offsets_.reserve(term_count);
-        next.doc_freqs_.reserve(term_count);
-        for (size_t i = 0; i < term_count; ++i) {
-            TermPostingMeta meta;
-            meta.doc_stream_offset = reader.U64();
-            meta.doc_stream_length = reader.U64();
-            meta.doc_freq = reader.U32();
-            meta.format_version = reader.U32();
-            Check(meta.format_version == 1 && meta.doc_freq > 0 &&
-                      meta.doc_freq <= count,
-                  "invalid persisted posting metadata");
-            wire_metas.push_back(meta);
-            next.posting_offsets_.push_back(meta.doc_stream_offset);
-            next.doc_freqs_.push_back(meta.doc_freq);
+        if (compact) {
+            next.terms_.Load(reader, term_count);
+            next.posting_offsets_.Load(reader, term_count);
+            next.doc_freqs_.Load(reader, term_count);
+            for (size_t i = 0; i < term_count; ++i) {
+                const auto value = next.terms_[i];
+                if constexpr (std::is_same_v<T, std::string>)
+                    Check(value.find('\0') == std::string::npos,
+                          "persisted term contains NUL");
+                Check(i == 0 || TermLess(next.terms_[i - 1], value),
+                      "persisted terms are not strictly ordered");
+                Check(next.doc_freqs_[i] > 0 && next.doc_freqs_[i] <= count,
+                      "invalid persisted posting metadata");
+            }
+        } else {
+            // Every entry has at least one term byte and 24 metadata bytes.
+            Check(term_count <= reader.Remaining() / 25,
+                  "persisted term count exceeds payload");
+            next.terms_.reserve(term_count);
+            for (size_t i = 0; i < term_count; ++i) {
+                T value;
+                if constexpr (std::is_same_v<T, std::string>) {
+                    value = reader.String();
+                    Check(value.find('\0') == std::string::npos,
+                          "persisted term contains NUL");
+                } else if constexpr (std::is_same_v<T, bool>) {
+                    auto raw = reader.U8();
+                    Check(raw <= 1, "invalid persisted bool term");
+                    value = raw;
+                } else if constexpr (std::is_same_v<T, float>) {
+                    value = std::bit_cast<float>(reader.U32());
+
+                } else if constexpr (std::is_same_v<T, double>) {
+                    value = std::bit_cast<double>(reader.U64());
+
+                } else {
+                    using Unsigned = std::make_unsigned_t<T>;
+                    auto raw = reader.U64();
+                    Check(raw <= std::numeric_limits<Unsigned>::max(),
+                          "persisted integer term exceeds type width");
+                    value = std::bit_cast<T>(static_cast<Unsigned>(raw));
+                }
+                Check(
+                    next.terms_.empty() || TermLess(next.terms_.back(), value),
+                    "persisted terms are not strictly ordered");
+                next.terms_.push_back(std::move(value));
+            }
+            Check(term_count <= reader.Remaining() / 24,
+                  "truncated persisted term metadata");
+            wire_metas.reserve(term_count);
+            next.posting_offsets_.reserve(term_count);
+            next.doc_freqs_.reserve(term_count);
+            for (size_t i = 0; i < term_count; ++i) {
+                TermPostingMeta meta;
+                meta.doc_stream_offset = reader.U64();
+                meta.doc_stream_length = reader.U64();
+                meta.doc_freq = reader.U32();
+                meta.format_version = reader.U32();
+                Check(meta.format_version == 1 && meta.doc_freq > 0 &&
+                          meta.doc_freq <= count,
+                      "invalid persisted posting metadata");
+                wire_metas.push_back(meta);
+                next.posting_offsets_.push_back(meta.doc_stream_offset);
+                next.doc_freqs_.push_back(meta.doc_freq);
+            }
         }
         const uint64_t null_count = reader.U64();
         Check(null_count <= count && null_count <= reader.Remaining() / 4,
@@ -168,6 +171,18 @@ class InvertedIndexKnowhereCore {
         }
         auto bytes = reader.Bytes();
         reader.Finish();
+        if (compact) {
+            wire_metas.reserve(term_count);
+            for (size_t i = 0; i < term_count; ++i) {
+                auto offset = next.posting_offsets_[i];
+                auto end = i + 1 < term_count ? next.posting_offsets_[i + 1]
+                                              : bytes.size();
+                Check(offset <= end && end <= bytes.size(),
+                      "invalid compact posting extent");
+                wire_metas.push_back(
+                    {offset, end - offset, uint32_t(next.doc_freqs_[i]), 1});
+            }
+        }
         uint64_t expected_offset = 0;
         for (const auto& meta : wire_metas) {
             Check(meta.doc_stream_offset == expected_offset &&
@@ -191,7 +206,9 @@ class InvertedIndexKnowhereCore {
             }
             Check(df == meta.doc_freq, "persisted posting DF mismatch");
             const size_t blocks = (size_t(df) + 255) / 256;
-            const size_t directory = (2 * blocks - 1) * 4;
+            const bool short_list =
+                next.format_ == PostingFormat::Adaptive && df <= 256;
+            const size_t directory = short_list ? 0 : (2 * blocks - 1) * 4;
             Check(directory <= posting.size() - header,
                   "truncated persisted block directory");
             auto word = [&](size_t position) {
@@ -224,14 +241,15 @@ class InvertedIndexKnowhereCore {
                     last = id;
                     next_id = id + 1;
                 }
-                Check(last == word(header + block * 4),
+                Check(short_list || last == word(header + block * 4),
                       "persisted block maximum mismatch");
                 start = end;
             }
         }
         Check(expected_offset == bytes.size(),
               "unreferenced persisted posting bytes");
-        next.posting_bytes_.reserve(bytes.size() + KnowhereSparsePostingCodec::kPadding);
+        next.posting_bytes_.reserve(bytes.size() +
+                                    KnowhereSparsePostingCodec::kPadding);
         next.posting_bytes_.assign(bytes.begin(), bytes.end());
         next.posting_bytes_.resize(
             next.posting_bytes_.size() + KnowhereSparsePostingCodec::kPadding,
@@ -444,8 +462,7 @@ class InvertedIndexKnowhereCore {
     MemoryStats
     Memory() const {
         return {terms_.Bytes(),
-                posting_offsets_.capacity() * sizeof(uint64_t) +
-                    doc_freqs_.capacity() * sizeof(uint32_t),
+                posting_offsets_.Bytes() + doc_freqs_.Bytes(),
                 posting_bytes_.capacity(),
                 null_offsets_.capacity() * sizeof(size_t)};
     }
@@ -470,14 +487,16 @@ class InvertedIndexKnowhereCore {
     Term(size_t i) const {
         return T(terms_.at(i));
     }
-    // Immutable unique-term views, valid until the next Build/destruction.
+    // Callback-only term views backed by query-local scratch; do not retain them.
     // Do not return const T& generically: vector<bool> has proxy elements.
     template <typename Visitor>
     void
     ForEachStringPrefix(std::string_view prefix, Visitor&& visitor) const
         requires(std::is_same_v<T, std::string>) {
+        std::string scratch;
         for (size_t i = Bound(prefix, false); i < terms_.size(); ++i) {
-            const auto term = terms_[i];
+            terms_.Get(i, scratch);
+            const std::string_view term(scratch);
             if (!term.starts_with(prefix))
                 break;
             visitor(term, static_cast<uint32_t>(i));
@@ -587,8 +606,8 @@ class InvertedIndexKnowhereCore {
     void
     Compact() {
         terms_.Compact();
-        posting_offsets_.shrink_to_fit();
-        doc_freqs_.shrink_to_fit();
+        posting_offsets_.Compact();
+        doc_freqs_.Compact();
         posting_bytes_.shrink_to_fit();
         null_offsets_.shrink_to_fit();
     }
@@ -609,8 +628,8 @@ class InvertedIndexKnowhereCore {
     }
     size_t count_ = 0;
     KnowhereTermStorage<T> terms_;
-    std::vector<uint64_t> posting_offsets_;
-    std::vector<uint32_t> doc_freqs_;
+    KnowherePackedVector posting_offsets_;
+    KnowherePackedVector doc_freqs_;
     std::vector<uint8_t> posting_bytes_;
     std::vector<size_t> null_offsets_;
 };

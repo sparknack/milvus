@@ -37,31 +37,41 @@ class TextMatchIndexKnowhere final : public TextMatchIndexBase {
         w.Bytes(core_.SerializeForPoC());
         auto terms = dictionary_.Enumerate();
         w.U64(terms.size());
-        for (const auto& [term, id] : terms) w.String(term);
+        KnowhereTermStorage<std::string> keys;
+        for (const auto& [term, id] : terms) keys.push_back(term);
+        keys.Compact();
+        keys.Save(w);
         w.Bytes(positions_.SerializeForPoC());
-        return poc_io::Pack("KTEXT001", 3, 0, w.data);
+        return poc_io::Pack("KTEXT001", 3, 1, w.data);
     }
     void
     LoadForPoC(std::span<const uint8_t> bytes) {
-        poc_io::Reader r(poc_io::UnpackAdapter(bytes, "KTEXT001", 3));
+        uint32_t codec = 0;
+        poc_io::Reader r(poc_io::Unpack(bytes, "KTEXT001", 3, &codec));
+        poc_io::Check(codec <= 1, "unsupported dictionary snapshot format");
         auto params = r.String();
         // Schema/analyzer binding is supplied by the segment, like other PoC
         // adapter configuration. Refuse a snapshot for a different analyzer.
-        poc_io::Check(params == analyzer_params_, "text analyzer configuration mismatch");
+        poc_io::Check(params == analyzer_params_,
+                      "text analyzer configuration mismatch");
         Core next;
         next.LoadForPoC(r.Bytes());
         const auto count = r.U64();
-        poc_io::Check(count == next.TermCount() && count <= r.Remaining() / 8,
+        poc_io::Check(count == next.TermCount() &&
+                          (codec == 1 || count <= r.Remaining() / 8),
                       "text dictionary count mismatch");
+        KnowhereTermStorage<std::string> keys;
+        if (codec == 1)
+            keys.Load(r, count);
         std::vector<std::string> terms;
         std::vector<uint32_t> dfs;
         terms.reserve(count);
         dfs.reserve(count);
         for (size_t i = 0; i < count; ++i) {
-            terms.push_back(r.String());
+            terms.push_back(codec == 1 ? keys[i] : r.String());
             poc_io::Check(next.Term(i) == i &&
-                          (i == 0 || terms[i-1] < terms[i]) &&
-                          terms[i].find('\0') == std::string::npos,
+                              (i == 0 || terms[i - 1] < terms[i]) &&
+                              terms[i].find('\0') == std::string::npos,
                           "invalid text dictionary ordinal/order");
             dfs.push_back(next.DocFreq(i));
         }
@@ -231,19 +241,19 @@ class TextMatchIndexKnowhere final : public TextMatchIndexBase {
         std::vector<std::string> queries;
         while (stream->advance()) {
             auto term = stream->get_token();
-            if (std::find(queries.begin(), queries.end(), term) != queries.end())
+            if (std::find(queries.begin(), queries.end(), term) !=
+                queries.end())
                 continue;
             queries.push_back(term);
-            dictionary_.ForEachFuzzy(term, max_edits,
-                                    [&](std::string_view, uint32_t id) {
-                                        expanded.push_back(id);
-                                    });
+            dictionary_.ForEachFuzzy(
+                term, max_edits, [&](std::string_view, uint32_t id) {
+                    expanded.push_back(id);
+                });
         }
         std::sort(expanded.begin(), expanded.end());
         expanded.erase(std::unique(expanded.begin(), expanded.end()),
                        expanded.end());
-        for (auto term : expanded)
-            core_.DecodeInto(term, result);
+        for (auto term : expanded) core_.DecodeInto(term, result);
         return result;
     }
     TargetBitmap
