@@ -1,3 +1,4 @@
+#include "folly/coro/BlockingWait.h"
 // Licensed to the LF AI & Data foundation under one
 // or more contributor license agreements. See the NOTICE file
 // distributed with this work for additional information
@@ -415,16 +416,17 @@ ResolvePackedLoadFamily(const IndexFamily& requested_family,
     return family;
 }
 
-IndexFamily
-ResolveLoadFamily(const IndexFamily& requested_family,
-                  storage::FileSource& source,
-                  const Config& load_params) {
+folly::coro::Task<IndexFamily>
+ResolveLoadFamilyAsync(const IndexFamily& requested_family,
+                       storage::FileSource& source,
+                       const Config& load_params,
+                       bool use_async) {
     if (requested_family != families::kHybrid) {
-        return requested_family;
+        co_return requested_family;
     }
 
     uint8_t encoded_type = 0;
-    auto bytes = source.ReadEntry(INDEX_TYPE);
+    auto bytes = co_await source.ReadEntryAsync(INDEX_TYPE, use_async);
     if (bytes.size() != sizeof(encoded_type)) {
         ThrowInfo(DataFormatBroken,
                   "invalid HYBRID V1/V2 selector size: {}",
@@ -439,7 +441,15 @@ ResolveLoadFamily(const IndexFamily& requested_family,
                   "unsupported HYBRID internal index type: {}",
                   encoded_type);
     }
-    return family;
+    co_return family;
+}
+
+IndexFamily
+ResolveLoadFamily(const IndexFamily& requested_family,
+                  storage::FileSource& source,
+                  const Config& load_params) {
+    return folly::coro::blockingWait(
+        ResolveLoadFamilyAsync(requested_family, source, load_params, false));
 }
 
 std::string

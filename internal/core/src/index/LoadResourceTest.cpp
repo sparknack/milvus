@@ -15,6 +15,8 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <cstring>
 #include <filesystem>
 #include <arrow/filesystem/localfs.h>
 #include "folly/ScopeGuard.h"
@@ -145,11 +147,33 @@ TEST(LegacyHybridResourceEstimate, ResolvesPersistedChildType) {
         auto data = std::make_shared<uint8_t[]>(1);
         data[0] = static_cast<uint8_t>(type);
         binary_set.Append(INDEX_TYPE, data, 1);
+        // Async estimation inspects real legacy envelopes. Bitmap also reads
+        // its cardinality/row metadata; the estimator never decodes postings.
+        const auto bitmap_meta = Config{
+            {BITMAP_INDEX_LENGTH, 2},
+            {BITMAP_INDEX_NUM_ROWS,
+             rows}}.dump();
+        auto meta_bytes = std::make_shared<uint8_t[]>(bitmap_meta.size());
+        std::memcpy(meta_bytes.get(), bitmap_meta.data(), bitmap_meta.size());
+        binary_set.Append(BITMAP_INDEX_META, meta_bytes, bitmap_meta.size());
+        auto payload = std::make_shared<uint8_t[]>(17);
+        std::fill_n(payload.get(), 17, uint8_t{42});
+        binary_set.Append("index_data", payload, 17);
         ASSERT_TRUE(manager.AddFile(binary_set));
-        ASSERT_EQ(manager.GetRemotePathsToFileSize().size(), 1);
-        const std::vector<std::string> files{
-            fixture.root->Path() + "/unread_index_payload",
-            manager.GetRemotePathsToFileSize().begin()->first};
+        ASSERT_EQ(manager.GetRemotePathsToFileSize().size(), 3);
+        std::vector<std::string> async_files;
+        std::string selector_path;
+        for (const auto& [path, bytes] : manager.GetRemotePathsToFileSize()) {
+            async_files.push_back(path);
+            if (std::filesystem::path(path).filename() == INDEX_TYPE) {
+                selector_path = path;
+            }
+        }
+        ASSERT_FALSE(selector_path.empty());
+        // Preserve the synchronous regression: resolving the child must not
+        // open any engine payload while using the size-only estimate.
+        const std::vector<std::string> sync_files{
+            fixture.root->Path() + "/unread_index_payload", selector_path};
         for (const auto* version : {"1", "2", ""}) {
             std::map<std::string, std::string> params{
                 {INDEX_TYPE, HYBRID_INDEX_TYPE}};
@@ -164,13 +188,22 @@ TEST(LegacyHybridResourceEstimate, ResolvesPersistedChildType) {
                     SCOPED_TRACE(::testing::Message()
                                  << name << " version=" << version
                                  << " async=" << async << " mmap=" << mmap);
+                    const auto& files = async ? async_files : sync_files;
                     const auto expected =
-                        ScalarIndexLoadResource(DataType::INT64,
-                                                0,
-                                                index_size,
-                                                child_params,
-                                                mmap,
-                                                rows);
+                        async ? ScalarIndexFileLoadResource(DataType::INT64,
+                                                            index_size,
+                                                            child_params,
+                                                            mmap,
+                                                            rows,
+                                                            files,
+                                                            ctx)
+                                    .request
+                              : ScalarIndexLoadResource(DataType::INT64,
+                                                        0,
+                                                        index_size,
+                                                        child_params,
+                                                        mmap,
+                                                        rows);
                     const auto resources =
                         ScalarIndexFileLoadResource(DataType::INT64,
                                                     index_size,

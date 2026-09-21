@@ -17,6 +17,10 @@
 #include "index/LoadResource.h"
 
 #include <algorithm>
+#include "yaml-cpp/yaml.h"
+#include "storage/LocalFileIOPool.h"
+#include "index/vector/VectorDiskLoader.h"
+#include "index/vector/KnowhereEngine.h"
 #include <cstring>
 #include <limits>
 
@@ -523,6 +527,195 @@ ScalarIndexLoadResource(DataType field_type,
                                                stream_memory_overhead);
 }
 
+namespace {
+// Envelope inspection measures decoded bytes and admitted scratch, rather than
+// treating compressed object size as the in-memory load peak.
+LoadResourceRequest
+LegacyScalarLoadResource(DataType field_type,
+                         uint64_t index_size,
+                         const std::map<std::string, std::string>& index_params,
+                         bool mmap_enable,
+                         int64_t num_rows,
+                         const std::vector<std::string>& paths,
+                         const storage::FileManagerContext& context) {
+    auto estimate = [&]() -> folly::coro::Task<LoadResourceRequest> {
+        auto params = index_params;
+        auto type = params.at(INDEX_TYPE);
+        const bool directory_layout =
+            type == HYBRID_INDEX_TYPE || type == INVERTED_INDEX_TYPE ||
+            type == NGRAM_INDEX_TYPE || type == RTREE_INDEX_TYPE;
+        storage::LoadOptions options;
+        options.params = ParseConfigFromIndexParams(params);
+        auto source = co_await storage::V1RemoteSource::OpenAsync(
+            context,
+            paths,
+            options,
+            storage::ArtifactStoragePath::Index,
+            directory_layout ? storage::V1SourceLayout::DiskFiles
+                             : storage::V1SourceLayout::MemoryEntries);
+        if (type == HYBRID_INDEX_TYPE) {
+            const auto family = co_await ResolveLoadFamilyAsync(
+                families::kHybrid, *source, options.params);
+            for (const auto child : {ScalarIndexType::BITMAP,
+                                     ScalarIndexType::STLSORT,
+                                     ScalarIndexType::MARISA,
+                                     ScalarIndexType::INVERTED}) {
+                if (FamilyFromScalarIndexType(child) == family) {
+                    type = HybridInternalIndexTypeToIndexType(child);
+                    break;
+                }
+            }
+            params[INDEX_TYPE] = type;
+        }
+        const auto names = source->EntryNames();
+        const auto bytes = co_await source->InspectLoadBytesAsync(names);
+        const auto persisted = std::max(index_size, bytes.payload);
+        auto rows = num_rows;
+        if (field_type == DataType::ARRAY) {
+            rows = std::max<int64_t>(
+                rows,
+                std::min<uint64_t>(bytes.payload,
+                                   std::numeric_limits<int64_t>::max()));
+        }
+        uint64_t cardinality = 0;
+        if (type == BITMAP_INDEX_TYPE) {
+            const auto encoded =
+                co_await source->ReadEntryAsync(BITMAP_INDEX_META);
+            try {
+                const auto meta =
+                    YAML::Load(std::string(encoded.begin(), encoded.end()));
+                const auto count = meta[BITMAP_INDEX_NUM_ROWS].as<uint64_t>();
+                cardinality = meta[BITMAP_INDEX_LENGTH].as<uint64_t>();
+                if (count > uint64_t{std::numeric_limits<int64_t>::max()}) {
+                    ThrowInfo(DataFormatBroken,
+                              "legacy bitmap row count exceeds int64");
+                }
+                rows = std::max(rows, static_cast<int64_t>(count));
+            } catch (const YAML::Exception& error) {
+                ThrowInfo(DataFormatBroken,
+                          "invalid legacy bitmap metadata: {}",
+                          error.what());
+            }
+            // Low-cardinality bitmaps stay resident even when mmap is requested.
+            if (cardinality <= DEFAULT_BITMAP_INDEX_BUILD_MODE_BOUND) {
+                mmap_enable = false;
+            }
+        }
+        auto request = ScalarIndexLoadResourceWithOverhead(
+            field_type, persisted, params, mmap_enable, rows, 0);
+        if (type == BITMAP_INDEX_TYPE) {
+            auto resident = SaturatingAdd(ValidityBitmapBytes(rows),
+                                          SaturatingMul(cardinality, 128));
+            if (cardinality <= DEFAULT_BITMAP_INDEX_BUILD_MODE_BOUND) {
+                resident = SaturatingAdd(
+                    resident,
+                    SaturatingMul(ValidityBitmapBytes(rows), cardinality));
+            }
+            if (GetValueFromConfig<bool>(options.params, ENABLE_OFFSET_CACHE)
+                    .value_or(false)) {
+                resident = SaturatingAdd(
+                    resident,
+                    SaturatingMul(uint64_t{std::max<int64_t>(0, rows)},
+                                  sizeof(void*)));
+            }
+            request.final_memory_cost =
+                std::max(request.final_memory_cost, resident);
+        }
+        if (!mmap_enable &&
+            (type == MARISA_TRIE || type == MARISA_TRIE_UPPER)) {
+            request.final_memory_cost = SaturatingAdd(
+                request.final_memory_cost, MarisaLegacyCsrBytes(rows, 2));
+        }
+        std::vector<std::string> sidecars;
+        for (const auto& name : names) {
+            if (name == INDEX_NULL_OFFSET ||
+                name == INDEX_NON_EXIST_OFFSET_FILE_NAME ||
+                name == "ngram_avg_row_size") {
+                sidecars.push_back(name);
+            }
+        }
+        const auto sidecar_bytes =
+            co_await source->InspectLoadBytesAsync(sidecars);
+        if (field_type == DataType::JSON) {
+            request.final_memory_cost =
+                SaturatingAdd(request.final_memory_cost,
+                              SaturatingAdd(sidecar_bytes.payload,
+                                            ValidityBitmapBytes(rows)));
+        } else if (type == INVERTED_INDEX_TYPE || type == NGRAM_INDEX_TYPE) {
+            request.final_memory_cost =
+                SaturatingAdd(request.final_memory_cost, sidecar_bytes.payload);
+        }
+        auto retained = sidecar_bytes.payload;
+        if (type == BITMAP_INDEX_TYPE && !mmap_enable) {
+            retained = bytes.payload;
+        }
+        const auto scratch = SaturatingAdd(
+            bytes.transient,
+            SaturatingAdd(
+                bytes.directory,
+                SaturatingAdd(retained,
+                              uint64_t{storage::FileWriter::MAX_BUFFER_SIZE})));
+        request.max_memory_cost = SaturatingAdd(
+            std::max(request.max_memory_cost, request.final_memory_cost),
+            scratch);
+        // Numeric sorted heap loads also stage their input before decoding.
+        request.max_disk_cost = std::max(request.max_disk_cost, persisted);
+        if (field_type == DataType::ARRAY) {
+            request.has_raw_data = false;
+        }
+        co_return request;
+    };
+    return folly::coro::blockingWait(folly::coro::co_withExecutor(
+        storage::ResolveAsyncLoadExecutor(
+            storage::LocalFileIOPool::GetInstance().GetExecutor(),
+            proto::common::LoadPriority::HIGH),
+        estimate()));
+}
+}  // namespace
+
+LoadResourceRequest
+LegacyVectorFileLoadResource(LoadResourceRequest request,
+                             bool disk_family,
+                             const storage::LoadOptions& options,
+                             const std::vector<std::string>& paths,
+                             const storage::FileManagerContext& context) {
+    auto estimate = [&]() -> folly::coro::Task<LoadResourceRequest> {
+        auto source = co_await storage::V1RemoteSource::OpenAsync(
+            context,
+            paths,
+            options,
+            storage::ArtifactStoragePath::Index,
+            disk_family ? storage::V1SourceLayout::DiskFiles
+                        : storage::V1SourceLayout::MemoryEntries);
+        const auto names =
+            disk_family ? VectorDiskLoader::AsyncEntryNames(*source, options)
+                        : source->EntryNames();
+        const auto bytes = co_await source->InspectLoadBytesAsync(names);
+        // BinarySet payloads coexist with native Deserialize state. For native
+        // stream backends, names contains only eagerly prepared sidecars.
+        const bool memory_mmap =
+            !disk_family && options.enable_mmap &&
+            KnowhereMmapSupported(
+                options.params.at(INDEX_TYPE).get<std::string>());
+        const auto retained = memory_mmap ? uint64_t{0} : bytes.payload;
+        const auto scratch = SaturatingAdd(
+            bytes.transient,
+            SaturatingAdd(
+                bytes.directory,
+                SaturatingAdd(retained,
+                              uint64_t{storage::FileWriter::MAX_BUFFER_SIZE})));
+        request.max_memory_cost = SaturatingAdd(
+            std::max(request.max_memory_cost, request.final_memory_cost),
+            scratch);
+        co_return request;
+    };
+    return folly::coro::blockingWait(folly::coro::co_withExecutor(
+        storage::ResolveAsyncLoadExecutor(
+            storage::LocalFileIOPool::GetInstance().GetExecutor(),
+            proto::common::LoadPriority::HIGH),
+        estimate()));
+}
+
 ScalarIndexLoadResources
 ScalarIndexFileLoadResource(
     DataType field_type,
@@ -540,6 +733,16 @@ ScalarIndexFileLoadResource(
     const bool use_async_load = context.use_async_load.value_or(
         segcore::storagev2translator::StorageV2AsyncLoadEnabled());
     if (version < 3 && index_params.at(INDEX_TYPE) != FMINDEX_INDEX_TYPE) {
+        if (use_async_load && context.Valid() && !index_files.empty()) {
+            return {LegacyScalarLoadResource(field_type,
+                                             index_size,
+                                             index_params,
+                                             mmap_enable,
+                                             num_rows,
+                                             index_files,
+                                             context),
+                    std::nullopt};
+        }
         auto resolved_params = index_params;
         if (resolved_params.at(INDEX_TYPE) == HYBRID_INDEX_TYPE) {
             auto type = ResolveLegacyHybridIndexType(index_files, context);

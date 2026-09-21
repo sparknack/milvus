@@ -99,4 +99,11 @@ FinishJsonProjectedOpen(JsonProjectedOpenPlan plan,
                         storage::FileSource& source,
                         std::unique_ptr<IIndexReaderBase> inner);
 
+// Suspends only source I/O; the caller owns the local initialization executor.
+folly::coro::Task<std::unique_ptr<IIndexReaderBase>>
+FinishJsonProjectedOpenAsync(bool use_async,
+                             JsonProjectedOpenPlan plan,
+                             storage::FileSource& source,
+                             std::unique_ptr<IIndexReaderBase> inner);
+
 }  // namespace milvus::index

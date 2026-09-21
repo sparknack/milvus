@@ -23,7 +23,7 @@
 #include <string_view>
 #include <vector>
 
-#include "nlohmann/json_fwd.hpp"
+#include "folly/coro/Task.h"
 #include "storage/artifact/FileSink.h"
 #include "storage/artifact/LoadOptions.h"
 
@@ -60,9 +60,9 @@ class FileSource {
     virtual bool
     HasEntry(std::string_view name) const = 0;
 
-    // Returns a known logical length when the transport carries one. On legacy
-    // layouts without length metadata this may materialize exactly this entry
-    // as load-time I/O. It is not a metadata-only caps/admission API.
+    // Return the logical payload length. Remote legacy sources inspect object
+    // envelopes when slice metadata omits it; they never cache decoded payloads
+    // for a size query. This may perform I/O, so it is not a caps-only API.
     virtual int64_t
     EntrySize(std::string_view name) const = 0;
 
@@ -93,6 +93,27 @@ class FileSource {
     ReadEntriesToLocalDir(const std::vector<std::string>& names,
                           const std::string& local_dir) = 0;
 
+    // Async transports suspend during remote I/O and admission. The default
+    // implementation supports local/test sources; remote sources override it.
+    // use_async=false preserves synchronous transport for shared loader bodies.
+    // Calls borrow their arguments until the returned task has completed.
+    virtual folly::coro::Task<int64_t>
+    EntrySizeAsync(std::string_view name, bool use_async = true);
+    virtual folly::coro::Task<std::vector<uint8_t>>
+    ReadEntryAsync(std::string_view name, bool use_async = true);
+    virtual folly::coro::Task<void>
+    ReadEntryToLocalFileAsync(std::string_view name,
+                              const std::string& path,
+                              bool use_async = true);
+    virtual folly::coro::Task<void>
+    ReadEntriesToLocalFileAsync(const std::vector<std::string>& names,
+                                const std::string& path,
+                                bool use_async = true);
+    virtual folly::coro::Task<std::vector<std::string>>
+    ReadEntriesToLocalDirAsync(const std::vector<std::string>& names,
+                               const std::string& directory,
+                               bool use_async = true);
+
     // Opens the storage backing required by a disk-vector engine. Sources that
     // do not represent V1/V2 index directory artifacts reject this capability.
     virtual std::shared_ptr<DiskEngineFileHandle>
@@ -109,6 +130,41 @@ class V1RemoteSource final : public FileSource {
         LoadOptions options = {},
         ArtifactStoragePath storage_path = ArtifactStoragePath::Index,
         V1SourceLayout layout = V1SourceLayout::MemoryEntries);
+    static folly::coro::Task<std::unique_ptr<V1RemoteSource>>
+    OpenAsync(const FileManagerContext& context,
+              std::vector<std::string> remote_paths,
+              LoadOptions options = {},
+              ArtifactStoragePath storage_path = ArtifactStoragePath::Index,
+              V1SourceLayout layout = V1SourceLayout::MemoryEntries);
+
+    folly::coro::Task<int64_t>
+    EntrySizeAsync(std::string_view name, bool use_async = true) override;
+    folly::coro::Task<std::vector<uint8_t>>
+    ReadEntryAsync(std::string_view name, bool use_async = true) override;
+    folly::coro::Task<void>
+    ReadEntryToLocalFileAsync(std::string_view name,
+                              const std::string& path,
+                              bool use_async = true) override;
+    folly::coro::Task<void>
+    ReadEntriesToLocalFileAsync(const std::vector<std::string>& names,
+                                const std::string& path,
+                                bool use_async = true) override;
+    folly::coro::Task<std::vector<std::string>>
+    ReadEntriesToLocalDirAsync(const std::vector<std::string>& names,
+                               const std::string& directory,
+                               bool use_async = true) override;
+
+    struct LoadBytes {
+        uint64_t payload{0};
+        uint64_t transient{0};
+        uint64_t directory{0};
+    };
+
+    // Inspect only the requested logical entries. Never fetch engine payloads;
+    // callers exclude native remote-stream entries from admission estimates.
+    folly::coro::Task<LoadBytes>
+    InspectLoadBytesAsync(const std::vector<std::string>& names);
+
     ~V1RemoteSource() override;
 
     Generation
@@ -137,6 +193,7 @@ class V1RemoteSource final : public FileSource {
 
  private:
     class Impl;
+    explicit V1RemoteSource(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;
 };
 

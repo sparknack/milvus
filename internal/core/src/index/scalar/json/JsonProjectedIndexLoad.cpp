@@ -14,6 +14,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "folly/coro/BlockingWait.h"
+
 #include "index/scalar/json/JsonProjectedIndexLoad.h"
 
 #include <algorithm>
@@ -411,8 +413,9 @@ class StagingDirectory final {
 
 using storage::FileDescriptorGuard;
 
-std::vector<size_t>
-ReadNonExistOffsets(const JsonProjectedOpenPlan& plan,
+folly::coro::Task<std::vector<size_t>>
+ReadNonExistOffsets(bool use_async,
+                    const JsonProjectedOpenPlan& plan,
                     storage::FileSource& source,
                     int64_t row_count) {
     AssertInfo(row_count >= 0,
@@ -426,7 +429,8 @@ ReadNonExistOffsets(const JsonProjectedOpenPlan& plan,
     const auto local_path = (std::filesystem::path(directory.Path()) /
                              INDEX_NON_EXIST_OFFSET_FILE_NAME)
                                 .string();
-    source.ReadEntryToLocalFile(INDEX_NON_EXIST_OFFSET_FILE_NAME, local_path);
+    co_await source.ReadEntryToLocalFileAsync(
+        INDEX_NON_EXIST_OFFSET_FILE_NAME, local_path, use_async);
     const auto bytes = storage::LocalFileSize(
         local_path, "failed to determine typed JSON sidecar size for");
     if (plan.declared_non_exist_bytes.has_value() &&
@@ -449,7 +453,7 @@ ReadNonExistOffsets(const JsonProjectedOpenPlan& plan,
                   count);
     }
     if (bytes == 0) {
-        return {};
+        co_return std::vector<size_t>{};
     }
 
     std::vector<size_t> result(offset_count);
@@ -467,7 +471,7 @@ ReadNonExistOffsets(const JsonProjectedOpenPlan& plan,
                      local_path,
                      "typed JSON staging file");
     descriptor.CloseChecked(local_path, "typed JSON staging file");
-    return result;
+    co_return result;
 }
 
 }  // namespace
@@ -538,19 +542,29 @@ std::unique_ptr<IIndexReaderBase>
 FinishJsonProjectedOpen(JsonProjectedOpenPlan plan,
                         storage::FileSource& source,
                         std::unique_ptr<IIndexReaderBase> inner) {
+    return folly::coro::blockingWait(FinishJsonProjectedOpenAsync(
+        false, std::move(plan), source, std::move(inner)));
+}
+
+folly::coro::Task<std::unique_ptr<IIndexReaderBase>>
+FinishJsonProjectedOpenAsync(bool use_async,
+                             JsonProjectedOpenPlan plan,
+                             storage::FileSource& source,
+                             std::unique_ptr<IIndexReaderBase> inner) {
     AssertInfo(inner != nullptr,
                "typed JSON load requires a non-null inner reader");
     if (plan.completeness != JsonProjectionCompleteness::Complete) {
-        return inner;
+        co_return inner;
     }
     AssertInfo(plan.cast_type.has_value(),
                "complete typed JSON load lacks a cast type");
     std::vector<size_t> offsets;
     if (plan.has_non_exist_entry) {
-        offsets = ReadNonExistOffsets(plan, source, inner->Count());
+        offsets = (co_await ReadNonExistOffsets(
+            use_async, plan, source, inner->Count()));
     }
     const auto row_count = inner->Count();
-    return std::make_unique<JsonPathIndexReader>(
+    co_return std::make_unique<JsonPathIndexReader>(
         std::move(inner),
         JsonProjectedIndexSpec(
             std::move(plan.json_path), *plan.cast_type, row_count),

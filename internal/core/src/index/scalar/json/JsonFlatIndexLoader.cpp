@@ -16,8 +16,13 @@
 
 #include "folly/CancellationToken.h"
 #include "folly/coro/Task.h"
+#include "folly/coro/WithCancellation.h"
+#include "storage/AsyncLoadExecutor.h"
+#include "storage/LocalFileIOPool.h"
 #include "common/OpContext.h"
 #include "storage/LocalFileIOPool.h"
+#include "folly/coro/BlockingWait.h"
+
 #include "index/scalar/json/JsonFlatIndexLoader.h"
 
 #include <algorithm>
@@ -205,49 +210,66 @@ using storage::LocalEntryGuard;
 
 using storage::FileDescriptorGuard;
 
-std::shared_ptr<const std::vector<size_t>>
-ReadNullOffsets(storage::FileSource& source,
+folly::coro::Task<std::shared_ptr<const std::vector<size_t>>>
+ReadNullOffsets(bool use_async,
+                const storage::LoadOptions& opts,
+                storage::FileSource& source,
                 bool has_null,
                 const std::string& staging_parent,
                 size_t count) {
-    if (!has_null) {
-        return std::make_shared<const std::vector<size_t>>();
-    }
+    const auto priority =
+        opts.op_ctx && opts.op_ctx->runtime_load_priority.value_or(0) != 0
+            ? proto::common::LoadPriority::LOW
+            : proto::common::LoadPriority::HIGH;
+    auto run_io =
+        [&]() -> folly::coro::Task<std::shared_ptr<const std::vector<size_t>>> {
+        if (!has_null) {
+            co_return std::make_shared<const std::vector<size_t>>();
+        }
 
-    auto staging = CreateJsonFlatIndexDirectory(staging_parent);
-    auto path = (std::filesystem::path(staging->Path()) /
-                 std::string(INDEX_NULL_OFFSET))
-                    .string();
-    LocalEntryGuard local(std::move(path));
-    source.ReadEntryToLocalFile(INDEX_NULL_OFFSET, local.Path());
-    const auto bytes = storage::LocalFileSize(
-        local.Path(), "failed to determine JSON flat entry size for");
+        auto staging = CreateJsonFlatIndexDirectory(staging_parent);
+        auto path = (std::filesystem::path(staging->Path()) /
+                     std::string(INDEX_NULL_OFFSET))
+                        .string();
+        LocalEntryGuard local(std::move(path));
+        co_await source.ReadEntryToLocalFileAsync(
+            INDEX_NULL_OFFSET, local.Path(), use_async);
+        const auto bytes = storage::LocalFileSize(
+            local.Path(), "failed to determine JSON flat entry size for");
 
-    if (bytes == 0 || bytes % sizeof(size_t) != 0 ||
-        bytes / sizeof(size_t) > count) {
-        ThrowInfo(DataFormatBroken,
-                  "invalid JSON flat null-offset byte size {} for count {}",
-                  bytes,
-                  count);
-    }
+        if (bytes == 0 || bytes % sizeof(size_t) != 0 ||
+            bytes / sizeof(size_t) > count) {
+            ThrowInfo(DataFormatBroken,
+                      "invalid JSON flat null-offset byte size {} for count {}",
+                      bytes,
+                      count);
+        }
 
-    auto result = std::make_shared<std::vector<size_t>>(bytes / sizeof(size_t));
-    const auto fd = ::open(local.Path().c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd == -1) {
-        ThrowInfo(FileOpenFailed,
-                  "failed to open JSON flat staging file {}: {}",
-                  local.Path(),
-                  std::strerror(errno));
-    }
-    FileDescriptorGuard descriptor(fd);
-    storage::ReadAll(descriptor.Get(),
-                     result->data(),
-                     bytes,
-                     local.Path(),
-                     "JSON flat staging file");
-    descriptor.CloseChecked(local.Path(), "JSON flat staging file");
-    local.RemoveChecked("JSON flat staging file");
-    return result;
+        auto result =
+            std::make_shared<std::vector<size_t>>(bytes / sizeof(size_t));
+        const auto fd = ::open(local.Path().c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd == -1) {
+            ThrowInfo(FileOpenFailed,
+                      "failed to open JSON flat staging file {}: {}",
+                      local.Path(),
+                      std::strerror(errno));
+        }
+        FileDescriptorGuard descriptor(fd);
+        storage::ReadAll(descriptor.Get(),
+                         result->data(),
+                         bytes,
+                         local.Path(),
+                         "JSON flat staging file");
+        descriptor.CloseChecked(local.Path(), "JSON flat staging file");
+        local.RemoveChecked("JSON flat staging file");
+        co_return result;
+    };
+    if (!use_async)
+        co_return co_await run_io();
+    co_return co_await folly::coro::co_withExecutor(
+        storage::ResolveAsyncLoadExecutor(
+            storage::LocalFileIOPool::GetInstance().GetExecutor(), priority),
+        run_io());
 }
 
 size_t
@@ -281,15 +303,33 @@ RamPayloadBytes(milvus::tantivy::TantivyIndexWrapper& engine) {
     return static_cast<size_t>(bytes);
 }
 
-std::shared_ptr<const JsonFlatIndexReaderState>
-LoadState(storage::FileSource& source, const storage::LoadOptions& opts) {
+folly::coro::Task<std::shared_ptr<const JsonFlatIndexReaderState>>
+LoadState(bool use_async,
+          storage::FileSource& source,
+          const storage::LoadOptions& opts) {
+    const auto priority =
+        opts.op_ctx && opts.op_ctx->runtime_load_priority.value_or(0) != 0
+            ? proto::common::LoadPriority::LOW
+            : proto::common::LoadPriority::HIGH;
     const auto params = ParseRuntimeParams(opts.params);
     const auto effective = ResolveLoadOptions(opts);
     const auto entries = ReadPersistedEntries(source);
 
-    auto directory = CreateJsonFlatIndexDirectory(effective.directory_parent);
-    const auto paths =
-        source.ReadEntriesToLocalDir(entries.engine_files, directory->Path());
+    std::shared_ptr<storage::LocalDirectory> directory;
+    {
+        auto local_io = [&] {
+            directory =
+                CreateJsonFlatIndexDirectory(effective.directory_parent);
+        };
+        if (use_async) {
+            co_await storage::RunLocalFileIOAsync(local_io, priority);
+        } else {
+            local_io();
+        }
+    }
+
+    const auto paths = co_await source.ReadEntriesToLocalDirAsync(
+        entries.engine_files, directory->Path(), use_async);
     if (paths.size() != entries.engine_files.size()) {
         ThrowInfo(DataFormatBroken,
                   "JSON flat source materialized {} of {} engine entries",
@@ -305,24 +345,51 @@ LoadState(storage::FileSource& source, const storage::LoadOptions& opts) {
                       paths[i]);
         }
     }
-    const auto mapped_bytes =
-        effective.mmap ? MaterializedBytes(paths) : size_t{0};
-    if (!tantivy_index_exist(directory->Path().c_str())) {
-        ThrowInfo(DataFormatBroken,
-                  "materialized JSON flat artifact is not a Tantivy index");
+    size_t mapped_bytes = 0;
+    {
+        auto local_io = [&] {
+            mapped_bytes =
+                effective.mmap ? MaterializedBytes(paths) : size_t{0};
+        };
+        if (use_async) {
+            co_await storage::RunLocalFileIOAsync(local_io, priority);
+        } else {
+            local_io();
+        }
     }
 
-    // Keep the directory and engine local until state construction succeeds.
-    // RAM engines copy their directory and the resulting state does not retain
-    // the staging directory; mmap engines receive the owner explicitly.
-    auto engine = std::make_shared<milvus::tantivy::TantivyIndexWrapper>(
-        directory->Path().c_str(), effective.mmap, SetBitsetSealed);
+    std::shared_ptr<milvus::tantivy::TantivyIndexWrapper> engine;
+    {
+        auto local_io = [&] {
+            if (!tantivy_index_exist(directory->Path().c_str())) {
+                ThrowInfo(
+                    DataFormatBroken,
+                    "materialized JSON flat artifact is not a Tantivy index");
+            }
+
+            // Keep the directory and engine local until state construction succeeds.
+            // RAM engines copy their directory and the resulting state does not retain
+            // the staging directory; mmap engines receive the owner explicitly.
+            engine = std::make_shared<milvus::tantivy::TantivyIndexWrapper>(
+                directory->Path().c_str(), effective.mmap, SetBitsetSealed);
+        };
+        if (use_async) {
+            co_await storage::RunLocalFileIOAsync(local_io, priority);
+        } else {
+            local_io();
+        }
+    }
+
     const auto count = static_cast<size_t>(engine->count());
-    auto null_offsets = ReadNullOffsets(
-        source, entries.has_null, effective.directory_parent, count);
+    auto null_offsets = (co_await ReadNullOffsets(use_async,
+                                                  opts,
+                                                  source,
+                                                  entries.has_null,
+                                                  effective.directory_parent,
+                                                  count));
     const auto engine_bytes =
         effective.mmap ? mapped_bytes : RamPayloadBytes(*engine);
-    return JsonFlatIndexReaderState::Create(
+    co_return JsonFlatIndexReaderState::Create(
         effective.mmap ? directory : nullptr,
         engine,
         params.nested_path,
@@ -349,7 +416,15 @@ JsonFlatIndexLoader::DeriveCaps(const Config& index_meta) {
 IIndexReaderBasePtr
 JsonFlatIndexLoader::Open(storage::FileSource& source,
                           const storage::LoadOptions& opts) {
-    return std::make_unique<JsonFlatIndexReader>(LoadState(source, opts));
+    return folly::coro::blockingWait(OpenAsync(source, opts, false));
+}
+
+folly::coro::Task<IIndexReaderBasePtr>
+JsonFlatIndexLoader::OpenAsync(storage::FileSource& source,
+                               const storage::LoadOptions& opts,
+                               bool use_async) {
+    co_return std::make_unique<JsonFlatIndexReader>(
+        (co_await LoadState(use_async, source, opts)));
 }
 
 IndexLoadPlan

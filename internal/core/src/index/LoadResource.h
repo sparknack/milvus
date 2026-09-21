@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "common/Types.h"
+#include "storage/artifact/LoadOptions.h"
 #include "common/resource_c.h"
 #include "storage/FileManager.h"
 #include "cachinglayer/LoadingOverhead.h"
@@ -69,6 +70,15 @@ ScalarIndexFileLoadResource(
     const std::vector<std::string>& index_files,
     const storage::FileManagerContext& context,
     bool is_index_file = true);
+
+// Add envelope/decode scratch for the entries actually prepared by async
+// vector loading. Native remote-stream engine entries remain uninspected.
+LoadResourceRequest
+LegacyVectorFileLoadResource(LoadResourceRequest request,
+                             bool disk_family,
+                             const storage::LoadOptions& options,
+                             const std::vector<std::string>& paths,
+                             const storage::FileManagerContext& context);
 
 /**
  * @brief Estimate packed scalar loading resources from inspected metadata.

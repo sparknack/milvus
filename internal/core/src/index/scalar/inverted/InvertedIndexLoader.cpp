@@ -16,8 +16,13 @@
 
 #include "folly/CancellationToken.h"
 #include "folly/coro/Task.h"
+#include "folly/coro/WithCancellation.h"
+#include "storage/AsyncLoadExecutor.h"
+#include "storage/LocalFileIOPool.h"
 #include "common/OpContext.h"
 #include "storage/LocalFileIOPool.h"
+#include "folly/coro/BlockingWait.h"
+
 #include "index/scalar/inverted/InvertedIndexLoader.h"
 
 #include <algorithm>
@@ -178,56 +183,73 @@ using storage::LocalEntryGuard;
 
 using storage::FileDescriptorGuard;
 
-std::shared_ptr<const std::vector<size_t>>
-ReadNullOffsets(storage::FileSource& source,
+folly::coro::Task<std::shared_ptr<const std::vector<size_t>>>
+ReadNullOffsets(bool use_async,
+                const storage::LoadOptions& opts,
+                storage::FileSource& source,
                 bool has_null,
                 const std::string& staging_parent,
                 size_t count,
                 bool nested) {
-    if (!has_null) {
-        return std::make_shared<const std::vector<size_t>>();
-    }
+    const auto priority =
+        opts.op_ctx && opts.op_ctx->runtime_load_priority.value_or(0) != 0
+            ? proto::common::LoadPriority::LOW
+            : proto::common::LoadPriority::HIGH;
+    auto run_io =
+        [&]() -> folly::coro::Task<std::shared_ptr<const std::vector<size_t>>> {
+        if (!has_null) {
+            co_return std::make_shared<const std::vector<size_t>>();
+        }
 
-    // The sidecar uses a separate owned child so it can never be enumerated
-    // as a Tantivy file by the publishable engine directory.
-    auto staging = CreateInvertedIndexDirectory(staging_parent);
-    auto path =
-        (std::filesystem::path(staging->Path()) / INDEX_NULL_OFFSET).string();
-    LocalEntryGuard local(std::move(path));
-    source.ReadEntryToLocalFile(INDEX_NULL_OFFSET, local.Path());
-    const auto bytes = storage::LocalFileSize(
-        local.Path(), "failed to determine inverted entry size for");
+        // The sidecar uses a separate owned child so it can never be enumerated
+        // as a Tantivy file by the publishable engine directory.
+        auto staging = CreateInvertedIndexDirectory(staging_parent);
+        auto path = (std::filesystem::path(staging->Path()) / INDEX_NULL_OFFSET)
+                        .string();
+        LocalEntryGuard local(std::move(path));
+        co_await source.ReadEntryToLocalFileAsync(
+            INDEX_NULL_OFFSET, local.Path(), use_async);
+        const auto bytes = storage::LocalFileSize(
+            local.Path(), "failed to determine inverted entry size for");
 
-    if (bytes == 0 || bytes % sizeof(size_t) != 0) {
-        ThrowInfo(DataFormatBroken,
-                  "invalid inverted null-offset byte size {}",
-                  bytes);
-    }
-    const auto offset_count = bytes / sizeof(size_t);
-    if (!nested && offset_count > count) {
-        ThrowInfo(DataFormatBroken,
-                  "inverted null-offset count {} exceeds row count {}",
-                  offset_count,
-                  count);
-    }
+        if (bytes == 0 || bytes % sizeof(size_t) != 0) {
+            ThrowInfo(DataFormatBroken,
+                      "invalid inverted null-offset byte size {}",
+                      bytes);
+        }
+        const auto offset_count = bytes / sizeof(size_t);
+        if (!nested && offset_count > count) {
+            ThrowInfo(DataFormatBroken,
+                      "inverted null-offset count {} exceeds row count {}",
+                      offset_count,
+                      count);
+        }
 
-    std::vector<size_t> result(offset_count);
-    const auto fd = ::open(local.Path().c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd == -1) {
-        ThrowInfo(FileOpenFailed,
-                  "failed to open inverted staging file {}: {}",
-                  local.Path(),
-                  std::strerror(errno));
-    }
-    FileDescriptorGuard descriptor(fd);
-    storage::ReadAll(descriptor.Get(),
-                     result.data(),
-                     bytes,
-                     local.Path(),
-                     "inverted staging file");
-    descriptor.CloseChecked(local.Path(), "inverted staging file");
-    local.RemoveChecked("inverted staging file");
-    return std::make_shared<const std::vector<size_t>>(std::move(result));
+        std::vector<size_t> result(offset_count);
+        const auto fd = ::open(local.Path().c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd == -1) {
+            ThrowInfo(FileOpenFailed,
+                      "failed to open inverted staging file {}: {}",
+                      local.Path(),
+                      std::strerror(errno));
+        }
+        FileDescriptorGuard descriptor(fd);
+        storage::ReadAll(descriptor.Get(),
+                         result.data(),
+                         bytes,
+                         local.Path(),
+                         "inverted staging file");
+        descriptor.CloseChecked(local.Path(), "inverted staging file");
+        local.RemoveChecked("inverted staging file");
+        co_return std::make_shared<const std::vector<size_t>>(
+            std::move(result));
+    };
+    if (!use_async)
+        co_return co_await run_io();
+    co_return co_await folly::coro::co_withExecutor(
+        storage::ResolveAsyncLoadExecutor(
+            storage::LocalFileIOPool::GetInstance().GetExecutor(), priority),
+        run_io());
 }
 
 size_t
@@ -269,18 +291,35 @@ struct InvertedLoadState {
     size_t engine_bytes{0};
 };
 
-InvertedLoadState
-LoadState(storage::FileSource& source,
+folly::coro::Task<InvertedLoadState>
+LoadState(bool use_async,
+          storage::FileSource& source,
           const storage::LoadOptions& opts,
           RuntimeParams params) {
+    const auto priority =
+        opts.op_ctx && opts.op_ctx->runtime_load_priority.value_or(0) != 0
+            ? proto::common::LoadPriority::LOW
+            : proto::common::LoadPriority::HIGH;
     const auto effective = ResolveLoadOptions(opts);
     const auto entries = ReadPersistedEntries(source);
 
     // Keep local owners intact until the state has acquired its own shared
     // references. On every exception the engine is released before directory.
-    auto directory = CreateInvertedIndexDirectory(effective.directory_parent);
-    const auto paths =
-        source.ReadEntriesToLocalDir(entries.engine_files, directory->Path());
+    std::shared_ptr<storage::LocalDirectory> directory;
+    {
+        auto local_io = [&] {
+            directory =
+                CreateInvertedIndexDirectory(effective.directory_parent);
+        };
+        if (use_async) {
+            co_await storage::RunLocalFileIOAsync(local_io, priority);
+        } else {
+            local_io();
+        }
+    }
+
+    const auto paths = co_await source.ReadEntriesToLocalDirAsync(
+        entries.engine_files, directory->Path(), use_async);
     if (paths.size() != entries.engine_files.size()) {
         ThrowInfo(DataFormatBroken,
                   "inverted source materialized {} of {} engine entries",
@@ -296,18 +335,44 @@ LoadState(storage::FileSource& source,
                       paths[i]);
         }
     }
-    const auto engine_bytes = MaterializedBytes(paths, !effective.mmap);
-    if (!tantivy_index_exist(directory->Path().c_str())) {
-        ThrowInfo(DataFormatBroken,
-                  "materialized inverted artifact is not a Tantivy index");
+    size_t engine_bytes = 0;
+    {
+        auto local_io = [&] {
+            engine_bytes = MaterializedBytes(paths, !effective.mmap);
+        };
+        if (use_async) {
+            co_await storage::RunLocalFileIOAsync(local_io, priority);
+        } else {
+            local_io();
+        }
     }
-    auto engine = std::make_shared<milvus::tantivy::TantivyIndexWrapper>(
-        directory->Path().c_str(), effective.mmap, SetBitsetSealed);
-    auto null_offsets = ReadNullOffsets(source,
-                                        entries.has_null,
-                                        effective.directory_parent,
-                                        static_cast<size_t>(engine->count()),
-                                        params.nested);
+
+    std::shared_ptr<milvus::tantivy::TantivyIndexWrapper> engine;
+    {
+        auto local_io = [&] {
+            if (!tantivy_index_exist(directory->Path().c_str())) {
+                ThrowInfo(
+                    DataFormatBroken,
+                    "materialized inverted artifact is not a Tantivy index");
+            }
+            engine = std::make_shared<milvus::tantivy::TantivyIndexWrapper>(
+                directory->Path().c_str(), effective.mmap, SetBitsetSealed);
+        };
+        if (use_async) {
+            co_await storage::RunLocalFileIOAsync(local_io, priority);
+        } else {
+            local_io();
+        }
+    }
+
+    auto null_offsets =
+        (co_await ReadNullOffsets(use_async,
+                                  opts,
+                                  source,
+                                  entries.has_null,
+                                  effective.directory_parent,
+                                  static_cast<size_t>(engine->count()),
+                                  params.nested));
 
     InvertedLoadState result;
     result.directory = directory;
@@ -316,7 +381,7 @@ LoadState(storage::FileSource& source,
     result.params = std::move(params);
     result.mmap = effective.mmap;
     result.engine_bytes = engine_bytes;
-    return result;
+    co_return result;
 }
 
 std::unique_ptr<IIndexReaderBase>
@@ -392,12 +457,20 @@ InvertedIndexLoader::DeriveCaps(const Config& index_meta) {
 IIndexReaderBasePtr
 InvertedIndexLoader::Open(storage::FileSource& source,
                           const storage::LoadOptions& opts) {
+    return folly::coro::blockingWait(OpenAsync(source, opts, false));
+}
+
+folly::coro::Task<IIndexReaderBasePtr>
+InvertedIndexLoader::OpenAsync(storage::FileSource& source,
+                               const storage::LoadOptions& opts,
+                               bool use_async) {
     auto projection =
         PrepareJsonProjectedOpen(families::kInverted, source, opts);
-    auto state = LoadState(source, opts, ParseRuntimeParams(opts.params));
+    auto state = (co_await LoadState(
+        use_async, source, opts, ParseRuntimeParams(opts.params)));
     auto reader = MakeReader(state);
-    return FinishJsonProjectedOpen(
-        std::move(projection), source, std::move(reader));
+    co_return (co_await FinishJsonProjectedOpenAsync(
+        use_async, std::move(projection), source, std::move(reader)));
 }
 
 IndexLoadPlan

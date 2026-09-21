@@ -16,8 +16,13 @@
 
 #include "folly/CancellationToken.h"
 #include "folly/coro/Task.h"
+#include "folly/coro/WithCancellation.h"
+#include "storage/AsyncLoadExecutor.h"
+#include "storage/LocalFileIOPool.h"
 #include "common/OpContext.h"
 #include "storage/LocalFileIOPool.h"
+#include "folly/coro/BlockingWait.h"
+
 #include "index/scalar/marisa/MarisaIndexLoader.h"
 #include "index/scalar/marisa/MarisaIndexParams.h"
 
@@ -96,58 +101,74 @@ using storage::LocalEntryGuard;
 using storage::FileDescriptorGuard;
 
 template <typename T>
-std::shared_ptr<std::vector<T>>
-ReadEntryVector(storage::FileSource& source,
+folly::coro::Task<std::shared_ptr<std::vector<T>>>
+ReadEntryVector(bool use_async,
+                const storage::LoadOptions& opts,
+                storage::FileSource& source,
                 std::string_view entry_name,
                 const std::string& staging_dir,
                 std::optional<size_t> expected_bytes = std::nullopt) {
-    if (!source.HasEntry(entry_name)) {
-        ThrowInfo(DataFormatBroken,
-                  "marisa artifact entry {} is missing",
-                  entry_name);
-    }
-
-    auto path =
-        (std::filesystem::path(staging_dir) / std::string(entry_name)).string();
-    LocalEntryGuard local(std::move(path));
-    source.ReadEntryToLocalFile(entry_name, local.Path());
-
-    const auto bytes = storage::LocalFileSize(
-        local.Path(), "failed to determine marisa entry size for");
-    if (expected_bytes.has_value() && bytes != *expected_bytes) {
-        ThrowInfo(DataFormatBroken,
-                  "invalid {} size: expected {}, got {}",
-                  entry_name,
-                  *expected_bytes,
-                  bytes);
-    }
-    if (bytes % sizeof(T) != 0) {
-        ThrowInfo(DataFormatBroken,
-                  "invalid {} size: expected a multiple of {}, got {}",
-                  entry_name,
-                  sizeof(T),
-                  bytes);
-    }
-
-    auto result = std::make_shared<std::vector<T>>(bytes / sizeof(T));
-    if (bytes != 0) {
-        const auto fd = ::open(local.Path().c_str(), O_RDONLY | O_CLOEXEC);
-        if (fd == -1) {
-            ThrowInfo(FileOpenFailed,
-                      "failed to open marisa staging file {}: {}",
-                      local.Path(),
-                      std::strerror(errno));
+    const auto priority =
+        opts.op_ctx && opts.op_ctx->runtime_load_priority.value_or(0) != 0
+            ? proto::common::LoadPriority::LOW
+            : proto::common::LoadPriority::HIGH;
+    auto run_io = [&]() -> folly::coro::Task<std::shared_ptr<std::vector<T>>> {
+        if (!source.HasEntry(entry_name)) {
+            ThrowInfo(DataFormatBroken,
+                      "marisa artifact entry {} is missing",
+                      entry_name);
         }
-        FileDescriptorGuard descriptor(fd);
-        storage::ReadAll(descriptor.Get(),
-                         result->data(),
-                         bytes,
-                         local.Path(),
-                         "marisa staging file");
-        descriptor.CloseChecked(local.Path(), "marisa staging file");
-    }
-    local.RemoveChecked("marisa staging file");
-    return result;
+
+        auto path =
+            (std::filesystem::path(staging_dir) / std::string(entry_name))
+                .string();
+        LocalEntryGuard local(std::move(path));
+        co_await source.ReadEntryToLocalFileAsync(
+            entry_name, local.Path(), use_async);
+
+        const auto bytes = storage::LocalFileSize(
+            local.Path(), "failed to determine marisa entry size for");
+        if (expected_bytes.has_value() && bytes != *expected_bytes) {
+            ThrowInfo(DataFormatBroken,
+                      "invalid {} size: expected {}, got {}",
+                      entry_name,
+                      *expected_bytes,
+                      bytes);
+        }
+        if (bytes % sizeof(T) != 0) {
+            ThrowInfo(DataFormatBroken,
+                      "invalid {} size: expected a multiple of {}, got {}",
+                      entry_name,
+                      sizeof(T),
+                      bytes);
+        }
+
+        auto result = std::make_shared<std::vector<T>>(bytes / sizeof(T));
+        if (bytes != 0) {
+            const auto fd = ::open(local.Path().c_str(), O_RDONLY | O_CLOEXEC);
+            if (fd == -1) {
+                ThrowInfo(FileOpenFailed,
+                          "failed to open marisa staging file {}: {}",
+                          local.Path(),
+                          std::strerror(errno));
+            }
+            FileDescriptorGuard descriptor(fd);
+            storage::ReadAll(descriptor.Get(),
+                             result->data(),
+                             bytes,
+                             local.Path(),
+                             "marisa staging file");
+            descriptor.CloseChecked(local.Path(), "marisa staging file");
+        }
+        local.RemoveChecked("marisa staging file");
+        co_return result;
+    };
+    if (!use_async)
+        co_return co_await run_io();
+    co_return co_await folly::coro::co_withExecutor(
+        storage::ResolveAsyncLoadExecutor(
+            storage::LocalFileIOPool::GetInstance().GetExecutor(), priority),
+        run_io());
 }
 
 storage::MappedRegionGuard
@@ -358,8 +379,14 @@ AddObservedBytes(size_t& total, size_t value) {
     total += value;
 }
 
-std::shared_ptr<const MarisaIndexStorage>
-LoadState(storage::FileSource& source, const storage::LoadOptions& opts) {
+folly::coro::Task<std::shared_ptr<const MarisaIndexStorage>>
+LoadState(bool use_async,
+          storage::FileSource& source,
+          const storage::LoadOptions& opts) {
+    const auto priority =
+        opts.op_ctx && opts.op_ctx->runtime_load_priority.value_or(0) != 0
+            ? proto::common::LoadPriority::LOW
+            : proto::common::LoadPriority::HIGH;
     if (ParseNested(opts.params)) {
         ThrowInfo(DataTypeInvalid,
                   "marisa indexes support row-domain strings only");
@@ -379,21 +406,35 @@ LoadState(storage::FileSource& source, const storage::LoadOptions& opts) {
     }
 
     const auto effective = ResolveLoadOptions(opts);
-    const auto staging_root =
-        effective.enable_mmap ? effective.mmap_dir
-                              : std::filesystem::temp_directory_path().string();
     // On every failure, storage (and therefore the trie) is destroyed before
     // this owner removes the directory backing a mapped trie.
-    auto staging = storage::LocalDirectory::CreateOwned(
-        staging_root, "marisa_XXXXXX", "marisa");
+    std::shared_ptr<storage::LocalDirectory> staging;
+    {
+        auto local_io = [&] {
+            const auto staging_root =
+                effective.enable_mmap
+                    ? effective.mmap_dir
+                    : std::filesystem::temp_directory_path().string();
+
+            staging = storage::LocalDirectory::CreateOwned(
+                staging_root, "marisa_XXXXXX", "marisa");
+        };
+        if (use_async) {
+            co_await storage::RunLocalFileIOAsync(local_io, priority);
+        } else {
+            local_io();
+        }
+    }
     auto storage = std::make_shared<MarisaIndexStorage>();
     storage->value_type = value_type;
 
     std::string trie_path;
     std::string str_ids_path;
     if (effective.enable_mmap) {
-        auto paths = source.ReadEntriesToLocalDir(
-            {MARISA_TRIE_INDEX, MARISA_STR_IDS}, staging->Path());
+        const std::vector<std::string> entries{MARISA_TRIE_INDEX,
+                                               MARISA_STR_IDS};
+        auto paths = co_await source.ReadEntriesToLocalDirAsync(
+            entries, staging->Path(), use_async);
         if (paths.size() != 2) {
             ThrowInfo(DataFormatBroken,
                       "marisa source returned {} paths for two entries",
@@ -409,15 +450,26 @@ LoadState(storage::FileSource& source, const storage::LoadOptions& opts) {
     } else {
         trie_path = (std::filesystem::path(staging->Path()) / MARISA_TRIE_INDEX)
                         .string();
-        source.ReadEntryToLocalFile(MARISA_TRIE_INDEX, trie_path);
+        co_await source.ReadEntryToLocalFileAsync(
+            MARISA_TRIE_INDEX, trie_path, use_async);
     }
 
-    const auto trie_bytes = storage::LocalFileSize(
-        trie_path, "failed to determine marisa entry size for");
-    if (trie_bytes == 0) {
-        ThrowInfo(DataFormatBroken, "marisa trie entry is empty");
+    size_t trie_bytes = 0;
+    {
+        auto local_io = [&] {
+            trie_bytes = storage::LocalFileSize(
+                trie_path, "failed to determine marisa entry size for");
+            if (trie_bytes == 0) {
+                ThrowInfo(DataFormatBroken, "marisa trie entry is empty");
+            }
+            storage->trie = OpenTrie(trie_path, effective.enable_mmap);
+        };
+        if (use_async) {
+            co_await storage::RunLocalFileIOAsync(local_io, priority);
+        } else {
+            local_io();
+        }
     }
-    storage->trie = OpenTrie(trie_path, effective.enable_mmap);
     const auto num_keys = storage->trie->num_keys();
     if (num_keys >= std::numeric_limits<uint32_t>::max()) {
         ThrowInfo(DataFormatBroken,
@@ -428,8 +480,8 @@ LoadState(storage::FileSource& source, const storage::LoadOptions& opts) {
     size_t observed_bytes = trie_bytes;
 
     if (!effective.enable_mmap) {
-        auto str_ids =
-            ReadEntryVector<int64_t>(source, MARISA_STR_IDS, staging->Path());
+        auto str_ids = (co_await ReadEntryVector<int64_t>(
+            use_async, opts, source, MARISA_STR_IDS, staging->Path()));
         ValidateStrIds(str_ids->data(), str_ids->size(), num_keys);
 
         std::shared_ptr<std::vector<uint32_t>> csr_index;
@@ -445,20 +497,31 @@ LoadState(storage::FileSource& source, const storage::LoadOptions& opts) {
         storage->str_ids_size = storage->str_ids_owner->size();
         storage->csr_index = storage->csr_index_owner->data();
         storage->csr_offsets = storage->csr_offsets_owner->data();
-        return storage;
+        co_return storage;
     }
 
-    const auto str_ids_bytes = storage::LocalFileSize(
-        str_ids_path, "failed to determine marisa entry size for");
-    if (str_ids_bytes % sizeof(int64_t) != 0) {
-        ThrowInfo(DataFormatBroken,
-                  "invalid {} size: expected a multiple of {}, got {}",
-                  MARISA_STR_IDS,
-                  sizeof(int64_t),
-                  str_ids_bytes);
+    size_t str_ids_bytes = 0;
+    storage::MappedRegionGuard str_ids_mapping;
+    {
+        auto local_io = [&] {
+            str_ids_bytes = storage::LocalFileSize(
+                str_ids_path, "failed to determine marisa entry size for");
+            if (str_ids_bytes % sizeof(int64_t) != 0) {
+                ThrowInfo(DataFormatBroken,
+                          "invalid {} size: expected a multiple of {}, got {}",
+                          MARISA_STR_IDS,
+                          sizeof(int64_t),
+                          str_ids_bytes);
+            }
+            AddObservedBytes(observed_bytes, str_ids_bytes);
+            str_ids_mapping = MapReadOnly(str_ids_path, str_ids_bytes);
+        };
+        if (use_async) {
+            co_await storage::RunLocalFileIOAsync(local_io, priority);
+        } else {
+            local_io();
+        }
     }
-    AddObservedBytes(observed_bytes, str_ids_bytes);
-    auto str_ids_mapping = MapReadOnly(str_ids_path, str_ids_bytes);
     const auto* str_ids =
         reinterpret_cast<const int64_t*>(str_ids_mapping.Data());
     const auto str_ids_count = str_ids_bytes / sizeof(int64_t);
@@ -486,7 +549,7 @@ LoadState(storage::FileSource& source, const storage::LoadOptions& opts) {
     storage->csr_index = csr_index;
     storage->csr_offsets = csr_offsets;
     storage->file_backed_bytes = observed_bytes;
-    return storage;
+    co_return storage;
 }
 
 struct PackedMarisaState {
@@ -553,11 +616,18 @@ MarisaIndexLoader::DeriveCaps(const Config& index_meta) {
 IIndexReaderBasePtr
 MarisaIndexLoader::Open(storage::FileSource& source,
                         const storage::LoadOptions& opts) {
+    return folly::coro::blockingWait(OpenAsync(source, opts, false));
+}
+
+folly::coro::Task<IIndexReaderBasePtr>
+MarisaIndexLoader::OpenAsync(storage::FileSource& source,
+                             const storage::LoadOptions& opts,
+                             bool use_async) {
     auto projection = PrepareJsonProjectedOpen(families::kMarisa, source, opts);
-    auto storage = LoadState(source, opts);
+    auto storage = (co_await LoadState(use_async, source, opts));
     auto reader = std::make_unique<MarisaIndexReader>(std::move(storage));
-    return FinishJsonProjectedOpen(
-        std::move(projection), source, std::move(reader));
+    co_return (co_await FinishJsonProjectedOpenAsync(
+        use_async, std::move(projection), source, std::move(reader)));
 }
 
 IndexLoadPlan

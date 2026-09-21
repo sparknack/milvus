@@ -53,6 +53,12 @@ class BitmapIndexLoader final {
 
     static IIndexReaderBasePtr
     Open(storage::FileSource& source, const storage::LoadOptions& opts);
+
+    // Shares decoding with Open; remote reads and admission suspend when enabled.
+    static folly::coro::Task<IIndexReaderBasePtr>
+    OpenAsync(storage::FileSource& source,
+              const storage::LoadOptions& opts,
+              bool use_async = true);
 };
 
 }  // namespace milvus::index

@@ -14,10 +14,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "common/OpContext.h"
+#include "storage/LocalFileIOPool.h"
 #include "index/vector/VectorMemLoader.h"
 #include "index/vector/VectorLoadUtils.h"
 
 #include <cstdint>
+#include "folly/coro/BlockingWait.h"
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -142,11 +145,12 @@ PlanEntries(storage::FileSource& source, const RuntimeParams& params) {
     return plan;
 }
 
-void
-AppendReadEntry(storage::FileSource& source,
+folly::coro::Task<void>
+AppendReadEntry(bool use_async,
+                storage::FileSource& source,
                 const std::string& name,
                 knowhere::BinarySet& entries) {
-    auto bytes = source.ReadEntry(name);
+    auto bytes = co_await source.ReadEntryAsync(name, use_async);
     if (bytes.size() >
         static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
         ThrowInfo(DataFormatBroken,
@@ -159,14 +163,15 @@ AppendReadEntry(storage::FileSource& source,
     entries.Append(name, std::move(data), size);
 }
 
-knowhere::BinarySet
-ReadEntries(storage::FileSource& source,
+folly::coro::Task<knowhere::BinarySet>
+ReadEntries(bool use_async,
+            storage::FileSource& source,
             const std::vector<std::string>& names) {
     knowhere::BinarySet entries;
     for (const auto& name : names) {
-        AppendReadEntry(source, name, entries);
+        co_await AppendReadEntry(use_async, source, name, entries);
     }
-    return entries;
+    co_return entries;
 }
 
 using detail::EmptyEmbeddingListState;
@@ -225,26 +230,44 @@ ThrowDeserializeError(knowhere::Status status) {
 // BEFORE the engine is deserialized: knowhere derives both mapping directions
 // from the bitmap inside Deserialize, and a metadata-only artifact never
 // reaches Deserialize at all, so its map is finalized explicitly.
-RestoredIdMap
-RestoreValidity(storage::FileSource& source,
+folly::coro::Task<RestoredIdMap>
+RestoreValidity(bool use_async,
+                const storage::LoadOptions& opts,
+                storage::FileSource& source,
                 const EntryPlan& plan,
                 const RuntimeParams& params,
                 KnowhereEngine& engine,
                 const std::string& mmap_path_prefix,
                 knowhere::BinarySet* existing = nullptr) {
     if (!plan.has_validity) {
-        return {};
+        co_return {};
     }
     knowhere::BinarySet local;
     auto& entries = existing == nullptr ? local : *existing;
     if (!entries.Contains(VALID_DATA_COUNT_KEY)) {
-        AppendReadEntry(source, VALID_DATA_COUNT_KEY, entries);
-        AppendReadEntry(source, VALID_DATA_KEY, entries);
+        co_await AppendReadEntry(
+            use_async, source, VALID_DATA_COUNT_KEY, entries);
+        co_await AppendReadEntry(use_async, source, VALID_DATA_KEY, entries);
     }
     const auto mmap_flags =
         mmap_path_prefix.empty() ? IdMapMmapFlags{} : params.id_map_mmap;
-    return RestoreIdMapFromBinarySet(
-        entries, engine.native_index.GetIdMap(), mmap_flags, mmap_path_prefix);
+    const auto priority =
+        opts.op_ctx && opts.op_ctx->runtime_load_priority.value_or(0) != 0
+            ? proto::common::LoadPriority::LOW
+            : proto::common::LoadPriority::HIGH;
+    RestoredIdMap result;
+    auto local_io = [&] {
+        result = RestoreIdMapFromBinarySet(entries,
+                                           engine.native_index.GetIdMap(),
+                                           mmap_flags,
+                                           mmap_path_prefix);
+    };
+    if (use_async && mmap_flags.Any()) {
+        co_await storage::RunLocalFileIOAsync(local_io, priority);
+    } else {
+        local_io();
+    }
+    co_return result;
 }
 
 struct OpenedMemState {
@@ -259,12 +282,17 @@ struct OpenedMemState {
     KnowhereEngine engine;
 };
 
-void
-PopulateState(OpenedMemState& state,
+folly::coro::Task<void>
+PopulateState(bool use_async,
+              OpenedMemState& state,
               storage::FileSource& source,
               const storage::LoadOptions& opts,
               const RuntimeParams& params,
               const EntryPlan& plan) {
+    const auto priority =
+        opts.op_ctx && opts.op_ctx->runtime_load_priority.value_or(0) != 0
+            ? proto::common::LoadPriority::LOW
+            : proto::common::LoadPriority::HIGH;
     auto config = params.knowhere_config;
     config.erase(MMAP_FILE_PATH);
     config.erase(EMB_LIST_META_PATH);
@@ -276,31 +304,52 @@ PopulateState(OpenedMemState& state,
     // outlive the engine. A metadata-only artifact owns no engine file, so it
     // creates that directory on its own when mmap was requested.
     const auto id_map_mmap_requested = params.id_map_mmap.Any();
-    auto stage_id_map_mmap_dir = [&]() -> std::string {
-        if (!plan.has_validity || !id_map_mmap_requested) {
-            return {};
+    auto stage_id_map_mmap_dir = [&]() -> folly::coro::Task<std::string> {
+        if (!plan.has_validity || !id_map_mmap_requested)
+            co_return std::string{};
+        std::string path;
+        auto local_io = [&] {
+            auto local_files =
+                storage::LocalDirectory::CreateOwned(opts.mmap_dir_path,
+                                                     "vector_id_map_XXXXXX",
+                                                     "vector id map mmap");
+            path = local_files->Path();
+            state.engine.backing_owner = std::move(local_files);
+        };
+        if (use_async) {
+            co_await storage::RunLocalFileIOAsync(local_io, priority);
+        } else {
+            local_io();
         }
-        auto local_files = storage::LocalDirectory::CreateOwned(
-            opts.mmap_dir_path, "vector_id_map_XXXXXX", "vector id map mmap");
-        auto path = local_files->Path();
-        state.engine.backing_owner = std::move(local_files);
-        return path;
+        co_return path;
     };
 
     if (plan.state == ArtifactState::EmptyEmbeddingList) {
-        auto entries = ReadEntries(source, plan.all_names);
+        auto entries = co_await ReadEntries(use_async, source, plan.all_names);
         auto empty = DecodeEmptyEmbeddingList(entries);
         state.engine.SetDim(empty.dim);
         state.engine.SetEmptyEmbListOffsets(std::move(empty.offsets));
-        const auto restored = RestoreValidity(source,
-                                              plan,
-                                              params,
-                                              state.engine,
-                                              stage_id_map_mmap_dir(),
-                                              &entries);
+        const auto id_map_path = co_await stage_id_map_mmap_dir();
+        const auto restored = co_await RestoreValidity(use_async,
+                                                       opts,
+                                                       source,
+                                                       plan,
+                                                       params,
+                                                       state.engine,
+                                                       id_map_path,
+                                                       &entries);
         if (restored.has_valid_data) {
-            FinalizeRestoredIdMap(state.engine.native_index.Node(),
-                                  "empty embedding-list vector load");
+            {
+                auto local_io = [&] {
+                    FinalizeRestoredIdMap(state.engine.native_index.Node(),
+                                          "empty embedding-list vector load");
+                };
+                if (use_async && params.id_map_mmap.Any()) {
+                    co_await storage::RunLocalFileIOAsync(local_io, priority);
+                } else {
+                    local_io();
+                }
+            }
         }
         ValidateLoadedDimension(params,
                                 state.engine.Dim(),
@@ -312,11 +361,21 @@ PopulateState(OpenedMemState& state,
                       "validity-only vector artifact requires runtime dim");
         }
         state.engine.SetDim(*params.runtime_dim);
-        const auto restored = RestoreValidity(
-            source, plan, params, state.engine, stage_id_map_mmap_dir());
+        const auto id_map_path = co_await stage_id_map_mmap_dir();
+        const auto restored = co_await RestoreValidity(
+            use_async, opts, source, plan, params, state.engine, id_map_path);
         if (restored.has_valid_data) {
-            FinalizeRestoredIdMap(state.engine.native_index.Node(),
-                                  "all-null nullable vector load");
+            {
+                auto local_io = [&] {
+                    FinalizeRestoredIdMap(state.engine.native_index.Node(),
+                                          "all-null nullable vector load");
+                };
+                if (use_async && params.id_map_mmap.Any()) {
+                    co_await storage::RunLocalFileIOAsync(local_io, priority);
+                } else {
+                    local_io();
+                }
+            }
         }
         ValidateLoadedDimension(params,
                                 state.engine.Dim(),
@@ -327,46 +386,77 @@ PopulateState(OpenedMemState& state,
             opts.enable_mmap &&
             KnowhereMmapSupported(state.engine.KnowhereIndexType());
         if (mmap) {
-            auto local_files = storage::LocalDirectory::CreateOwned(
-                opts.mmap_dir_path, "vector_mem_XXXXXX", "vector mmap");
-            const auto& directory = local_files->Path();
-            state.engine.backing_owner = std::move(local_files);
+            std::string directory;
+            {
+                auto local_io = [&] {
+                    auto local_files = storage::LocalDirectory::CreateOwned(
+                        opts.mmap_dir_path, "vector_mem_XXXXXX", "vector mmap");
+                    directory = local_files->Path();
+                    state.engine.backing_owner = std::move(local_files);
+                };
+                if (use_async) {
+                    co_await storage::RunLocalFileIOAsync(local_io, priority);
+                } else {
+                    local_io();
+                }
+            }
             const auto main_path =
                 (std::filesystem::path(directory) / "index").string();
-            source.ReadEntriesToLocalFile(plan.engine_names, main_path);
+            co_await source.ReadEntriesToLocalFileAsync(
+                plan.engine_names, main_path, use_async);
             config[ENABLE_MMAP] = true;
             if (params.elem_type != DataType::NONE) {
                 const auto meta_path =
                     (std::filesystem::path(directory) / EMB_LIST_META_FILE_NAME)
                         .string();
-                source.ReadEntryToLocalFile(knowhere::meta::EMB_LIST_META,
-                                            meta_path);
+                co_await source.ReadEntryToLocalFileAsync(
+                    knowhere::meta::EMB_LIST_META, meta_path, use_async);
                 config[EMB_LIST_META_PATH] = meta_path;
                 if (plan.has_emb_raw) {
                     const auto raw_path = (std::filesystem::path(directory) /
                                            EMB_LIST_RAW_INDEX_FILE_NAME)
                                               .string();
-                    source.ReadEntryToLocalFile(
-                        knowhere::meta::EMB_LIST_RAW_INDEX, raw_path);
+                    co_await source.ReadEntryToLocalFileAsync(
+                        knowhere::meta::EMB_LIST_RAW_INDEX,
+                        raw_path,
+                        use_async);
                     config[EMB_LIST_RAW_INDEX_PATH] = raw_path;
                 }
             }
             // Restore before deserializing: Deserialize is what derives the
             // dense id arrays from the validity bitmap.
-            RestoreValidity(source, plan, params, state.engine, directory);
-            const auto status = state.engine.native_index.DeserializeFromFile(
-                main_path, config);
-            // The knowhere deserialize API has no OpContext entrance. Remote
-            // reads and local materialization observe the context captured by
-            // FileSource; the borrowed opts.op_ctx is never retained here.
-            if (status != knowhere::Status::success) {
-                ThrowDeserializeError(status);
+            co_await RestoreValidity(
+                use_async, opts, source, plan, params, state.engine, directory);
+            {
+                auto local_io = [&] {
+                    const auto status =
+                        state.engine.native_index.DeserializeFromFile(main_path,
+                                                                      config);
+                    // The knowhere deserialize API has no OpContext entrance. Remote
+                    // reads and local materialization observe the context captured by
+                    // FileSource; the borrowed opts.op_ctx is never retained here.
+                    if (status != knowhere::Status::success) {
+                        ThrowDeserializeError(status);
+                    }
+                };
+                if (use_async) {
+                    co_await storage::RunLocalFileIOAsync(local_io, priority);
+                } else {
+                    local_io();
+                }
             }
         } else {
             config[ENABLE_MMAP] = false;
-            auto entries = ReadEntries(source, plan.all_names);
-            RestoreValidity(
-                source, plan, params, state.engine, std::string{}, &entries);
+            auto entries =
+                co_await ReadEntries(use_async, source, plan.all_names);
+            co_await RestoreValidity(use_async,
+                                     opts,
+                                     source,
+                                     plan,
+                                     params,
+                                     state.engine,
+                                     std::string{},
+                                     &entries);
             const auto status =
                 state.engine.native_index.Deserialize(entries, config);
             if (status != knowhere::Status::success) {
@@ -394,9 +484,10 @@ VectorMemLoader::DeriveCaps(const Config& index_meta) {
     return {};
 }
 
-IIndexReaderBasePtr
-VectorMemLoader::Open(storage::FileSource& source,
-                      const storage::LoadOptions& opts) {
+folly::coro::Task<IIndexReaderBasePtr>
+VectorMemLoader::OpenImpl(bool use_async,
+                          storage::FileSource& source,
+                          const storage::LoadOptions& opts) {
     const auto params = ParseRuntimeParams(opts.params);
     if (source.Gen() != storage::Generation::V1V2) {
         ThrowInfo(Unsupported,
@@ -409,8 +500,20 @@ VectorMemLoader::Open(storage::FileSource& source,
                   "nullable vector mmap mapping requires a staging parent");
     }
     OpenedMemState state(params);
-    PopulateState(state, source, opts, params, plan);
-    return std::make_unique<VectorIndexReader>(std::move(state.engine));
+    co_await PopulateState(use_async, state, source, opts, params, plan);
+    co_return std::make_unique<VectorIndexReader>(std::move(state.engine));
+}
+
+IIndexReaderBasePtr
+VectorMemLoader::Open(storage::FileSource& source,
+                      const storage::LoadOptions& opts) {
+    return folly::coro::blockingWait(OpenImpl(false, source, opts));
+}
+
+folly::coro::Task<IIndexReaderBasePtr>
+VectorMemLoader::OpenAsync(storage::FileSource& source,
+                           const storage::LoadOptions& opts) {
+    return OpenImpl(true, source, opts);
 }
 
 }  // namespace milvus::index

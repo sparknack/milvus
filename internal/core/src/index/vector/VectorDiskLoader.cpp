@@ -14,10 +14,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "common/OpContext.h"
+#include "storage/LocalFileIOPool.h"
 #include "index/vector/VectorDiskLoader.h"
 #include "index/vector/VectorLoadUtils.h"
 
 #include <cstdint>
+#include "folly/coro/BlockingWait.h"
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -188,17 +191,19 @@ DecodeValidityBytes(const std::vector<uint8_t>& bytes) {
 
 // Publish the persisted validity into the engine's knowhere IdMap (#50524).
 // Must run before Deserialize, which is what derives the dense id arrays.
-RestoredIdMap
-RestoreValidity(storage::FileSource& source,
+folly::coro::Task<RestoredIdMap>
+RestoreValidity(bool use_async,
+                const storage::LoadOptions& opts,
+                storage::FileSource& source,
                 const EntryPlan& plan,
                 const RuntimeParams& params,
                 KnowhereEngine& engine,
                 const std::string& local_prefix,
                 std::vector<uint8_t>& owned_bytes) {
     if (!plan.has_validity) {
-        return {};
+        co_return {};
     }
-    owned_bytes = source.ReadEntry(VALID_DATA_KEY);
+    owned_bytes = co_await source.ReadEntryAsync(VALID_DATA_KEY, use_async);
     const auto valid_data = DecodeValidityBytes(owned_bytes);
     auto mmap_flags = params.id_map_mmap;
     // A fully null column derives no dense id array at all, so mmap staging
@@ -207,8 +212,23 @@ RestoreValidity(storage::FileSource& source,
         CountValidDataBitmap(valid_data.count, valid_data.bitmap) == 0) {
         mmap_flags = {};
     }
-    return RestoreIdMapFromValidData(
-        engine.native_index.GetIdMap(), valid_data, mmap_flags, local_prefix);
+    const auto priority =
+        opts.op_ctx && opts.op_ctx->runtime_load_priority.value_or(0) != 0
+            ? proto::common::LoadPriority::LOW
+            : proto::common::LoadPriority::HIGH;
+    RestoredIdMap result;
+    auto local_io = [&] {
+        result = RestoreIdMapFromValidData(engine.native_index.GetIdMap(),
+                                           valid_data,
+                                           mmap_flags,
+                                           local_prefix);
+    };
+    if (use_async && mmap_flags.Any()) {
+        co_await storage::RunLocalFileIOAsync(local_io, priority);
+    } else {
+        local_io();
+    }
+    co_return result;
 }
 
 using detail::EmptyEmbeddingListState;
@@ -229,10 +249,10 @@ DecodeEmptyEmbeddingListBytes(const std::vector<uint8_t>& bytes) {
     return result;
 }
 
-EmptyEmbeddingListState
-DecodeEmptyEmbeddingList(storage::FileSource& source) {
-    return DecodeEmptyEmbeddingListBytes(
-        source.ReadEntry(EMPTY_EMB_LIST_OFFSETS_KEY));
+folly::coro::Task<EmptyEmbeddingListState>
+DecodeEmptyEmbeddingList(bool use_async, storage::FileSource& source) {
+    co_return DecodeEmptyEmbeddingListBytes(
+        co_await source.ReadEntryAsync(EMPTY_EMB_LIST_OFFSETS_KEY, use_async));
 }
 
 void
@@ -280,58 +300,89 @@ ThrowDeserializeError(knowhere::Status status) {
               knowhere::Status2String(status));
 }
 
-std::unique_ptr<IIndexReaderBase>
-OpenIndex(storage::FileSource& source,
+KnowhereEngine
+MakeEngine(const RuntimeParams& params,
+           const std::shared_ptr<storage::DiskEngineFileHandle>& handle) {
+    auto manager = handle->Manager();
+    auto pack = knowhere::Pack(std::move(manager));
+    return KnowhereEngine(params.physical_type,
+                          params.elem_type,
+                          params.index_type,
+                          params.metric_type,
+                          params.version,
+                          handle,
+                          pack,
+                          true);
+}
+
+folly::coro::Task<std::unique_ptr<IIndexReaderBase>>
+OpenIndex(bool use_async,
+          storage::FileSource& source,
           const RuntimeParams& params,
           const DiskOpenOptions& open_options,
           const EntryPlan& plan,
           const storage::LoadOptions& opts) {
-    auto make_engine =
-        [&](const std::shared_ptr<storage::DiskEngineFileHandle>& handle) {
-            auto manager = handle->Manager();
-            auto pack = knowhere::Pack(std::move(manager));
-            return KnowhereEngine(params.physical_type,
-                                  params.elem_type,
-                                  params.index_type,
-                                  params.metric_type,
-                                  params.version,
-                                  handle,
-                                  pack,
-                                  true);
-        };
-
+    const auto priority =
+        opts.op_ctx && opts.op_ctx->runtime_load_priority.value_or(0) != 0
+            ? proto::common::LoadPriority::LOW
+            : proto::common::LoadPriority::HIGH;
     // Handles precede the engine so failed construction/deserialization always
     // destroys the native node before its manager and local generation.
-    auto local_handle = source.OpenDiskEngineFiles(
-        storage::DiskEngineFileMode::LocalFiles, plan.engine_names);
-    std::shared_ptr<storage::DiskEngineFileHandle> stream_handle;
-    std::shared_ptr<storage::DiskEngineFileHandle> selected_handle =
-        local_handle;
-    auto engine = make_engine(local_handle);
-    const bool stream_backend = plan.state == ArtifactState::Normal &&
-                                engine.native_index.LoadIndexWithStream();
-    if (stream_backend) {
-        stream_handle = source.OpenDiskEngineFiles(
-            storage::DiskEngineFileMode::RemoteStreams, plan.engine_names);
-        auto stream_engine = make_engine(stream_handle);
-        AssertInfo(stream_engine.native_index.LoadIndexWithStream(),
-                   "disk vector stream capability changed while opening");
-        engine = std::move(stream_engine);
-        selected_handle = stream_handle;
+    std::shared_ptr<storage::DiskEngineFileHandle> local_handle, stream_handle,
+        selected_handle;
+    std::optional<KnowhereEngine> owned_engine;
+    bool stream_backend = false;
+    {
+        auto local_io = [&] {
+            local_handle = source.OpenDiskEngineFiles(
+                storage::DiskEngineFileMode::LocalFiles, plan.engine_names);
+            selected_handle = local_handle;
+            owned_engine.emplace(MakeEngine(params, local_handle));
+            auto& engine = *owned_engine;
+            stream_backend = plan.state == ArtifactState::Normal &&
+                             engine.native_index.LoadIndexWithStream();
+            if (stream_backend) {
+                stream_handle = source.OpenDiskEngineFiles(
+                    storage::DiskEngineFileMode::RemoteStreams,
+                    plan.engine_names);
+                auto stream_engine = MakeEngine(params, stream_handle);
+                AssertInfo(
+                    stream_engine.native_index.LoadIndexWithStream(),
+                    "disk vector stream capability changed while opening");
+                engine = std::move(stream_engine);
+                selected_handle = stream_handle;
+            }
+        };
+        if (use_async) {
+            co_await storage::RunLocalFileIOAsync(local_io, priority);
+        } else {
+            local_io();
+        }
     }
+    auto& engine = *owned_engine;
     const auto prefix = selected_handle->LocalPrefix();
     // Keep the decoded payload alive until AddFromData has copied it.
     std::vector<uint8_t> validity_bytes;
-    const auto restored_id_map =
-        RestoreValidity(source, plan, params, engine, prefix, validity_bytes);
+    const auto restored_id_map = co_await RestoreValidity(
+        use_async, opts, source, plan, params, engine, prefix, validity_bytes);
 
     if (plan.state == ArtifactState::EmptyEmbeddingList) {
-        auto empty = DecodeEmptyEmbeddingList(source);
+        auto empty = co_await DecodeEmptyEmbeddingList(use_async, source);
         engine.SetDim(empty.dim);
         engine.SetEmptyEmbListOffsets(std::move(empty.offsets));
         if (restored_id_map.has_valid_data) {
-            FinalizeRestoredIdMap(engine.native_index.Node(),
-                                  "empty embedding-list disk vector load");
+            {
+                auto local_io = [&] {
+                    FinalizeRestoredIdMap(
+                        engine.native_index.Node(),
+                        "empty embedding-list disk vector load");
+                };
+                if (use_async && params.id_map_mmap.Any()) {
+                    co_await storage::RunLocalFileIOAsync(local_io, priority);
+                } else {
+                    local_io();
+                }
+            }
         }
         ValidateLoadedDimension(params,
                                 engine.Dim(),
@@ -345,8 +396,17 @@ OpenIndex(storage::FileSource& source,
         }
         engine.SetDim(*params.runtime_dim);
         if (restored_id_map.has_valid_data) {
-            FinalizeRestoredIdMap(engine.native_index.Node(),
-                                  "all-null nullable disk vector load");
+            {
+                auto local_io = [&] {
+                    FinalizeRestoredIdMap(engine.native_index.Node(),
+                                          "all-null nullable disk vector load");
+                };
+                if (use_async && params.id_map_mmap.Any()) {
+                    co_await storage::RunLocalFileIOAsync(local_io, priority);
+                } else {
+                    local_io();
+                }
+            }
         }
         ValidateLoadedDimension(params,
                                 engine.Dim(),
@@ -357,8 +417,8 @@ OpenIndex(storage::FileSource& source,
             opts.enable_mmap &&
             KnowhereMmapSupported(engine.KnowhereIndexType());
         if (!stream_backend) {
-            const auto paths =
-                source.ReadEntriesToLocalDir(plan.engine_names, prefix);
+            const auto paths = co_await source.ReadEntriesToLocalDirAsync(
+                plan.engine_names, prefix, use_async);
             if (paths.size() != plan.engine_names.size()) {
                 ThrowInfo(
                     FileReadFailed,
@@ -378,22 +438,38 @@ OpenIndex(storage::FileSource& source,
                 }
             }
         } else if (enable_mmap) {
-            EnsureMmapDirectory(prefix);
+            {
+                auto local_io = [&] { EnsureMmapDirectory(prefix); };
+                if (use_async) {
+                    co_await storage::RunLocalFileIOAsync(local_io, priority);
+                } else {
+                    local_io();
+                }
+            }
         }
 
         auto config = params.knowhere_config;
         PrepareCommonLoadConfig(
             config, params, open_options, prefix, stream_backend, enable_mmap);
-        const auto status =
-            engine.native_index.Deserialize(knowhere::BinarySet{}, config);
-        selected_handle->RethrowFirstFailure();
-        // The knowhere deserialize API has no OpContext entrance. FileSource
-        // observes its captured cancellation/priority while materializing
-        // sidecars/non-stream files. Stream backends retain their storage input
-        // through the engine backing owner; neither source nor opts.op_ctx is
-        // retained by the reader.
-        if (status != knowhere::Status::success) {
-            ThrowDeserializeError(status);
+        {
+            auto local_io = [&] {
+                const auto status = engine.native_index.Deserialize(
+                    knowhere::BinarySet{}, config);
+                selected_handle->RethrowFirstFailure();
+                // The knowhere deserialize API has no OpContext entrance. FileSource
+                // observes its captured cancellation/priority while materializing
+                // sidecars/non-stream files. Stream backends retain their storage input
+                // through the engine backing owner; neither source nor opts.op_ctx is
+                // retained by the reader.
+                if (status != knowhere::Status::success) {
+                    ThrowDeserializeError(status);
+                }
+            };
+            if (use_async) {
+                co_await storage::RunLocalFileIOAsync(local_io, priority);
+            } else {
+                local_io();
+            }
         }
         engine.SetDim(engine.native_index.Dim());
         ValidateLoadedDimension(params,
@@ -403,8 +479,8 @@ OpenIndex(storage::FileSource& source,
     }
 
     ValidateLoadedShape(params, plan.state, engine, LoadBackend::Disk);
-    return std::make_unique<VectorIndexReader>(open_options.beamwidth,
-                                               std::move(engine));
+    co_return std::make_unique<VectorIndexReader>(open_options.beamwidth,
+                                                  std::move(engine));
 }
 
 }  // namespace
@@ -417,9 +493,10 @@ VectorDiskLoader::DeriveCaps(const Config& index_meta) {
     return {};
 }
 
-IIndexReaderBasePtr
-VectorDiskLoader::Open(storage::FileSource& source,
-                       const storage::LoadOptions& opts) {
+folly::coro::Task<IIndexReaderBasePtr>
+VectorDiskLoader::OpenImpl(bool use_async,
+                           storage::FileSource& source,
+                           const storage::LoadOptions& opts) {
     auto params = ParseDiskLoadMetadata(opts.params);
     const auto open_options = ParseOpenOptions(opts.params, params);
     ParseIdMapMmapMetadata(opts.params, params);
@@ -428,7 +505,43 @@ VectorDiskLoader::Open(storage::FileSource& source,
                   "disk vector indexes have no V3 persisted format");
     }
     const auto plan = PlanEntries(source, params);
-    return OpenIndex(source, params, open_options, plan, opts);
+    co_return co_await OpenIndex(
+        use_async, source, params, open_options, plan, opts);
+}
+
+std::vector<std::string>
+VectorDiskLoader::AsyncEntryNames(storage::FileSource& source,
+                                  const storage::LoadOptions& opts) {
+    const auto params = ParseRuntimeParams(opts.params);
+    const auto plan = PlanEntries(source, params);
+    if (plan.state == ArtifactState::Normal) {
+        auto handle = source.OpenDiskEngineFiles(
+            storage::DiskEngineFileMode::LocalFiles, plan.engine_names);
+        auto engine = MakeEngine(params, handle);
+        if (!engine.native_index.LoadIndexWithStream()) {
+            return source.EntryNames();
+        }
+    }
+    std::vector<std::string> names;
+    if (plan.has_validity) {
+        names.emplace_back(VALID_DATA_KEY);
+    }
+    if (plan.has_empty_offsets) {
+        names.emplace_back(EMPTY_EMB_LIST_OFFSETS_KEY);
+    }
+    return names;
+}
+
+IIndexReaderBasePtr
+VectorDiskLoader::Open(storage::FileSource& source,
+                       const storage::LoadOptions& opts) {
+    return folly::coro::blockingWait(OpenImpl(false, source, opts));
+}
+
+folly::coro::Task<IIndexReaderBasePtr>
+VectorDiskLoader::OpenAsync(storage::FileSource& source,
+                            const storage::LoadOptions& opts) {
+    return OpenImpl(true, source, opts);
 }
 
 }  // namespace milvus::index

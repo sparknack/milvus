@@ -16,8 +16,13 @@
 
 #include "folly/CancellationToken.h"
 #include "folly/coro/Task.h"
+#include "folly/coro/WithCancellation.h"
+#include "storage/AsyncLoadExecutor.h"
+#include "storage/LocalFileIOPool.h"
 #include "common/OpContext.h"
 #include "storage/LocalFileIOPool.h"
+#include "folly/coro/BlockingWait.h"
+
 #include "index/scalar/text/TextIndexLoader.h"
 
 #include <algorithm>
@@ -174,62 +179,80 @@ ValidateNullOffsets(const std::vector<size_t>& offsets, size_t count) {
     }
 }
 
-std::shared_ptr<const std::vector<size_t>>
-ReadNullOffsets(storage::FileSource& source,
+folly::coro::Task<std::shared_ptr<const std::vector<size_t>>>
+ReadNullOffsets(bool use_async,
+                const storage::LoadOptions& opts,
+                storage::FileSource& source,
                 bool has_null,
                 const std::string& staging_parent,
                 size_t count) {
-    if (!has_null) {
-        return std::make_shared<const std::vector<size_t>>();
-    }
+    const auto priority =
+        opts.op_ctx && opts.op_ctx->runtime_load_priority.value_or(0) != 0
+            ? proto::common::LoadPriority::LOW
+            : proto::common::LoadPriority::HIGH;
+    auto run_io =
+        [&]() -> folly::coro::Task<std::shared_ptr<const std::vector<size_t>>> {
+        if (!has_null) {
+            co_return std::make_shared<const std::vector<size_t>>();
+        }
 
-    // Keep the sidecar outside the Tantivy directory so it can never enter the
-    // engine inventory enumerated by TextIndexArtifact::Serialize.
-    auto directory = CreateTextIndexDirectory(staging_parent, "null");
-    auto path =
-        (std::filesystem::path(directory->Path()) / INDEX_NULL_OFFSET).string();
-    LocalEntryGuard local(std::move(path));
-    source.ReadEntryToLocalFile(INDEX_NULL_OFFSET, local.Path());
+        // Keep the sidecar outside the Tantivy directory so it can never enter the
+        // engine inventory enumerated by TextIndexArtifact::Serialize.
+        auto directory = CreateTextIndexDirectory(staging_parent, "null");
+        auto path =
+            (std::filesystem::path(directory->Path()) / INDEX_NULL_OFFSET)
+                .string();
+        LocalEntryGuard local(std::move(path));
+        co_await source.ReadEntryToLocalFileAsync(
+            INDEX_NULL_OFFSET, local.Path(), use_async);
 
-    std::error_code error;
-    const auto observed = std::filesystem::file_size(local.Path(), error);
-    if (error || observed > std::numeric_limits<size_t>::max()) {
-        ThrowInfo(FileReadFailed,
-                  "failed to determine text NULL sidecar size {}: {}",
-                  local.Path(),
-                  error.message());
-    }
-    const auto bytes = static_cast<size_t>(observed);
-    if (bytes == 0 || bytes % sizeof(size_t) != 0) {
-        ThrowInfo(
-            DataFormatBroken, "invalid text null-offset byte size {}", bytes);
-    }
-    const auto offset_count = bytes / sizeof(size_t);
-    if (offset_count > count) {
-        ThrowInfo(DataFormatBroken,
-                  "text null-offset count {} exceeds row count {}",
-                  offset_count,
-                  count);
-    }
+        std::error_code error;
+        const auto observed = std::filesystem::file_size(local.Path(), error);
+        if (error || observed > std::numeric_limits<size_t>::max()) {
+            ThrowInfo(FileReadFailed,
+                      "failed to determine text NULL sidecar size {}: {}",
+                      local.Path(),
+                      error.message());
+        }
+        const auto bytes = static_cast<size_t>(observed);
+        if (bytes == 0 || bytes % sizeof(size_t) != 0) {
+            ThrowInfo(DataFormatBroken,
+                      "invalid text null-offset byte size {}",
+                      bytes);
+        }
+        const auto offset_count = bytes / sizeof(size_t);
+        if (offset_count > count) {
+            ThrowInfo(DataFormatBroken,
+                      "text null-offset count {} exceeds row count {}",
+                      offset_count,
+                      count);
+        }
 
-    auto result = std::make_shared<std::vector<size_t>>(offset_count);
-    const auto fd = ::open(local.Path().c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd == -1) {
-        ThrowInfo(FileOpenFailed,
-                  "failed to open text NULL staging file {}: {}",
-                  local.Path(),
-                  std::strerror(errno));
-    }
-    FileDescriptorGuard descriptor(fd);
-    storage::ReadAll(descriptor.Get(),
-                     result->data(),
-                     bytes,
-                     local.Path(),
-                     "text NULL staging file");
-    descriptor.CloseChecked(local.Path(), "text NULL staging file");
-    ValidateNullOffsets(*result, count);
-    local.RemoveChecked("text NULL staging file");
-    return result;
+        auto result = std::make_shared<std::vector<size_t>>(offset_count);
+        const auto fd = ::open(local.Path().c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd == -1) {
+            ThrowInfo(FileOpenFailed,
+                      "failed to open text NULL staging file {}: {}",
+                      local.Path(),
+                      std::strerror(errno));
+        }
+        FileDescriptorGuard descriptor(fd);
+        storage::ReadAll(descriptor.Get(),
+                         result->data(),
+                         bytes,
+                         local.Path(),
+                         "text NULL staging file");
+        descriptor.CloseChecked(local.Path(), "text NULL staging file");
+        ValidateNullOffsets(*result, count);
+        local.RemoveChecked("text NULL staging file");
+        co_return result;
+    };
+    if (!use_async)
+        co_return co_await run_io();
+    co_return co_await folly::coro::co_withExecutor(
+        storage::ResolveAsyncLoadExecutor(
+            storage::LocalFileIOPool::GetInstance().GetExecutor(), priority),
+        run_io());
 }
 
 struct TextLoadState {
@@ -244,20 +267,36 @@ struct TextLoadState {
     size_t payload_bytes{0};
 };
 
-TextLoadState
-LoadState(storage::FileSource& source,
+folly::coro::Task<TextLoadState>
+LoadState(bool use_async,
+          storage::FileSource& source,
           const storage::LoadOptions& opts,
           RuntimeParams params) {
+    const auto priority =
+        opts.op_ctx && opts.op_ctx->runtime_load_priority.value_or(0) != 0
+            ? proto::common::LoadPriority::LOW
+            : proto::common::LoadPriority::HIGH;
     const auto effective = ResolveLoadOptions(opts);
     const auto entries = ReadPersistedEntries(source);
 
     // Keep these local owners intact until TextLoadState has acquired all
     // shared references. The engine is declared after its backing directory
     // and therefore releases first if any later operation throws.
-    auto directory =
-        CreateTextIndexDirectory(effective.directory_parent, "loaded");
-    const auto paths =
-        source.ReadEntriesToLocalDir(entries.engine_files, directory->Path());
+    std::shared_ptr<storage::LocalDirectory> directory;
+    {
+        auto local_io = [&] {
+            directory =
+                CreateTextIndexDirectory(effective.directory_parent, "loaded");
+        };
+        if (use_async) {
+            co_await storage::RunLocalFileIOAsync(local_io, priority);
+        } else {
+            local_io();
+        }
+    }
+
+    const auto paths = co_await source.ReadEntriesToLocalDirAsync(
+        entries.engine_files, directory->Path(), use_async);
     if (paths.size() != entries.engine_files.size()) {
         ThrowInfo(DataFormatBroken,
                   "text source materialized {} of {} engine entries",
@@ -273,24 +312,49 @@ LoadState(storage::FileSource& source,
                       paths[i]);
         }
     }
-    if (!tantivy_index_exist(directory->Path().c_str())) {
-        ThrowInfo(DataFormatBroken,
-                  "materialized text artifact is not a Tantivy index");
+    std::shared_ptr<milvus::tantivy::TantivyIndexWrapper> engine;
+    {
+        auto local_io = [&] {
+            if (!tantivy_index_exist(directory->Path().c_str())) {
+                ThrowInfo(DataFormatBroken,
+                          "materialized text artifact is not a Tantivy index");
+            }
+
+            engine = std::make_shared<milvus::tantivy::TantivyIndexWrapper>(
+                directory->Path().c_str(),
+                effective.file_backed,
+                SetBitsetSealed);
+        };
+        if (use_async) {
+            co_await storage::RunLocalFileIOAsync(local_io, priority);
+        } else {
+            local_io();
+        }
     }
 
-    auto engine = std::make_shared<milvus::tantivy::TantivyIndexWrapper>(
-        directory->Path().c_str(), effective.file_backed, SetBitsetSealed);
     engine->set_analyzer_extra_info(params.analyzer_extra_info);
     engine->register_tokenizer(params.analyzer_name.c_str(),
                                params.analyzer_params.c_str());
     const auto count = static_cast<int64_t>(engine->count());
-    auto null_offsets = ReadNullOffsets(source,
-                                        entries.has_null,
-                                        effective.directory_parent,
-                                        static_cast<size_t>(count));
-    const auto payload_bytes = effective.file_backed
-                                   ? TextIndexDirectoryBytes(*directory)
-                                   : TextIndexRamPayloadBytes(*engine);
+    auto null_offsets = (co_await ReadNullOffsets(use_async,
+                                                  opts,
+                                                  source,
+                                                  entries.has_null,
+                                                  effective.directory_parent,
+                                                  static_cast<size_t>(count)));
+    size_t payload_bytes = 0;
+    {
+        auto local_io = [&] {
+            payload_bytes = effective.file_backed
+                                ? TextIndexDirectoryBytes(*directory)
+                                : TextIndexRamPayloadBytes(*engine);
+        };
+        if (use_async) {
+            co_await storage::RunLocalFileIOAsync(local_io, priority);
+        } else {
+            local_io();
+        }
+    }
 
     TextLoadState result;
     result.directory = directory;
@@ -300,7 +364,7 @@ LoadState(storage::FileSource& source,
     result.count = count;
     result.reader_file_backed = effective.file_backed;
     result.payload_bytes = payload_bytes;
-    return result;
+    co_return result;
 }
 
 std::unique_ptr<IIndexReaderBase>
@@ -338,8 +402,16 @@ TextIndexLoader::DeriveCaps(const Config& index_meta) {
 IIndexReaderBasePtr
 TextIndexLoader::Open(storage::FileSource& source,
                       const storage::LoadOptions& opts) {
-    auto state = LoadState(source, opts, ParseRuntimeParams(opts.params));
-    return MakeReader(state);
+    return folly::coro::blockingWait(OpenAsync(source, opts, false));
+}
+
+folly::coro::Task<IIndexReaderBasePtr>
+TextIndexLoader::OpenAsync(storage::FileSource& source,
+                           const storage::LoadOptions& opts,
+                           bool use_async) {
+    auto state = (co_await LoadState(
+        use_async, source, opts, ParseRuntimeParams(opts.params)));
+    co_return MakeReader(state);
 }
 
 IndexLoadPlan

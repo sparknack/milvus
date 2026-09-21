@@ -40,6 +40,13 @@ class MarisaIndexLoader final {
 
     static IIndexReaderBasePtr
     Open(storage::FileSource& source, const storage::LoadOptions& opts);
+
+    // Shares decoding with Open; remote reads and admission suspend when enabled.
+    static folly::coro::Task<IIndexReaderBasePtr>
+    OpenAsync(storage::FileSource& source,
+              const storage::LoadOptions& opts,
+              bool use_async = true);
+
     // Plan V3 directly into heap vectors or mapped-file regions.
     static IndexLoadPlan
     PlanPacked(const storage::IndexEntryDirectory& directory,

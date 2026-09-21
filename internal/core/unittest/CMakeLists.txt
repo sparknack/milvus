@@ -86,6 +86,9 @@ set(MILVUS_TEST_FILES
         )
 
 set(INDEX_TEST_FILES
+        ${CMAKE_HOME_DIRECTORY}/src/storage/FileWriterTest.cpp
+        ${CMAKE_HOME_DIRECTORY}/src/index/LegacyIndexLoadTest.cpp
+        ${CMAKE_HOME_DIRECTORY}/src/storage/LegacyIndexLoaderTest.cpp
         ${CMAKE_HOME_DIRECTORY}/src/indexbuilder/MaterializerArrayTest.cpp
         ${CMAKE_HOME_DIRECTORY}/src/index/LoadResourceTest.cpp
         ${CMAKE_HOME_DIRECTORY}/src/index/PackedIndexLoadTest.cpp
@@ -264,6 +267,7 @@ target_link_libraries(
         "$<COMPILE_ONLY:milvus_core>"
         "$<TARGET_FILE:milvus_core>"
         "$<TARGET_FILE:milvus-storage>"
+        "$<TARGET_FILE:knowhere>"
         "${INDEX_TEST_MILVUS_COMMON_LIBRARY}"
         gRPC::grpc++
         Boost::filesystem

@@ -50,8 +50,19 @@ class VectorMemLoader final {
     DeriveCaps(const Config& index_meta);
 
     static IIndexReaderBasePtr
-    Open(storage::FileSource& source,
-         const storage::LoadOptions& opts);
+    Open(storage::FileSource& source, const storage::LoadOptions& opts);
+
+    // Borrow source/options until completion. Run on the local-file executor:
+    // remote reads suspend, while native initialization and mmap remain local.
+    static folly::coro::Task<IIndexReaderBasePtr>
+    OpenAsync(storage::FileSource& source, const storage::LoadOptions& opts);
+
+ private:
+    // Share validation, decoding and ownership across both transport modes.
+    static folly::coro::Task<IIndexReaderBasePtr>
+    OpenImpl(bool use_async,
+             storage::FileSource& source,
+             const storage::LoadOptions& opts);
 };
 
 }  // namespace milvus::index

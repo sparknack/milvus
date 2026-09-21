@@ -51,6 +51,9 @@ struct LoaderEntry {
     using OpenFn = IIndexReaderBasePtr (*)(storage::FileSource&,
                                            const storage::LoadOptions&);
 
+    using OpenAsyncFn = folly::coro::Task<IIndexReaderBasePtr> (*)(
+        storage::FileSource&, const storage::LoadOptions&);
+
     using PlanPackedFn = IndexLoadPlan (*)(const storage::IndexEntryDirectory&,
                                            const nlohmann::json&,
                                            const storage::LoadOptions&);
@@ -79,6 +82,9 @@ struct LoaderEntry {
     // after a complete reader has been constructed. Null for legacy-only families.
     PlanPackedFn plan_packed{nullptr};
     FinishPackedFn finish_packed{FinishPackedSyncFn{nullptr}};
+
+    // Legacy transport suspends; the orchestrator supplies the loading executor.
+    OpenAsyncFn open_async{nullptr};
 
     explicit operator bool() const noexcept {
         return derive_caps != nullptr && open != nullptr;
@@ -115,6 +121,15 @@ class LoaderRegistry {
                       }) {
             entry.plan_packed = &Provider::PlanPacked;
             entry.finish_packed = &Provider::FinishPacked;
+        }
+        if constexpr (requires(storage::FileSource & source,
+                               const storage::LoadOptions& options) {
+                          Provider::OpenAsync(source, options);
+                      }) {
+            entry.open_async = [](storage::FileSource& source,
+                                  const storage::LoadOptions& options) {
+                return Provider::OpenAsync(source, options);
+            };
         }
         RegisterEntry(Provider::kFamily, entry);
     }

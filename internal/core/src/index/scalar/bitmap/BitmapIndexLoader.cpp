@@ -17,6 +17,8 @@
 #include "folly/CancellationToken.h"
 #include "folly/coro/Task.h"
 #include "storage/LocalFileIOPool.h"
+#include "folly/coro/BlockingWait.h"
+
 #include "index/scalar/bitmap/BitmapIndexLoader.h"
 
 #include <bit>
@@ -154,9 +156,10 @@ ParseLegacyMeta(const std::vector<uint8_t>& encoded) {
     }
 }
 
-BitmapMeta
-ReadMeta(storage::FileSource& source) {
-    return ParseLegacyMeta(source.ReadEntry(BITMAP_INDEX_META));
+folly::coro::Task<BitmapMeta>
+ReadMeta(bool use_async, storage::FileSource& source) {
+    co_return ParseLegacyMeta(
+        co_await source.ReadEntryAsync(BITMAP_INDEX_META, use_async));
 }
 
 void
@@ -792,11 +795,12 @@ DispatchMmapOpen(DataType value_type,
         });
 }
 
-std::unique_ptr<IIndexReaderBase>
-LoadBitmapPayload(storage::FileSource& source,
+folly::coro::Task<std::unique_ptr<IIndexReaderBase>>
+LoadBitmapPayload(bool use_async,
+                  storage::FileSource& source,
                   const storage::LoadOptions& opts,
                   const RuntimeParams& params) {
-    auto meta = ReadMeta(source);
+    auto meta = (co_await ReadMeta(use_async, source));
     if (meta.has_nested && meta.nested != params.nested) {
         ThrowInfo(DataFormatBroken,
                   "bitmap persisted nested value {} disagrees with runtime "
@@ -813,7 +817,8 @@ LoadBitmapPayload(storage::FileSource& source,
     TargetBitmap validity(meta.count, meta.nested || !params.nullable);
     bool rebuild_validity = params.nullable && !meta.nested;
     if (source.HasEntry(BITMAP_INDEX_VALID_BITSET)) {
-        auto encoded = source.ReadEntry(BITMAP_INDEX_VALID_BITSET);
+        auto encoded = co_await source.ReadEntryAsync(BITMAP_INDEX_VALID_BITSET,
+                                                      use_async);
         validity = DecodeValidity(encoded, meta.count);
         rebuild_validity = false;
     }
@@ -824,65 +829,113 @@ LoadBitmapPayload(storage::FileSource& source,
             ? BitmapLayout::Bitset
             : BitmapLayout::Roaring;
     if (opts.enable_mmap && layout == BitmapLayout::Roaring) {
-        auto portable_file =
-            CreateTemporaryFile(opts.mmap_dir_path, "bitmap_portable");
-        portable_file.Close();
-        source.ReadEntryToLocalFile(BITMAP_INDEX_DATA, portable_file.Path());
-        const auto size = storage::LocalFileSize(
-            portable_file.Path(), "failed to size bitmap mmap input");
-        if (size == 0) {
-            ThrowInfo(DataFormatBroken,
-                      "bitmap data is empty for non-empty mmap index");
+        const auto priority =
+            opts.op_ctx && opts.op_ctx->runtime_load_priority.value_or(0) != 0
+                ? proto::common::LoadPriority::LOW
+                : proto::common::LoadPriority::HIGH;
+        std::optional<TemporaryFileGuard> portable_file;
+        size_t size = 0;
+        int fd = -1;
+        char* mapped = nullptr;
+        IIndexReaderBasePtr reader;
+        std::exception_ptr failure;
+        try {
+            {
+                auto local_io = [&] {
+                    portable_file.emplace(CreateTemporaryFile(
+                        opts.mmap_dir_path, "bitmap_portable"));
+                    portable_file->Close();
+                };
+                if (use_async) {
+                    co_await storage::RunLocalFileIOAsync(local_io, priority);
+                } else {
+                    local_io();
+                }
+            }
+            co_await source.ReadEntryToLocalFileAsync(
+                BITMAP_INDEX_DATA, portable_file->Path(), use_async);
+            {
+                auto local_io = [&] {
+                    size = storage::LocalFileSize(
+                        portable_file->Path(),
+                        "failed to size bitmap mmap input");
+                    if (size == 0) {
+                        ThrowInfo(
+                            DataFormatBroken,
+                            "bitmap data is empty for non-empty mmap index");
+                    }
+                    fd = open(portable_file->Path().c_str(), O_RDONLY);
+                    if (fd == -1) {
+                        ThrowInfo(FileOpenFailed,
+                                  "failed to open bitmap file {}: {}",
+                                  portable_file->Path(),
+                                  std::strerror(errno));
+                    }
+                    mapped = static_cast<char*>(
+                        mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0));
+                    const auto saved_errno = errno;
+                    if (mapped == MAP_FAILED) {
+                        ThrowInfo(MmapError,
+                                  "failed to map bitmap file {}: {}",
+                                  portable_file->Path(),
+                                  std::strerror(saved_errno));
+                    }
+                    // Conversion scans portable postings once, in order. Best-effort only.
+                    (void)::madvise(mapped, size, MADV_SEQUENTIAL);
+                };
+                if (use_async) {
+                    co_await storage::RunLocalFileIOAsync(local_io, priority);
+                } else {
+                    local_io();
+                }
+            }
+            const auto operation_token = opts.op_ctx
+                                             ? opts.op_ctx->cancellation_token
+                                             : folly::CancellationToken{};
+            const auto token = folly::cancellation_token_merge(
+                operation_token,
+                co_await folly::coro::co_current_cancellation_token);
+            reader = co_await DispatchMmapOpen(
+                params.value_type,
+                reinterpret_cast<const uint8_t*>(mapped),
+                size,
+                meta,
+                params,
+                std::move(validity),
+                rebuild_validity,
+                opts,
+                token,
+                use_async);
+        } catch (...) {
+            failure = std::current_exception();
         }
-        const auto fd = open(portable_file.Path().c_str(), O_RDONLY);
-        if (fd == -1) {
-            ThrowInfo(FileOpenFailed,
-                      "failed to open bitmap file {}: {}",
-                      portable_file.Path(),
-                      std::strerror(errno));
-        }
-        storage::FileDescriptorGuard descriptor(fd);
-        // Unmap before evicting the one-pass input; keep fd alive for advice.
-        auto evict_input = folly::makeGuard(
-            [fd] { (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); });
-        auto* mapped = static_cast<char*>(
-            mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0));
-        const auto saved_errno = errno;
-        if (mapped == MAP_FAILED) {
-            ThrowInfo(MmapError,
-                      "failed to map bitmap file {}: {}",
-                      portable_file.Path(),
-                      std::strerror(saved_errno));
-        }
-        storage::MappedRegionGuard mapping(mapped, size);
-        // Conversion scans portable postings once, in order. Best-effort only.
-        (void)::madvise(mapped, size, MADV_SEQUENTIAL);
-        const auto operation_token = opts.op_ctx
-                                         ? opts.op_ctx->cancellation_token
-                                         : folly::CancellationToken{};
-        const auto token = operation_token;
-        return folly::coro::blockingWait(
-            DispatchMmapOpen(params.value_type,
-                             reinterpret_cast<const uint8_t*>(mapping.Data()),
-                             size,
-                             meta,
-                             params,
-                             std::move(validity),
-                             rebuild_validity,
-                             opts,
-                             token,
-                             false));
+        auto cleanup = [&] {
+            if (mapped != nullptr && mapped != MAP_FAILED)
+                (void)::munmap(mapped, size);
+            if (fd >= 0) {
+                (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+                (void)::close(fd);
+            }
+            portable_file.reset();
+        };
+        if (use_async)
+            co_await storage::RunLocalFileIOAsync(cleanup, priority);
+        else
+            cleanup();
+        if (failure)
+            std::rethrow_exception(failure);
+        co_return reader;
     }
 
-    auto data = source.ReadEntry(BITMAP_INDEX_DATA);
-    return DispatchOpen(params.value_type,
-                        data.data(),
-                        data.size(),
-                        meta,
-                        params,
-                        std::move(validity),
-                        rebuild_validity,
-                        layout);
+    auto data = co_await source.ReadEntryAsync(BITMAP_INDEX_DATA, use_async);
+    co_return DispatchOpen(params.value_type,
+                           data.data(),
+                           data.size(),
+                           meta,
+                           params,
+                           std::move(validity),
+                           rebuild_validity,
+                           layout);
 }
 
 struct PackedBitmapState {
@@ -916,6 +969,13 @@ BitmapIndexLoader::DeriveCaps(const Config& index_meta) {
 IIndexReaderBasePtr
 BitmapIndexLoader::Open(storage::FileSource& source,
                         const storage::LoadOptions& opts) {
+    return folly::coro::blockingWait(OpenAsync(source, opts, false));
+}
+
+folly::coro::Task<IIndexReaderBasePtr>
+BitmapIndexLoader::OpenAsync(storage::FileSource& source,
+                             const storage::LoadOptions& opts,
+                             bool use_async) {
     auto projection = PrepareJsonProjectedOpen(families::kBitmap, source, opts);
     const auto params = ParseRuntimeParams(opts.params);
     if (params.value_type == DataType::NONE ||
@@ -923,9 +983,9 @@ BitmapIndexLoader::Open(storage::FileSource& source,
         ThrowInfo(DataTypeInvalid,
                   "bitmap loader requires value_type or array_element_type");
     }
-    auto inner = LoadBitmapPayload(source, opts, params);
-    return FinishJsonProjectedOpen(
-        std::move(projection), source, std::move(inner));
+    auto inner = (co_await LoadBitmapPayload(use_async, source, opts, params));
+    co_return (co_await FinishJsonProjectedOpenAsync(
+        use_async, std::move(projection), source, std::move(inner)));
 }
 
 IndexLoadPlan

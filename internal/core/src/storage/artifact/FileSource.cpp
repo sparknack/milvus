@@ -36,11 +36,13 @@
 #include "nlohmann/json.hpp"
 #include "pb/common.pb.h"
 #include "storage/DataCodec.h"
-#include "storage/LegacyIndexLoader.h"
 #include "storage/DiskFileManagerImpl.h"
 #include "storage/EntryStreamUtils.h"
 #include "storage/FileManager.h"
 #include "storage/FileWriter.h"
+#include "storage/LegacyIndexLoader.h"
+#include "folly/coro/WithCancellation.h"
+#include "storage/LocalFileIOPool.h"
 #include "storage/MemFileManagerImpl.h"
 #include "storage/ThreadPools.h"
 #include "storage/artifact/DiskEngineFileHandle.h"
@@ -447,13 +449,72 @@ FileSource::OpenDiskEngineFiles(DiskEngineFileMode,
               "artifact source does not support disk engine files");
 }
 
+folly::coro::Task<int64_t>
+FileSource::EntrySizeAsync(std::string_view name, bool use_async) {
+    if (!use_async)
+        co_return EntrySize(name);
+    int64_t bytes = 0;
+    co_await RunLocalFileIOAsync([&] { bytes = EntrySize(name); },
+                                 proto::common::LoadPriority::HIGH);
+    co_return bytes;
+}
+
+folly::coro::Task<std::vector<uint8_t>>
+FileSource::ReadEntryAsync(std::string_view name, bool use_async) {
+    if (!use_async)
+        co_return ReadEntry(name);
+    std::vector<uint8_t> bytes;
+    co_await RunLocalFileIOAsync([&] { bytes = ReadEntry(name); },
+                                 proto::common::LoadPriority::HIGH);
+    co_return bytes;
+}
+
+folly::coro::Task<void>
+FileSource::ReadEntryToLocalFileAsync(std::string_view name,
+                                      const std::string& path,
+                                      bool use_async) {
+    if (!use_async) {
+        ReadEntryToLocalFile(name, path);
+        co_return;
+    }
+    co_await RunLocalFileIOAsync([&] { ReadEntryToLocalFile(name, path); },
+                                 proto::common::LoadPriority::HIGH);
+}
+
+folly::coro::Task<void>
+FileSource::ReadEntriesToLocalFileAsync(const std::vector<std::string>& names,
+                                        const std::string& path,
+                                        bool use_async) {
+    if (!use_async) {
+        ReadEntriesToLocalFile(names, path);
+        co_return;
+    }
+    co_await RunLocalFileIOAsync([&] { ReadEntriesToLocalFile(names, path); },
+                                 proto::common::LoadPriority::HIGH);
+}
+
+folly::coro::Task<std::vector<std::string>>
+FileSource::ReadEntriesToLocalDirAsync(const std::vector<std::string>& names,
+                                       const std::string& directory,
+                                       bool use_async) {
+    if (!use_async) {
+        co_return ReadEntriesToLocalDir(names, directory);
+    }
+    std::vector<std::string> paths;
+    co_await RunLocalFileIOAsync(
+        [&] { paths = ReadEntriesToLocalDir(names, directory); },
+        proto::common::LoadPriority::HIGH);
+    co_return paths;
+}
+
 class V1RemoteSource::Impl {
  public:
     Impl(const FileManagerContext& context,
          std::vector<std::string> paths,
          LoadOptions options,
          ArtifactStoragePath storage_path,
-         V1SourceLayout layout)
+         V1SourceLayout layout,
+         bool defer_directory = false)
         : context(context),
           remote_paths(std::move(paths)),
           load_priority(LoadPriority(options)),
@@ -463,7 +524,9 @@ class V1RemoteSource::Impl {
           memory_manager(std::make_shared<MemFileManagerImpl>(context)),
           disk_manager(std::make_shared<DiskFileManagerImpl>(context)) {
         NormalizePaths();
-        BuildDirectory();
+        if (!defer_directory) {
+            BuildDirectory();
+        }
     }
 
     void
@@ -488,7 +551,8 @@ class V1RemoteSource::Impl {
     }
 
     void
-    BuildDirectory() {
+    BuildDirectory(
+        std::optional<std::vector<uint8_t>> downloaded_meta = std::nullopt) {
         std::map<std::string, std::string> by_basename;
         for (size_t i = 0; i < normalized_paths.size(); ++i) {
             auto name = SourceBaseName(normalized_paths[i]);
@@ -503,20 +567,31 @@ class V1RemoteSource::Impl {
         std::set<std::string> consumed;
         auto meta = by_basename.find(INDEX_FILE_SLICE_META);
         if (meta != by_basename.end()) {
-            CheckCancelled("V1/V2 slice-meta download");
-            auto codecs = memory_manager->LoadIndexToMemory({meta->second},
-                                                            load_priority);
-            CheckCancelled("V1/V2 slice-meta download");
-            auto codec = codecs.find(INDEX_FILE_SLICE_META);
-            if (codec == codecs.end() || codec->second == nullptr) {
-                ThrowInfo(FileReadFailed, "failed to load V1/V2 slice meta");
+            std::vector<uint8_t> encoded;
+            if (downloaded_meta) {
+                encoded = std::move(*downloaded_meta);
+            } else {
+                CheckCancelled("V1/V2 slice-meta download");
+                auto codecs = memory_manager->LoadIndexToMemory({meta->second},
+                                                                load_priority);
+                CheckCancelled("V1/V2 slice-meta download");
+                auto codec = codecs.find(INDEX_FILE_SLICE_META);
+                if (codec == codecs.end() || codec->second == nullptr) {
+                    ThrowInfo(FileReadFailed,
+                              "failed to load V1/V2 slice meta");
+                }
+                const auto bytes = codec->second->PayloadSize();
+                const auto* payload = codec->second->PayloadData();
+                if (bytes != 0 && payload == nullptr) {
+                    ThrowInfo(DataFormatBroken,
+                              "V1/V2 slice meta has null payload");
+                }
+                if (bytes != 0) {
+                    encoded.assign(payload, payload + bytes);
+                }
             }
-            auto size = codec->second->PayloadSize();
-            const auto* data = codec->second->PayloadData();
-            if (size != 0 && data == nullptr) {
-                ThrowInfo(DataFormatBroken,
-                          "V1/V2 slice meta has null payload");
-            }
+            auto size = encoded.size();
+            const auto* data = encoded.data();
             if (size == 0) {
                 ThrowInfo(DataFormatBroken, "V1/V2 slice meta is empty");
             }
@@ -655,6 +730,25 @@ class V1RemoteSource::Impl {
         return it->second;
     }
 
+    folly::coro::Task<std::vector<LegacyIndexFile>>
+    InspectSourcesAsync(const std::vector<std::string>& paths) {
+        std::vector<LegacyIndexFile> files;
+        files.reserve(paths.size());
+        for (const auto& path : paths) {
+            CheckCancelled("V1/V2 inspect");
+            auto found = file_infos.find(path);
+            if (found == file_infos.end()) {
+                auto input = co_await OpenLegacyIndexInputAsync(
+                    context.chunkManagerPtr, context.fs, path, load_priority);
+                auto info = co_await InspectLegacyIndexFileAsync(
+                    *input, load_priority, cancellation_token);
+                found = file_infos.emplace(path, info).first;
+            }
+            files.push_back({path, found->second});
+        }
+        co_return files;
+    }
+
     static size_t
     PayloadBytes(const std::vector<LegacyIndexFile>& files) {
         size_t total = 0;
@@ -670,6 +764,125 @@ class V1RemoteSource::Impl {
         return total;
     }
 
+    folly::coro::Task<std::vector<uint8_t>>
+    ReadPhysicalAsync(const std::vector<std::string>& paths,
+                      std::string_view logical_name = {}) {
+        const auto files = co_await InspectSourcesAsync(paths);
+        const auto total = PayloadBytes(files);
+        if (!logical_name.empty()) {
+            RecordOrValidateEntrySize(logical_name,
+                                      static_cast<int64_t>(total));
+        }
+        std::vector<uint8_t> bytes(total);
+        const EntryTarget target =
+            MemoryEntryTarget{nullptr, bytes.data(), bytes.size()};
+        co_await StreamLegacyIndexFilesAsync(files,
+                                             context.chunkManagerPtr,
+                                             context.fs,
+                                             target,
+                                             load_priority,
+                                             cancellation_token);
+        co_return bytes;
+    }
+
+    folly::coro::Task<void>
+    OpenDirectoryAsync() {
+        std::optional<std::vector<uint8_t>> metadata;
+        for (const auto& path : normalized_paths) {
+            if (SourceBaseName(path) == INDEX_FILE_SLICE_META) {
+                const std::vector<std::string> paths{path};
+                metadata = co_await ReadPhysicalAsync(paths);
+                break;
+            }
+        }
+        BuildDirectory(std::move(metadata));
+    }
+
+    folly::coro::Task<void>
+    WritePhysicalAsync(const std::vector<LegacyIndexFile>& files,
+                       const std::string& path) {
+        const auto bytes = PayloadBytes(files);
+        // Logical entries must remain byte-for-byte concatenated for knowhere.
+        // Use buffered positioned writes when an internal boundary is unaligned.
+        std::optional<FileWriter::WriteMode> mode;
+        size_t offset = 0;
+        for (const auto& file : files) {
+            if ((offset & FileWriter::ALIGNMENT_MASK) != 0) {
+                mode = FileWriter::WriteMode::BUFFERED;
+                break;
+            }
+            offset += file.info.payload_bytes;
+        }
+        auto file = std::make_shared<IndexFileTarget>(path, bytes, true, mode);
+        const EntryTarget target = FileEntryTarget{file, 0, bytes};
+        std::exception_ptr failure;
+        try {
+            co_await ReadLegacyIndexFilesAsync(files,
+                                               context.chunkManagerPtr,
+                                               context.fs,
+                                               target,
+                                               load_priority,
+                                               cancellation_token);
+            file->Commit();
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        co_await RunLocalFileIOAsync([&] { file->Cleanup(); }, load_priority);
+        if (failure) {
+            std::rethrow_exception(failure);
+        }
+    }
+
+    // All destinations are staged before publishing any of them. Both the
+    // existing rollback helper and cleanup run on the local file executor.
+    folly::coro::Task<void>
+    MaterializeAsync(const std::vector<std::vector<std::string>>& entries,
+                     const std::vector<std::string>& paths) {
+        const auto token = folly::cancellation_token_merge(
+            cancellation_token,
+            co_await folly::coro::co_current_cancellation_token);
+        ThrowIfCancelled(token, "V1/V2 artifact materialization");
+        std::vector<StagedLocalFile> staged;
+        staged.reserve(paths.size());
+        std::exception_ptr failure;
+        try {
+            co_await RunLocalFileIOAsync(
+                [&] {
+                    for (const auto& path : paths) {
+                        staged.emplace_back(path);
+                    }
+                },
+                load_priority);
+            for (size_t i = 0; i < paths.size(); ++i) {
+                std::vector<LegacyIndexFile> files;
+                for (const auto& name : entries[i]) {
+                    auto sources = co_await InspectSourcesAsync(Paths(name));
+                    RecordOrValidateEntrySize(
+                        name, static_cast<int64_t>(PayloadBytes(sources)));
+                    files.insert(files.end(),
+                                 std::make_move_iterator(sources.begin()),
+                                 std::make_move_iterator(sources.end()));
+                }
+                co_await WritePhysicalAsync(files, staged[i].Staging());
+            }
+            ThrowIfCancelled(token, "V1/V2 artifact publication");
+            co_await RunLocalFileIOAsync(
+                [&] {
+                    ThrowIfCancelled(token, "V1/V2 artifact publication");
+                    CommitAll(staged);
+                },
+                load_priority);
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        co_await RunLocalFileIOAsync([&] { staged.clear(); }, load_priority);
+        if (failure) {
+            std::rethrow_exception(failure);
+        }
+    }
+
+    // Keep the old synchronous download concurrency, but retain only one
+    // bounded batch instead of accumulating codecs for the whole entry.
     template <typename Consume>
     size_t
     ReadPayload(std::string_view name, Consume consume) {
@@ -860,9 +1073,9 @@ class V1RemoteSource::Impl {
     std::shared_ptr<MemFileManagerImpl> memory_manager;
     std::shared_ptr<DiskFileManagerImpl> disk_manager;
     std::map<std::string, std::vector<std::string>> logical_entries;
+    std::unordered_map<std::string, LegacyIndexFileInfo> file_infos;
     std::set<std::string> slice_meta_entries;
     mutable std::unordered_map<std::string, int64_t> entry_sizes;
-    std::unordered_map<std::string, LegacyIndexFileInfo> file_infos;
     mutable std::unordered_map<std::string, std::string> staged_files;
 };
 
@@ -879,6 +1092,136 @@ V1RemoteSource::V1RemoteSource(const FileManagerContext& context,
 }
 
 V1RemoteSource::~V1RemoteSource() = default;
+
+V1RemoteSource::V1RemoteSource(std::unique_ptr<Impl> impl)
+    : impl_(std::move(impl)) {
+}
+
+folly::coro::Task<std::unique_ptr<V1RemoteSource>>
+V1RemoteSource::OpenAsync(const FileManagerContext& context,
+                          std::vector<std::string> paths,
+                          LoadOptions options,
+                          ArtifactStoragePath storage_path,
+                          V1SourceLayout layout) {
+    auto impl = std::make_unique<Impl>(context,
+                                       std::move(paths),
+                                       std::move(options),
+                                       storage_path,
+                                       layout,
+                                       true);
+    impl->cancellation_token = folly::cancellation_token_merge(
+        impl->cancellation_token,
+        co_await folly::coro::co_current_cancellation_token);
+    impl->CheckCancelled("V1/V2 open source");
+    co_await impl->OpenDirectoryAsync();
+    impl->CheckCancelled("V1/V2 open source");
+    co_return std::unique_ptr<V1RemoteSource>(
+        new V1RemoteSource(std::move(impl)));
+}
+
+folly::coro::Task<int64_t>
+V1RemoteSource::EntrySizeAsync(std::string_view name, bool use_async) {
+    if (!use_async) {
+        co_return EntrySize(name);
+    }
+    auto files = co_await impl_->InspectSourcesAsync(impl_->Paths(name));
+    auto bytes = static_cast<int64_t>(Impl::PayloadBytes(files));
+    impl_->RecordOrValidateEntrySize(name, bytes);
+    co_return bytes;
+}
+
+folly::coro::Task<std::vector<uint8_t>>
+V1RemoteSource::ReadEntryAsync(std::string_view name, bool use_async) {
+    if (!use_async) {
+        co_return ReadEntry(name);
+    }
+    co_return co_await impl_->ReadPhysicalAsync(impl_->Paths(name), name);
+}
+
+folly::coro::Task<void>
+V1RemoteSource::ReadEntryToLocalFileAsync(std::string_view name,
+                                          const std::string& path,
+                                          bool use_async) {
+    if (!use_async) {
+        ReadEntryToLocalFile(name, path);
+        co_return;
+    }
+    const std::vector<std::string> names{std::string(name)};
+    co_await ReadEntriesToLocalFileAsync(names, path);
+}
+
+folly::coro::Task<void>
+V1RemoteSource::ReadEntriesToLocalFileAsync(
+    const std::vector<std::string>& names,
+    const std::string& path,
+    bool use_async) {
+    if (!use_async) {
+        ReadEntriesToLocalFile(names, path);
+        co_return;
+    }
+    const std::vector<std::vector<std::string>> entries{names};
+    const std::vector<std::string> paths{path};
+    co_await impl_->MaterializeAsync(entries, paths);
+}
+
+folly::coro::Task<std::vector<std::string>>
+V1RemoteSource::ReadEntriesToLocalDirAsync(
+    const std::vector<std::string>& names,
+    const std::string& directory,
+    bool use_async) {
+    if (!use_async) {
+        co_return ReadEntriesToLocalDir(names, directory);
+    }
+    std::set<std::string> targets;
+    std::vector<std::string> paths;
+    std::vector<std::vector<std::string>> entries;
+    paths.reserve(names.size());
+    entries.reserve(names.size());
+    for (const auto& name : names) {
+        auto path =
+            (std::filesystem::path(directory) / SourceBaseName(name)).string();
+        AssertInfo(targets.insert(path).second,
+                   "artifact entries collide at local path {}",
+                   path);
+        paths.push_back(std::move(path));
+        entries.push_back({name});
+    }
+    co_await impl_->MaterializeAsync(entries, paths);
+    co_return paths;
+}
+
+folly::coro::Task<V1RemoteSource::LoadBytes>
+V1RemoteSource::InspectLoadBytesAsync(const std::vector<std::string>& names) {
+    LoadBytes result;
+    for (const auto& name : names) {
+        const auto files =
+            co_await impl_->InspectSourcesAsync(impl_->Paths(name));
+        for (const auto& file : files) {
+            result.payload = milvus::SaturatingAdd(
+                result.payload, uint64_t{file.info.payload_bytes});
+            result.transient = milvus::SaturatingAdd(
+                result.transient, uint64_t{file.info.TotalTransientBytes()});
+        }
+    }
+    // Directory maps and slice names survive across payload reads. Bound the
+    // parsed representation from its encoded metadata and owned path strings.
+    for (const auto& path : impl_->normalized_paths) {
+        result.directory = milvus::SaturatingAdd(
+            result.directory,
+            milvus::SaturatingMultiply(
+                uint64_t{path.size() + sizeof(std::string)}, uint64_t{8}));
+        if (SourceBaseName(path) == INDEX_FILE_SLICE_META) {
+            const auto found = impl_->file_infos.find(path);
+            if (found != impl_->file_infos.end()) {
+                result.directory = milvus::SaturatingAdd(
+                    result.directory,
+                    milvus::SaturatingMultiply(
+                        uint64_t{found->second.payload_bytes}, uint64_t{32}));
+            }
+        }
+    }
+    co_return result;
+}
 
 Generation
 V1RemoteSource::Gen() const {

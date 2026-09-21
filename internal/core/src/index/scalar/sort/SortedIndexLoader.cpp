@@ -16,7 +16,11 @@
 
 #include "folly/CancellationToken.h"
 #include "folly/coro/Task.h"
+#include "folly/coro/WithCancellation.h"
+#include "storage/AsyncLoadExecutor.h"
 #include "storage/LocalFileIOPool.h"
+#include "folly/coro/BlockingWait.h"
+
 #include "index/scalar/sort/SortedIndexLoader.h"
 #include "common/OpContext.h"
 
@@ -142,13 +146,15 @@ ParseRuntimeParams(const Config& params) {
 }
 
 template <typename T>
-T
-ReadRequiredPod(storage::FileSource& source, std::string_view name) {
+folly::coro::Task<T>
+ReadRequiredPod(bool use_async,
+                storage::FileSource& source,
+                std::string_view name) {
     if (!source.HasEntry(name)) {
         ThrowInfo(
             DataFormatBroken, "sorted artifact entry {} is missing", name);
     }
-    const auto bytes = source.ReadEntry(name);
+    const auto bytes = co_await source.ReadEntryAsync(name, use_async);
     if (bytes.size() != sizeof(T)) {
         ThrowInfo(DataFormatBroken,
                   "sorted artifact entry {} has size {}, expected {}",
@@ -158,16 +164,18 @@ ReadRequiredPod(storage::FileSource& source, std::string_view name) {
     }
     T result;
     std::memcpy(&result, bytes.data(), sizeof(result));
-    return result;
+    co_return result;
 }
 
 template <typename T>
-std::optional<T>
-ReadOptionalPod(storage::FileSource& source, std::string_view name) {
+folly::coro::Task<std::optional<T>>
+ReadOptionalPod(bool use_async,
+                storage::FileSource& source,
+                std::string_view name) {
     if (!source.HasEntry(name)) {
-        return std::nullopt;
+        co_return std::nullopt;
     }
-    return ReadRequiredPod<T>(source, name);
+    co_return (co_await ReadRequiredPod<T>(use_async, source, name));
 }
 
 struct CommonMeta {
@@ -180,28 +188,31 @@ struct NumericMeta : CommonMeta {
     size_t index_length{0};
 };
 
-NumericMeta
-ReadNumericMeta(storage::FileSource& source) {
+folly::coro::Task<NumericMeta>
+ReadNumericMeta(bool use_async, storage::FileSource& source) {
     NumericMeta result;
-    result.index_length =
-        ReadRequiredPod<size_t>(source, sort_format::kIndexLength);
-    result.count = ReadOptionalPod<size_t>(source, sort_format::kLegacyNumRows)
+    result.index_length = (co_await ReadRequiredPod<size_t>(
+        use_async, source, sort_format::kIndexLength));
+    result.count = (co_await ReadOptionalPod<size_t>(
+                        use_async, source, sort_format::kLegacyNumRows))
                        .value_or(result.index_length);
-    if (auto nested =
-            ReadOptionalPod<bool>(source, sort_format::kLegacyNested)) {
+    if (auto nested = (co_await ReadOptionalPod<bool>(
+            use_async, source, sort_format::kLegacyNested))) {
         result.nested = *nested;
         result.has_nested = true;
     }
-    return result;
+    co_return result;
 }
 
-CommonMeta
-ReadStringMeta(storage::FileSource& source) {
+folly::coro::Task<CommonMeta>
+ReadStringMeta(bool use_async, storage::FileSource& source) {
     CommonMeta result;
-    auto version = ReadRequiredPod<uint32_t>(source, sort_format::kVersion);
-    result.count = ReadRequiredPod<size_t>(source, sort_format::kLegacyNumRows);
-    if (auto nested =
-            ReadOptionalPod<bool>(source, sort_format::kLegacyNested)) {
+    auto version = (co_await ReadRequiredPod<uint32_t>(
+        use_async, source, sort_format::kVersion));
+    result.count = (co_await ReadRequiredPod<size_t>(
+        use_async, source, sort_format::kLegacyNumRows));
+    if (auto nested = (co_await ReadOptionalPod<bool>(
+            use_async, source, sort_format::kLegacyNested))) {
         result.nested = *nested;
         result.has_nested = true;
     }
@@ -211,7 +222,7 @@ ReadStringMeta(storage::FileSource& source) {
                   version,
                   sort_format::kStringVersion);
     }
-    return result;
+    co_return result;
 }
 
 void
@@ -272,100 +283,129 @@ CreateLocalFile(const std::string& configured_dir, std::string_view prefix) {
 }
 
 template <typename T>
-std::shared_ptr<std::vector<T>>
-ReadEntryVector(storage::FileSource& source,
+folly::coro::Task<std::shared_ptr<std::vector<T>>>
+ReadEntryVector(bool use_async,
+                const storage::LoadOptions& opts,
+                storage::FileSource& source,
                 std::string_view name,
                 size_t expected_bytes,
                 const std::string& staging_dir) {
-    if (!source.HasEntry(name)) {
-        ThrowInfo(
-            DataFormatBroken, "sorted artifact entry {} is missing", name);
-    }
-    if (expected_bytes % sizeof(T) != 0) {
-        ThrowInfo(DataFormatBroken,
-                  "sorted entry {} size is not element aligned",
-                  name);
-    }
-    auto file = CreateLocalFile(staging_dir, "sorted_heap");
-    source.ReadEntryToLocalFile(name, file.Path());
-    const auto actual = storage::LocalFileSize(
-        file.Path(), "failed to size sorted staging file");
-    if (actual != expected_bytes) {
-        ThrowInfo(DataFormatBroken,
-                  "sorted entry {} has size {}, expected {}",
-                  name,
-                  actual,
-                  expected_bytes);
-    }
-    auto result = std::make_shared<std::vector<T>>(expected_bytes / sizeof(T));
-    if (expected_bytes == 0) {
-        return result;
-    }
-    const auto fd = open(file.Path().c_str(), O_RDONLY);
-    if (fd == -1) {
-        ThrowInfo(FileOpenFailed,
-                  "failed to open sorted staging file {}: {}",
-                  file.Path(),
-                  std::strerror(errno));
-    }
-    storage::FileDescriptorGuard descriptor(fd);
-    storage::ReadAll(descriptor.Get(),
-                     result->data(),
-                     expected_bytes,
-                     file.Path(),
-                     "sorted staging file");
-    return result;
-}
-
-std::shared_ptr<SortedMmapOwner>
-MapEntry(storage::FileSource& source,
-         std::string_view name,
-         const std::string& staging_dir,
-         std::optional<size_t> expected_bytes = std::nullopt) {
-    if (!source.HasEntry(name)) {
-        ThrowInfo(
-            DataFormatBroken, "sorted artifact entry {} is missing", name);
-    }
-    auto file = CreateLocalFile(staging_dir, "sorted_mmap");
-    source.ReadEntryToLocalFile(name, file.Path());
-    const auto size = storage::LocalFileSize(
-        file.Path(), "failed to size sorted staging file");
-    if (expected_bytes.has_value() && size != *expected_bytes) {
-        ThrowInfo(DataFormatBroken,
-                  "sorted entry {} has size {}, expected {}",
-                  name,
-                  size,
-                  *expected_bytes);
-    }
-    if (size == 0) {
-        return nullptr;
-    }
-    storage::MappedRegionGuard mapping;
-    {
+    const auto priority =
+        opts.op_ctx && opts.op_ctx->runtime_load_priority.value_or(0) != 0
+            ? proto::common::LoadPriority::LOW
+            : proto::common::LoadPriority::HIGH;
+    auto run_io = [&]() -> folly::coro::Task<std::shared_ptr<std::vector<T>>> {
+        if (!source.HasEntry(name)) {
+            ThrowInfo(
+                DataFormatBroken, "sorted artifact entry {} is missing", name);
+        }
+        if (expected_bytes % sizeof(T) != 0) {
+            ThrowInfo(DataFormatBroken,
+                      "sorted entry {} size is not element aligned",
+                      name);
+        }
+        auto file = CreateLocalFile(staging_dir, "sorted_heap");
+        co_await source.ReadEntryToLocalFileAsync(name, file.Path(), use_async);
+        const auto actual = storage::LocalFileSize(
+            file.Path(), "failed to size sorted staging file");
+        if (actual != expected_bytes) {
+            ThrowInfo(DataFormatBroken,
+                      "sorted entry {} has size {}, expected {}",
+                      name,
+                      actual,
+                      expected_bytes);
+        }
+        auto result =
+            std::make_shared<std::vector<T>>(expected_bytes / sizeof(T));
+        if (expected_bytes == 0) {
+            co_return result;
+        }
         const auto fd = open(file.Path().c_str(), O_RDONLY);
         if (fd == -1) {
             ThrowInfo(FileOpenFailed,
-                      "failed to open sorted mmap file {}: {}",
+                      "failed to open sorted staging file {}: {}",
                       file.Path(),
                       std::strerror(errno));
         }
         storage::FileDescriptorGuard descriptor(fd);
-        auto* mapped = static_cast<char*>(
-            mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0));
-        const auto saved_errno = errno;
-        if (mapped == MAP_FAILED) {
-            ThrowInfo(MmapError,
-                      "failed to mmap sorted file {}: {}",
-                      file.Path(),
-                      std::strerror(saved_errno));
+        storage::ReadAll(descriptor.Get(),
+                         result->data(),
+                         expected_bytes,
+                         file.Path(),
+                         "sorted staging file");
+        co_return result;
+    };
+    if (!use_async)
+        co_return co_await run_io();
+    co_return co_await folly::coro::co_withExecutor(
+        storage::ResolveAsyncLoadExecutor(
+            storage::LocalFileIOPool::GetInstance().GetExecutor(), priority),
+        run_io());
+}
+
+folly::coro::Task<std::shared_ptr<SortedMmapOwner>>
+MapEntry(bool use_async,
+         const storage::LoadOptions& opts,
+         storage::FileSource& source,
+         std::string_view name,
+         const std::string& staging_dir,
+         std::optional<size_t> expected_bytes = std::nullopt) {
+    const auto priority =
+        opts.op_ctx && opts.op_ctx->runtime_load_priority.value_or(0) != 0
+            ? proto::common::LoadPriority::LOW
+            : proto::common::LoadPriority::HIGH;
+    auto run_io = [&]() -> folly::coro::Task<std::shared_ptr<SortedMmapOwner>> {
+        if (!source.HasEntry(name)) {
+            ThrowInfo(
+                DataFormatBroken, "sorted artifact entry {} is missing", name);
         }
-        mapping = storage::MappedRegionGuard(mapped, size);
-    }
-    auto owner = std::make_shared<SortedMmapOwner>(
-        mapping.Data(), size, size, file.Path());
-    mapping.Release();
-    static_cast<void>(file.Release());
-    return owner;
+        auto file = CreateLocalFile(staging_dir, "sorted_mmap");
+        co_await source.ReadEntryToLocalFileAsync(name, file.Path(), use_async);
+        const auto size = storage::LocalFileSize(
+            file.Path(), "failed to size sorted staging file");
+        if (expected_bytes.has_value() && size != *expected_bytes) {
+            ThrowInfo(DataFormatBroken,
+                      "sorted entry {} has size {}, expected {}",
+                      name,
+                      size,
+                      *expected_bytes);
+        }
+        if (size == 0) {
+            co_return nullptr;
+        }
+        storage::MappedRegionGuard mapping;
+        {
+            const auto fd = open(file.Path().c_str(), O_RDONLY);
+            if (fd == -1) {
+                ThrowInfo(FileOpenFailed,
+                          "failed to open sorted mmap file {}: {}",
+                          file.Path(),
+                          std::strerror(errno));
+            }
+            storage::FileDescriptorGuard descriptor(fd);
+            auto* mapped = static_cast<char*>(
+                mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0));
+            const auto saved_errno = errno;
+            if (mapped == MAP_FAILED) {
+                ThrowInfo(MmapError,
+                          "failed to mmap sorted file {}: {}",
+                          file.Path(),
+                          std::strerror(saved_errno));
+            }
+            mapping = storage::MappedRegionGuard(mapped, size);
+        }
+        auto owner = std::make_shared<SortedMmapOwner>(
+            mapping.Data(), size, size, file.Path());
+        mapping.Release();
+        static_cast<void>(file.Release());
+        co_return owner;
+    };
+    if (!use_async)
+        co_return co_await run_io();
+    co_return co_await folly::coro::co_withExecutor(
+        storage::ResolveAsyncLoadExecutor(
+            storage::LocalFileIOPool::GetInstance().GetExecutor(), priority),
+        run_io());
 }
 
 TargetBitmap
@@ -493,8 +533,9 @@ ValidateNumericAux(const IndexStructure<T>* data,
 }
 
 template <typename T>
-typename SortedIndexReader<T>::OpenArgs
-LoadNumericState(storage::FileSource& source,
+folly::coro::Task<typename SortedIndexReader<T>::OpenArgs>
+LoadNumericState(bool use_async,
+                 storage::FileSource& source,
                  const storage::LoadOptions& opts,
                  NumericMeta meta,
                  const RuntimeParams& params) {
@@ -513,15 +554,24 @@ LoadNumericState(storage::FileSource& source,
     typename SortedIndexReader<T>::OpenArgs args;
     args.storage.size = meta.index_length;
     if (opts.enable_mmap && data_bytes != 0) {
-        auto owner = MapEntry(
-            source, sort_format::kIndexData, opts.mmap_dir_path, data_bytes);
+        auto owner = (co_await MapEntry(use_async,
+                                        opts,
+                                        source,
+                                        sort_format::kIndexData,
+                                        opts.mmap_dir_path,
+                                        data_bytes));
         args.storage.data =
             reinterpret_cast<const IndexStructure<T>*>(owner->Data());
         args.storage.data_owner = owner;
         args.storage.data_file_bytes = owner->MappedSize();
     } else {
-        auto owner = ReadEntryVector<IndexStructure<T>>(
-            source, sort_format::kIndexData, data_bytes, opts.mmap_dir_path);
+        auto owner = (co_await ReadEntryVector<IndexStructure<T>>(
+            use_async,
+            opts,
+            source,
+            sort_format::kIndexData,
+            data_bytes,
+            opts.mmap_dir_path));
         args.storage.data = owner->data();
         args.storage.data_owner = owner;
         args.storage.data_heap_bytes =
@@ -543,7 +593,7 @@ LoadNumericState(storage::FileSource& source,
     args.state.value_type = params.value_type;
     args.state.nested = meta.nested;
     args.state.value_lookup = params.value_lookup;
-    return args;
+    co_return args;
 }
 
 void
@@ -599,8 +649,9 @@ ValidateStringAux(const SortedStringLayout& layout,
     }
 }
 
-SortedIndexReader<std::string_view>::OpenArgs
-LoadStringState(storage::FileSource& source,
+folly::coro::Task<SortedIndexReader<std::string_view>::OpenArgs>
+LoadStringState(bool use_async,
+                storage::FileSource& source,
                 const storage::LoadOptions& opts,
                 CommonMeta meta,
                 const RuntimeParams& params) {
@@ -615,19 +666,24 @@ LoadStringState(storage::FileSource& source,
 
     SortedIndexReader<std::string_view>::OpenArgs args;
     if (opts.enable_mmap) {
-        auto owner =
-            MapEntry(source, sort_format::kIndexData, opts.mmap_dir_path);
+        auto owner = (co_await MapEntry(use_async,
+                                        opts,
+                                        source,
+                                        sort_format::kIndexData,
+                                        opts.mmap_dir_path));
         if (owner == nullptr) {
             ThrowInfo(DataFormatBroken, "sorted string index_data is empty");
         }
         args.storage.layout =
             SortedStringLayout::FromPackedMmap(std::move(owner), meta.count);
     } else {
-        auto packed = source.ReadEntry(sort_format::kIndexData);
+        auto packed =
+            co_await source.ReadEntryAsync(sort_format::kIndexData, use_async);
         args.storage.layout =
             SortedStringLayout::FromPackedHeap(std::move(packed), meta.count);
     }
-    const auto validity = source.ReadEntry(sort_format::kValidBitset);
+    const auto validity =
+        co_await source.ReadEntryAsync(sort_format::kValidBitset, use_async);
     args.state.valid_bitset = std::make_shared<const TargetBitmap>(
         DecodePackedValidity(validity, meta.count));
 
@@ -648,7 +704,7 @@ LoadStringState(storage::FileSource& source,
     args.state.value_type = params.value_type;
     args.state.nested = meta.nested;
     args.state.value_lookup = params.value_lookup;
-    return args;
+    co_return args;
 }
 
 struct PackedSortedState {
@@ -852,6 +908,13 @@ SortedIndexLoader::DeriveCaps(const Config& index_meta) {
 IIndexReaderBasePtr
 SortedIndexLoader::Open(storage::FileSource& source,
                         const storage::LoadOptions& opts) {
+    return folly::coro::blockingWait(OpenAsync(source, opts, false));
+}
+
+folly::coro::Task<IIndexReaderBasePtr>
+SortedIndexLoader::OpenAsync(storage::FileSource& source,
+                             const storage::LoadOptions& opts,
+                             bool use_async) {
     auto projection = PrepareJsonProjectedOpen(families::kSort, source, opts);
     const auto params = ParseRuntimeParams(opts.params);
     if (params.value_type == DataType::NONE ||
@@ -860,52 +923,61 @@ SortedIndexLoader::Open(storage::FileSource& source,
                   "sorted loader requires value_type or array_element_type");
     }
     if (IsStringDataType(params.value_type)) {
-        return FinishJsonProjectedOpen(
-            std::move(projection),
-            source,
-            std::make_unique<SortedIndexReader<std::string_view>>(
-                LoadStringState(source, opts, ReadStringMeta(source), params)));
+        const auto meta = co_await ReadStringMeta(use_async, source);
+        auto state =
+            co_await LoadStringState(use_async, source, opts, meta, params);
+        auto inner = std::make_unique<SortedIndexReader<std::string_view>>(
+            std::move(state));
+        co_return co_await FinishJsonProjectedOpenAsync(
+            use_async, std::move(projection), source, std::move(inner));
     }
 
-    const auto meta = ReadNumericMeta(source);
+    const auto meta = (co_await ReadNumericMeta(use_async, source));
     std::unique_ptr<IIndexReaderBase> inner;
     switch (params.value_type) {
         case DataType::BOOL:
             inner = std::make_unique<SortedIndexReader<bool>>(
-                LoadNumericState<bool>(source, opts, meta, params));
+                (co_await LoadNumericState<bool>(
+                    use_async, source, opts, meta, params)));
             break;
         case DataType::INT8:
             inner = std::make_unique<SortedIndexReader<int8_t>>(
-                LoadNumericState<int8_t>(source, opts, meta, params));
+                (co_await LoadNumericState<int8_t>(
+                    use_async, source, opts, meta, params)));
             break;
         case DataType::INT16:
             inner = std::make_unique<SortedIndexReader<int16_t>>(
-                LoadNumericState<int16_t>(source, opts, meta, params));
+                (co_await LoadNumericState<int16_t>(
+                    use_async, source, opts, meta, params)));
             break;
         case DataType::INT32:
             inner = std::make_unique<SortedIndexReader<int32_t>>(
-                LoadNumericState<int32_t>(source, opts, meta, params));
+                (co_await LoadNumericState<int32_t>(
+                    use_async, source, opts, meta, params)));
             break;
         case DataType::INT64:
         case DataType::TIMESTAMPTZ:
             inner = std::make_unique<SortedIndexReader<int64_t>>(
-                LoadNumericState<int64_t>(source, opts, meta, params));
+                (co_await LoadNumericState<int64_t>(
+                    use_async, source, opts, meta, params)));
             break;
         case DataType::FLOAT:
             inner = std::make_unique<SortedIndexReader<float>>(
-                LoadNumericState<float>(source, opts, meta, params));
+                (co_await LoadNumericState<float>(
+                    use_async, source, opts, meta, params)));
             break;
         case DataType::DOUBLE:
             inner = std::make_unique<SortedIndexReader<double>>(
-                LoadNumericState<double>(source, opts, meta, params));
+                (co_await LoadNumericState<double>(
+                    use_async, source, opts, meta, params)));
             break;
         default:
             ThrowInfo(DataTypeInvalid,
                       "unsupported sorted value type {}",
                       static_cast<int>(params.value_type));
     }
-    return FinishJsonProjectedOpen(
-        std::move(projection), source, std::move(inner));
+    co_return (co_await FinishJsonProjectedOpenAsync(
+        use_async, std::move(projection), source, std::move(inner)));
 }
 
 IndexLoadPlan

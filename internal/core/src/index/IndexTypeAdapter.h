@@ -79,6 +79,13 @@ ResolveLoadFamily(const IndexFamily& requested_family,
                   storage::FileSource& source,
                   const Config& load_params = Config::object());
 
+// Async selector inspection retains the same family validation as sync loads.
+folly::coro::Task<IndexFamily>
+ResolveLoadFamilyAsync(const IndexFamily& requested_family,
+                       storage::FileSource& source,
+                       const Config& load_params,
+                       bool use_async = true);
+
 IndexFamily
 FamilyFromScalarIndexType(ScalarIndexType type);
 

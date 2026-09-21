@@ -16,8 +16,13 @@
 
 #include "folly/CancellationToken.h"
 #include "folly/coro/Task.h"
+#include "folly/coro/WithCancellation.h"
+#include "storage/AsyncLoadExecutor.h"
+#include "storage/LocalFileIOPool.h"
 #include "common/OpContext.h"
 #include "storage/LocalFileIOPool.h"
+#include "folly/coro/BlockingWait.h"
+
 #include "index/scalar/spatial/RTreeIndexLoader.h"
 
 #include <algorithm>
@@ -191,74 +196,108 @@ using storage::LocalEntryGuard;
 
 using storage::FileDescriptorGuard;
 
-std::shared_ptr<const std::vector<size_t>>
-ReadNullOffsets(storage::FileSource& source,
+folly::coro::Task<std::shared_ptr<const std::vector<size_t>>>
+ReadNullOffsets(bool use_async,
+                const storage::LoadOptions& opts,
+                storage::FileSource& source,
                 bool has_null,
                 int64_t total_num_rows,
                 const std::string& staging_parent) {
-    if (!has_null) {
-        return std::make_shared<const std::vector<size_t>>();
-    }
-    if (!source.HasEntry(INDEX_NULL_OFFSET)) {
-        ThrowInfo(DataFormatBroken,
-                  "R-Tree artifact declares nulls but has no {} entry",
-                  INDEX_NULL_OFFSET);
-    }
+    const auto priority =
+        opts.op_ctx && opts.op_ctx->runtime_load_priority.value_or(0) != 0
+            ? proto::common::LoadPriority::LOW
+            : proto::common::LoadPriority::HIGH;
+    auto run_io =
+        [&]() -> folly::coro::Task<std::shared_ptr<const std::vector<size_t>>> {
+        if (!has_null) {
+            co_return std::make_shared<const std::vector<size_t>>();
+        }
+        if (!source.HasEntry(INDEX_NULL_OFFSET)) {
+            ThrowInfo(DataFormatBroken,
+                      "R-Tree artifact declares nulls but has no {} entry",
+                      INDEX_NULL_OFFSET);
+        }
 
-    auto directory = CreateRTreeIndexDirectory(staging_parent, "null");
-    auto path =
-        (std::filesystem::path(directory->Path()) / INDEX_NULL_OFFSET).string();
-    LocalEntryGuard local(std::move(path));
-    source.ReadEntryToLocalFile(INDEX_NULL_OFFSET, local.Path());
+        auto directory = CreateRTreeIndexDirectory(staging_parent, "null");
+        auto path =
+            (std::filesystem::path(directory->Path()) / INDEX_NULL_OFFSET)
+                .string();
+        LocalEntryGuard local(std::move(path));
+        co_await source.ReadEntryToLocalFileAsync(
+            INDEX_NULL_OFFSET, local.Path(), use_async);
 
-    std::error_code error;
-    const auto observed = std::filesystem::file_size(local.Path(), error);
-    if (error || observed > std::numeric_limits<size_t>::max()) {
-        ThrowInfo(FileReadFailed,
-                  "failed to determine R-Tree NULL sidecar size {}: {}",
-                  local.Path(),
-                  error.message());
-    }
-    const auto bytes = static_cast<size_t>(observed);
-    if (bytes == 0 || bytes % sizeof(size_t) != 0 ||
-        bytes / sizeof(size_t) > static_cast<size_t>(total_num_rows)) {
-        ThrowInfo(DataFormatBroken,
-                  "R-Tree null-offset byte size {} is invalid for {} rows",
-                  bytes,
-                  total_num_rows);
-    }
+        std::error_code error;
+        const auto observed = std::filesystem::file_size(local.Path(), error);
+        if (error || observed > std::numeric_limits<size_t>::max()) {
+            ThrowInfo(FileReadFailed,
+                      "failed to determine R-Tree NULL sidecar size {}: {}",
+                      local.Path(),
+                      error.message());
+        }
+        const auto bytes = static_cast<size_t>(observed);
+        if (bytes == 0 || bytes % sizeof(size_t) != 0 ||
+            bytes / sizeof(size_t) > static_cast<size_t>(total_num_rows)) {
+            ThrowInfo(DataFormatBroken,
+                      "R-Tree null-offset byte size {} is invalid for {} rows",
+                      bytes,
+                      total_num_rows);
+        }
 
-    auto offsets =
-        std::make_shared<std::vector<size_t>>(bytes / sizeof(size_t));
-    const auto fd = ::open(local.Path().c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd == -1) {
-        ThrowInfo(FileOpenFailed,
-                  "failed to open R-Tree NULL staging file {}: {}",
-                  local.Path(),
-                  std::strerror(errno));
-    }
-    FileDescriptorGuard descriptor(fd);
-    storage::ReadAll(descriptor.Get(),
-                     offsets->data(),
-                     bytes,
-                     local.Path(),
-                     "R-Tree NULL staging file");
-    descriptor.CloseChecked(local.Path(), "R-Tree NULL staging file");
-    local.RemoveChecked("R-Tree NULL staging file");
-    return offsets;
+        auto offsets =
+            std::make_shared<std::vector<size_t>>(bytes / sizeof(size_t));
+        const auto fd = ::open(local.Path().c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd == -1) {
+            ThrowInfo(FileOpenFailed,
+                      "failed to open R-Tree NULL staging file {}: {}",
+                      local.Path(),
+                      std::strerror(errno));
+        }
+        FileDescriptorGuard descriptor(fd);
+        storage::ReadAll(descriptor.Get(),
+                         offsets->data(),
+                         bytes,
+                         local.Path(),
+                         "R-Tree NULL staging file");
+        descriptor.CloseChecked(local.Path(), "R-Tree NULL staging file");
+        local.RemoveChecked("R-Tree NULL staging file");
+        co_return offsets;
+    };
+    if (!use_async)
+        co_return co_await run_io();
+    co_return co_await folly::coro::co_withExecutor(
+        storage::ResolveAsyncLoadExecutor(
+            storage::LocalFileIOPool::GetInstance().GetExecutor(), priority),
+        run_io());
 }
 
-std::shared_ptr<const RTreeIndexState>
-LoadState(storage::FileSource& source, const storage::LoadOptions& opts) {
+folly::coro::Task<std::shared_ptr<const RTreeIndexState>>
+LoadState(bool use_async,
+          storage::FileSource& source,
+          const storage::LoadOptions& opts) {
+    const auto priority =
+        opts.op_ctx && opts.op_ctx->runtime_load_priority.value_or(0) != 0
+            ? proto::common::LoadPriority::LOW
+            : proto::common::LoadPriority::HIGH;
     ValidateGeometryParams(opts.params);
     const auto total_num_rows = ReadRequiredRowCount(opts.params);
     AssertInfo(opts.mmap_dir_path.find('\0') == std::string::npos,
                "R-Tree load options contain an invalid staging path");
     auto entries = ReadPersistedEntries(source);
 
-    auto directory = CreateRTreeIndexDirectory(opts.mmap_dir_path, "load");
-    auto local_paths =
-        source.ReadEntriesToLocalDir(entries.engine_files, directory->Path());
+    std::shared_ptr<storage::LocalDirectory> directory;
+    {
+        auto local_io = [&] {
+            directory = CreateRTreeIndexDirectory(opts.mmap_dir_path, "load");
+        };
+        if (use_async) {
+            co_await storage::RunLocalFileIOAsync(local_io, priority);
+        } else {
+            local_io();
+        }
+    }
+
+    auto local_paths = co_await source.ReadEntriesToLocalDirAsync(
+        entries.engine_files, directory->Path(), use_async);
     if (local_paths.size() != entries.engine_files.size()) {
         ThrowInfo(DataFormatBroken,
                   "R-Tree source materialized {} of {} engine entries",
@@ -275,11 +314,26 @@ LoadState(storage::FileSource& source, const storage::LoadOptions& opts) {
         }
     }
 
-    auto engine = std::make_shared<RTreeQueryEngine>(FindBasePath(local_paths));
-    engine->Load();
-    auto null_offsets = ReadNullOffsets(
-        source, entries.has_null, total_num_rows, opts.mmap_dir_path);
-    return RTreeIndexState::Create(
+    std::shared_ptr<RTreeQueryEngine> engine;
+    {
+        auto local_io = [&] {
+            engine =
+                std::make_shared<RTreeQueryEngine>(FindBasePath(local_paths));
+            engine->Load();
+        };
+        if (use_async) {
+            co_await storage::RunLocalFileIOAsync(local_io, priority);
+        } else {
+            local_io();
+        }
+    }
+    auto null_offsets = (co_await ReadNullOffsets(use_async,
+                                                  opts,
+                                                  source,
+                                                  entries.has_null,
+                                                  total_num_rows,
+                                                  opts.mmap_dir_path));
+    co_return RTreeIndexState::Create(
         std::move(engine), std::move(null_offsets), total_num_rows);
 }
 
@@ -299,9 +353,17 @@ RTreeIndexLoader::DeriveCaps(const Config& index_meta) {
 IIndexReaderBasePtr
 RTreeIndexLoader::Open(storage::FileSource& source,
                        const storage::LoadOptions& opts) {
+    return folly::coro::blockingWait(OpenAsync(source, opts, false));
+}
+
+folly::coro::Task<IIndexReaderBasePtr>
+RTreeIndexLoader::OpenAsync(storage::FileSource& source,
+                            const storage::LoadOptions& opts,
+                            bool use_async) {
     // Boost's R-tree archive has no mmap view. `enable_mmap` is a preference;
     // preserve the baseline heap fallback and report the resulting heap bytes.
-    return std::make_unique<RTreeIndexReader>(LoadState(source, opts));
+    co_return std::make_unique<RTreeIndexReader>(
+        (co_await LoadState(use_async, source, opts)));
 }
 
 IndexLoadPlan

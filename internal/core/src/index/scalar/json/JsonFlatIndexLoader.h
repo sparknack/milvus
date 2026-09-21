@@ -43,6 +43,13 @@ class JsonFlatIndexLoader final {
 
     static IIndexReaderBasePtr
     Open(storage::FileSource& source, const storage::LoadOptions& opts);
+
+    // Shares decoding with Open; remote reads and admission suspend when enabled.
+    static folly::coro::Task<IIndexReaderBasePtr>
+    OpenAsync(storage::FileSource& source,
+              const storage::LoadOptions& opts,
+              bool use_async = true);
+
     // Describe direct V3 destinations; caller performs and drains all reads.
     static IndexLoadPlan
     PlanPacked(const storage::IndexEntryDirectory& directory,
