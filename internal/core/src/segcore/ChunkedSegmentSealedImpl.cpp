@@ -139,6 +139,7 @@
 #include "segcore/storagev2translator/ManifestGroupTranslator.h"
 #include "segcore/storagev2translator/StorageV2Config.h"
 #include "segcore/TextColumnCache.h"
+#include "segcore/TextLobIndexInput.h"
 #include "storage/FileManager.h"
 #include "storage/StatusToErrorCode.h"
 #include "storage/KeyRetriever.h"
@@ -5693,62 +5694,24 @@ ChunkedSegmentSealedImpl::CreateTextIndexWithSchema(
 
                 const auto& lob_base_path = it->second;
 
-                struct TextIndexEntry {
-                    size_t offset;
-                    bool is_valid;
-                    size_t text_index;
-                };
-                std::vector<TextIndexEntry> entries;
-                std::vector<milvus_storage::lob_column::EncodedRef>
-                    encoded_refs;
-                auto flush_text_entries = [&]() {
-                    if (entries.empty()) {
-                        return;
-                    }
-                    auto texts = ReadTextLobBatch(lob_base_path, encoded_refs);
-                    AssertInfo(texts.size() == encoded_refs.size(),
-                               "TEXT field {} LOB batch read returned {} "
-                               "texts for {} refs. segment_id={}",
-                               field_id.get(),
-                               texts.size(),
-                               encoded_refs.size(),
-                               id_);
-                    for (const auto& entry : entries) {
-                        if (!entry.is_valid) {
-                            index->AddNullSealed(entry.offset);
-                            continue;
-                        }
-                        index->AddTextSealed(
-                            texts[entry.text_index], true, entry.offset);
-                    }
-                    entries.clear();
-                    encoded_refs.clear();
-                    CheckCancellation(
-                        op_ctx,
-                        id_,
-                        field_id.get(),
-                        "ChunkedSegmentSealedImpl::CreateTextIndex()");
-                };
-                column->BulkRawStringAt(
-                    nullptr,
-                    [&](std::string_view value, size_t offset, bool is_valid) {
-                        if (!is_valid) {
-                            entries.push_back({offset, false, 0});
-                            if (entries.size() >= kTextLobIndexBuildBatchSize) {
-                                flush_text_entries();
-                            }
-                            return;
-                        }
-                        entries.push_back({offset, true, encoded_refs.size()});
-                        encoded_refs.push_back(
-                            MakeTextLobEncodedRef(value.data(), value.size()));
-                        if (encoded_refs.size() >=
-                                kTextLobIndexBuildBatchSize ||
-                            entries.size() >= kTextLobIndexBuildBatchSize) {
-                            flush_text_entries();
-                        }
+                VisitTextLobIndexInput(
+                    [&](auto&& visitor) {
+                        column->BulkRawStringAt(nullptr, visitor);
+                    },
+                    [&](const auto& refs) {
+                        return ReadTextLobBatch(lob_base_path, refs);
+                    },
+                    [&](std::string_view text, size_t offset, bool valid) {
+                        if (valid)
+                            index->AddTextSealed(std::string(text), true, offset);
+                        else
+                            index->AddNullSealed(offset);
+                    },
+                    [&] {
+                        CheckCancellation(
+                            op_ctx, id_, field_id.get(),
+                            "ChunkedSegmentSealedImpl::CreateTextIndex()");
                     });
-                flush_text_entries();
             } else {
                 column->BulkRawStringAt(
                     nullptr,

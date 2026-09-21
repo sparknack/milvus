@@ -147,8 +147,15 @@ TextColumnCache::ReadBatch(
             texts = std::move(batch_result).ValueOrDie();
         }
 
-        for (size_t i = 0; i < pending_indices.size() && i < texts.size();
-             i++) {
+        // The reader must return one value per reference. A successful but
+        // mis-sized result is an internal contract violation, not user input;
+        // do not silently fill missing rows with empty text or discard extras.
+        AssertInfo(texts.size() == pending_refs.size(),
+                   "LOB reader for {} returned {} texts for {} references",
+                   lob_base_path,
+                   texts.size(),
+                   pending_refs.size());
+        for (size_t i = 0; i < pending_indices.size(); i++) {
             size_t original_idx = pending_indices[i];
             results[original_idx] = std::move(texts[i]);
         }
@@ -207,8 +214,15 @@ TextColumnCache::ReadBatchInto(
             texts = std::move(batch_result).ValueOrDie();
         }
 
-        for (size_t i = 0; i < pending_indices.size() && i < texts.size();
-             i++) {
+        // The reader must return one value per reference. A successful but
+        // mis-sized result is an internal contract violation, not user input;
+        // do not silently fill missing rows with empty text or discard extras.
+        AssertInfo(texts.size() == pending_refs.size(),
+                   "LOB reader for {} returned {} texts for {} references",
+                   lob_base_path,
+                   texts.size(),
+                   pending_refs.size());
+        for (size_t i = 0; i < pending_indices.size(); i++) {
             *dst->Mutable(pending_indices[i]) = std::move(texts[i]);
         }
     }

@@ -937,7 +937,7 @@ TEST(TextMatch, SealedCreateTextIndexDecodesTextLobRefs) {
                                std::nullopt));
 
     auto lob_base_path =
-        test_dir + "/lobs/" + std::to_string(text_field_id.get());
+        TestLocalPath + test_dir + "/lobs/" + std::to_string(text_field_id.get());
     milvus_storage::lob_column::LobColumnConfig lob_config;
     lob_config.lob_base_path = lob_base_path;
     lob_config.field_id = text_field_id.get();

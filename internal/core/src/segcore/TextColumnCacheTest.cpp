@@ -308,5 +308,120 @@ TEST(TextColumnCache, PreservesStorageErrorWhenCreatingReader) {
     }
 }
 
+// Inject below LobColumnReader::ReadBatch, at the virtual byte-reader interface.
+// That adapter converts every returned row, so this exercises the real cache
+// boundary rather than a mock of TextColumnCache itself.
+struct ReaderReply {
+    size_t count = 2;
+    arrow::Status status = arrow::Status::OK();
+};
+class ContractLobColumnReader : public InstrumentedLobColumnReader {
+ public:
+    explicit ContractLobColumnReader(std::shared_ptr<ReaderReply> reply)
+        : InstrumentedLobColumnReader(std::make_shared<BlockingCallTracker>()),
+          reply_(std::move(reply)) {
+    }
+    arrow::Result<std::vector<std::vector<uint8_t>>>
+    ReadBatchData(const std::vector<EncodedRef>& refs) override {
+        EXPECT_EQ(refs.size(), 2);
+        if (!reply_->status.ok())
+            return reply_->status;
+        std::vector<std::vector<uint8_t>> result;
+        for (size_t i = 0; i < reply_->count; ++i)
+            result.push_back(Bytes("lob-" + std::to_string(i)));
+        return result;
+    }
+
+ private:
+    std::shared_ptr<ReaderReply> reply_;
+};
+TextLobReaderFactory
+ContractFactory(std::shared_ptr<ReaderReply> reply) {
+    return
+        [reply](std::shared_ptr<arrow::fs::FileSystem>, const LobColumnConfig&)
+            -> arrow::Result<std::unique_ptr<LobColumnReader>> {
+            std::unique_ptr<LobColumnReader> result =
+                std::make_unique<ContractLobColumnReader>(reply);
+            return std::move(result);
+        };
+}
+
+TEST(TextColumnCache, RejectsReaderCardinalityMismatchAndRecovers) {
+    auto reply = std::make_shared<ReaderReply>();
+    TextColumnCache cache(TextColumnCacheConfig{}, ContractFactory(reply));
+    milvus_storage::api::Properties properties;
+    const auto ref = MakeLobReference();
+    const auto inline_ref =
+        milvus_storage::lob_column::EncodeInlineText("inline");
+    const std::vector<EncodedRef> refs{{inline_ref.data(), inline_ref.size()},
+                                       {ref.data(), ref.size()},
+                                       {nullptr, 0},
+                                       {ref.data(), ref.size()}};
+    for (size_t wrong_size : {0U, 1U, 3U}) {
+        SCOPED_TRACE(wrong_size);
+        reply->count = wrong_size;
+        try {
+            cache.ReadBatch("/tmp/lob-contract", nullptr, properties, refs);
+            FAIL() << "mis-sized reader result was accepted";
+        } catch (const SegcoreError& error) {
+            EXPECT_EQ(error.get_error_code(), ErrorCode::UnexpectedError);
+            EXPECT_NE(std::string(error.what()).find("texts for 2 references"),
+                      std::string::npos);
+        }
+        google::protobuf::RepeatedPtrField<std::string> dst;
+        for (size_t i = 0; i < refs.size(); ++i) *dst.Add() = "untouched-lob";
+        try {
+            cache.ReadBatchInto(
+                "/tmp/lob-contract", nullptr, properties, refs, &dst);
+            FAIL() << "mis-sized reader result was accepted";
+        } catch (const SegcoreError& error) {
+            EXPECT_EQ(error.get_error_code(), ErrorCode::UnexpectedError);
+        }
+        // Inline/null slots are filled before the LOB read. Do not claim an
+        // atomic destination rollback, but no LOB row may be partially applied.
+        EXPECT_EQ(dst.Get(0), "inline");
+        EXPECT_EQ(dst.Get(1), "untouched-lob");
+        EXPECT_TRUE(dst.Get(2).empty());
+        EXPECT_EQ(dst.Get(3), "untouched-lob");
+        reply->count = 2;
+        EXPECT_EQ(
+            cache.ReadBatch("/tmp/lob-contract", nullptr, properties, refs),
+            (std::vector<std::string>{"inline", "lob-0", "", "lob-1"}));
+        cache.ReadBatchInto(
+            "/tmp/lob-contract", nullptr, properties, refs, &dst);
+        EXPECT_EQ(dst.Get(1), "lob-0");
+        EXPECT_EQ(dst.Get(3), "lob-1");
+    }
+}
+
+TEST(TextColumnCache, PreservesReaderStorageErrorBeforeCardinalityCheck) {
+    auto reply = std::make_shared<ReaderReply>();
+    reply->status = milvus_storage::MakeExtendError(
+        milvus_storage::ExtendStatusCode::StorageTransientTimeout,
+        "injected read timeout");
+    TextColumnCache cache(TextColumnCacheConfig{}, ContractFactory(reply));
+    milvus_storage::api::Properties properties;
+    const auto ref = MakeLobReference();
+    const std::vector<EncodedRef> refs{{ref.data(), ref.size()},
+                                       {ref.data(), ref.size()}};
+    for (bool into : {false, true}) {
+        try {
+            if (into) {
+                google::protobuf::RepeatedPtrField<std::string> dst;
+                dst.Add();
+                dst.Add();
+                cache.ReadBatchInto(
+                    "/tmp/lob-timeout", nullptr, properties, refs, &dst);
+            } else
+                cache.ReadBatch("/tmp/lob-timeout", nullptr, properties, refs);
+            FAIL() << "reader error swallowed";
+        } catch (const SegcoreError& error) {
+            EXPECT_EQ(error.get_error_code(), ErrorCode::StorageTransientError);
+            EXPECT_NE(std::string(error.what()).find("injected read timeout"),
+                      std::string::npos);
+        }
+    }
+}
+
 }  // namespace
 }  // namespace milvus::segcore
