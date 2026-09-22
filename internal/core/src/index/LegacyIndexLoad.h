@@ -17,31 +17,33 @@
 #pragma once
 
 #include "index/contracts/Registry.h"
+#include "index/IndexLoadInput.h"
+#include <functional>
 #include "storage/FileManager.h"
 
 namespace milvus::index {
 
-// Open the logical V1/V2 entry directory, fetching slice metadata with the
-// context's pinned transport mode. Does not prefetch engine payloads.
-std::unique_ptr<storage::V1RemoteSource>
-OpenLegacyIndexSource(const storage::FileManagerContext& context,
-                      const std::vector<std::string>& paths,
-                      const storage::LoadOptions& options,
-                      storage::V1SourceLayout layout);
+/** @brief Family payload decoding invoked within a legacy loading operation. */
+using LegacyLoadFn = std::function<folly::coro::Task<IIndexReaderBasePtr>(
+    storage::FileSource&, const storage::LoadOptions&, bool)>;
 
-// Execute a legacy loader on the loading executor. Remote reads/admission
-// suspend; families offload blocking file phases and retain their owners.
+/**
+ * @brief Execute family decoding with a per-call legacy source context.
+ * @param input Shared source and pinned transport; no concurrent use is
+ * allowed.
+ * @param options Fixed family configuration; copied with context for this call.
+ * @param load Family payload decoder; owns its targets until I/O and cleanup
+ * finish.
+ * @param context Borrowed only until task completion; may be null.
+ * @return A reader after final cancellation checks.
+ * @note Source context is reset on success and failure. Sync stays on the
+ * caller; async orchestration uses the loading executor. Families offload
+ * blocking file phases to the local-file executor.
+ */
 folly::coro::Task<IIndexReaderBasePtr>
-LoadLegacyIndexAsync(const LoaderEntry& loader,
-                     storage::FileSource& source,
-                     const storage::LoadOptions& options);
-
-// Cache boundary: choose the pinned mode once, open the source and load it.
-IIndexReaderBasePtr
-LoadLegacyIndexFile(const LoaderEntry& loader,
-                    const storage::FileManagerContext& context,
-                    const std::vector<std::string>& paths,
-                    const storage::LoadOptions& options,
-                    storage::V1SourceLayout layout);
+RunLegacyLoad(LegacyIndexSource& input,
+              const storage::LoadOptions& options,
+              LegacyLoadFn load,
+              milvus::OpContext* context);
 
 }  // namespace milvus::index

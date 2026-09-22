@@ -15,6 +15,7 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
+#include "index/IndexLoaderFactory.h"
 
 #include <algorithm>
 #include <array>
@@ -32,6 +33,7 @@
 #include "index/IndexTypeAdapter.h"
 #include "index/Meta.h"
 #include "index/contracts/Registry.h"
+#include "index/LegacyIndexLoad.h"
 #include "index/contracts/build/VectorBuildInput.h"
 #include "index/contracts/query/INullReader.h"
 #include "index/contracts/query/IScalarPredicateReader.h"
@@ -317,8 +319,7 @@ MakeVectorValues(int64_t rows, int64_t dim) {
                          static_cast<SparseValueType>(row + 2));
         }
     } else {
-        const auto values_per_row =
-            std::is_same_v<T, bin1> ? dim / 8 : dim;
+        const auto values_per_row = std::is_same_v<T, bin1> ? dim / 8 : dim;
         result.reserve(static_cast<size_t>(rows * values_per_row));
         for (int64_t i = 0; i < rows * values_per_row; ++i) {
             result.push_back(static_cast<ValueType>((i % 13) + 1));
@@ -393,7 +394,12 @@ RunVectorArtifactLifecycle(const VectorLifecycleProfile& profile,
     ASSERT_TRUE(static_cast<bool>(loader));
     storage::LoadOptions options;
     options.params = adapted.params;
-    auto reader = loader.open(source, options);
+    auto reader = LoadIndex(
+        loader,
+        {OpenedIndexInput{LegacyIndexSource{
+             std::shared_ptr<storage::FileSource>(&source, [](auto*) {}),
+             false}},
+         options});
     ASSERT_NE(reader, nullptr);
     EXPECT_EQ(reader->CoordDomain(), Domain::Row);
     EXPECT_EQ(reader->ValueType(), physical_type);
@@ -420,11 +426,12 @@ AddVectorLifecycleCases(std::vector<FilterParam>& cases,
                         VectorLifecycleProfile profile) {
     for (const auto all_null : {false, true}) {
         cases.push_back({
-            .name = "Vector_" + type_name +
-                    (all_null ? "_AllNull" : "_Populated"),
-            .run = [profile, all_null] {
-                RunVectorArtifactLifecycle<T>(profile, all_null);
-            },
+            .name =
+                "Vector_" + type_name + (all_null ? "_AllNull" : "_Populated"),
+            .run =
+                [profile, all_null] {
+                    RunVectorArtifactLifecycle<T>(profile, all_null);
+                },
         });
     }
 }
@@ -455,11 +462,12 @@ ArtifactLifecycleCases() {
             .index_type = knowhere::IndexEnum::INDEX_FAISS_IVFPQ,
             .metric_type = knowhere::metric::L2,
             .dim = 4,
-            .extra_params = {
-                {knowhere::indexparam::NLIST, 2},
-                {knowhere::indexparam::M, 2},
-                {knowhere::indexparam::NBITS, 4},
-            },
+            .extra_params =
+                {
+                    {knowhere::indexparam::NLIST, 2},
+                    {knowhere::indexparam::M, 2},
+                    {knowhere::indexparam::NBITS, 4},
+                },
         };
         AddVectorLifecycleCases<float>(result, "Float", dense);
         AddVectorLifecycleCases<float16>(result, "Float16", dense);
@@ -478,13 +486,13 @@ ArtifactLifecycleCases() {
             result,
             "SparseFloat",
             {
-                .index_type =
-                    knowhere::IndexEnum::INDEX_SPARSE_INVERTED_INDEX,
+                .index_type = knowhere::IndexEnum::INDEX_SPARSE_INVERTED_INDEX,
                 .metric_type = knowhere::metric::IP,
                 .dim = 32,
-                .extra_params = {
-                    {knowhere::indexparam::DROP_RATIO_BUILD, 0.1},
-                },
+                .extra_params =
+                    {
+                        {knowhere::indexparam::DROP_RATIO_BUILD, 0.1},
+                    },
             });
         return result;
     }();

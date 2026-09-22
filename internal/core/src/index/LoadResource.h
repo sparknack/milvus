@@ -71,15 +71,6 @@ ScalarIndexFileLoadResource(
     const storage::FileManagerContext& context,
     bool is_index_file = true);
 
-// Add envelope/decode scratch for the entries actually prepared by async
-// vector loading. Native remote-stream engine entries remain uninspected.
-LoadResourceRequest
-LegacyVectorFileLoadResource(LoadResourceRequest request,
-                             bool disk_family,
-                             const storage::LoadOptions& options,
-                             const std::vector<std::string>& paths,
-                             const storage::FileManagerContext& context);
-
 /**
  * @brief Estimate packed scalar loading resources from inspected metadata.
  * @param reader Borrowed directory and metadata; this calculation performs no I/O.
@@ -95,5 +86,14 @@ PackedScalarIndexLoadResource(
     const std::vector<std::string>& index_files,
     const storage::AsyncIndexEntryReader& reader,
     bool use_async_load);
+
+// Add envelope/decode scratch for the entries actually prepared by async
+// vector loading. Native remote-stream engine entries remain uninspected.
+LoadResourceRequest
+LegacyVectorFileLoadResource(LoadResourceRequest request,
+                             bool disk_family,
+                             const storage::LoadOptions& options,
+                             const std::vector<std::string>& paths,
+                             const storage::FileManagerContext& context);
 
 }  // namespace milvus::index

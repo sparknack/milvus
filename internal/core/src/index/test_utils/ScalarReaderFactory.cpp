@@ -15,6 +15,7 @@
 // limitations under the License.
 
 #include "index/test_utils/ScalarReaderFactory.h"
+#include "index/IndexLoaderFactory.h"
 
 #include <algorithm>
 #include <arrow/io/memory.h>
@@ -270,7 +271,11 @@ ReaderBackend::Open(storage::ArtifactPtr artifact,
         options.mmap_dir_path = std::filesystem::temp_directory_path().string();
     }
     options.params = std::move(params);
-    auto reader = LoadPackedIndex(loader, *source, options);
+    auto reader = LoadIndex(
+        loader,
+        {OpenedIndexInput{PackedIndexSource{
+             std::shared_ptr<storage::IndexEntryReader>(std::move(source))}},
+         options});
     ValidateReader(Name(), *this, expected_caps, reader);
     return reader;
 }

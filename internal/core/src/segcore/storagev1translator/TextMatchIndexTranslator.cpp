@@ -15,6 +15,7 @@
 // limitations under the License.
 
 #include "segcore/storagev1translator/TextMatchIndexTranslator.h"
+#include "index/IndexLoaderFactory.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -28,6 +29,7 @@
 #include "index/Families.h"
 #include "index/Meta.h"
 #include "index/PackedIndexLoad.h"
+#include "index/LegacyIndexLoad.h"
 #include "index/LoadResource.h"
 #include "segcore/storagev2translator/StorageV2Config.h"
 #include "index/Utils.h"
@@ -223,12 +225,21 @@ TextMatchIndexTranslator::get_cells(
             },
             milvus::ScopedTimer::LogLevel::Info);
         if (IsPackedV3(*files)) {
-            reader = index::LoadPackedIndexFile(
-                loader, file_manager_context_, files->front(), options, false);
+            reader = index::LoadIndex(
+                loader,
+                {index::IndexFiles{file_manager_context_,
+                                   {files->front()},
+                                   index::PackedIndexFile{false}},
+                 options});
         } else {
             auto source =
                 MakeTextSource(file_manager_context_, *files, options);
-            reader = loader.open(*source, options);
+            reader = index::LoadIndex(
+                loader,
+                {index::OpenedIndexInput{index::LegacyIndexSource{
+                     std::shared_ptr<storage::FileSource>(std::move(source)),
+                     false}},
+                 options});
         }
     }
     AssertInfo(reader != nullptr, "text loader returned a null reader");

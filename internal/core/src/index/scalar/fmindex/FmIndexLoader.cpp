@@ -14,11 +14,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "folly/CancellationToken.h"
-#include "folly/coro/Task.h"
-#include "common/OpContext.h"
 #include "storage/LocalFileIOPool.h"
+#include "common/OpContext.h"
 #include "index/scalar/fmindex/FmIndexLoader.h"
+#include "index/IndexLoaderFactory.h"
+#include "index/PackedIndexLoad.h"
 
 #include <algorithm>
 #include <bit>
@@ -54,11 +54,16 @@ constexpr std::string_view kTotalRowsMeta = "total_rows";
 constexpr std::string_view kNullableMeta = "nullable";
 constexpr size_t kMmapPadding = 64;
 
+/**
+ * @brief Normalized runtime field semantics used to interpret persisted data.
+ */
 struct RuntimeParams {
     DataType value_type{DataType::VARCHAR};
     std::optional<bool> nullable;
 };
 
+// Require row-domain strings and preserve an optional runtime nullability
+// constraint.
 RuntimeParams
 ParseRuntimeParams(const Config& params) {
     RuntimeParams result;
@@ -95,6 +100,7 @@ ParseRuntimeParams(const Config& params) {
     return result;
 }
 
+/** @brief Remove the staging directory unless handed to the mapped reader. */
 class StagingDirectory final {
  public:
     explicit StagingDirectory(const std::string& configured_parent) {
@@ -149,6 +155,7 @@ class StagingDirectory final {
         return path_;
     }
 
+    // The mapped reader now owns directory cleanup.
     void
     Release() {
         path_.clear();
@@ -158,6 +165,7 @@ class StagingDirectory final {
     std::string path_;
 };
 
+/** @brief Unmap a new view unless ownership reaches FmIndexMappedFile. */
 class MappingGuard final {
  public:
     MappingGuard(void* data, size_t size) : data_(data), size_(size) {
@@ -173,6 +181,7 @@ class MappingGuard final {
         }
     }
 
+    // FmIndexMappedFile now owns munmap; disarm rollback.
     void
     Release() {
         data_ = nullptr;
@@ -190,6 +199,8 @@ ExpectedNullBitmapBytes(int64_t total_rows) {
            static_cast<size_t>(total_rows % 8 != 0);
 }
 
+// Cross-check the decoded FM blob structure and document count against
+// metadata.
 void
 ValidateLoadedEngine(const fmindex::FMIndex& engine, int64_t total_rows) {
     if (!engine.valid()) {
@@ -204,7 +215,10 @@ ValidateLoadedEngine(const fmindex::FMIndex& engine, int64_t total_rows) {
     }
 }
 
-// Per-load state; null bitmap storage is the final query allocation.
+/**
+ * @brief Per-load FM blob and null bitmap owners retained by IndexLoadPlan.
+ * @note Null bitmap storage becomes the final query allocation.
+ */
 struct PackedFmState {
     RuntimeParams runtime;
     int64_t total_rows{0};
@@ -216,26 +230,14 @@ struct PackedFmState {
     std::shared_ptr<storage::IndexFileTarget> file;
 };
 
-}  // namespace
-
-ReaderCaps
-FmIndexLoader::DeriveCaps(const Config& index_meta) {
-    static_cast<void>(ParseRuntimeParams(index_meta));
-    return ReaderCaps{.pattern_match = true};
-}
-
-IIndexReaderBasePtr
-FmIndexLoader::Open(storage::FileSource&, const storage::LoadOptions&) {
-    ThrowInfo(DataFormatBroken,
-              "FM-index has no V1/V2 artifact representation");
-}
-
-IndexLoadPlan
-FmIndexLoader::PlanPacked(const storage::IndexEntryDirectory& directory,
-                          const nlohmann::json& metadata,
-                          const storage::LoadOptions& opts) {
-    auto state = std::make_shared<PackedFmState>();
-    state->runtime = ParseRuntimeParams(opts.params);
+// Validate row/nullability metadata and entry sizes without allocating
+// payload targets.
+void
+ValidatePackedMetadata(PackedFmState& state,
+                       const storage::IndexEntryDirectory& directory,
+                       const nlohmann::json& metadata,
+                       const storage::LoadOptions& opts) {
+    state.runtime = ParseRuntimeParams(opts.params);
     if (!metadata.contains(kTotalRowsMeta) ||
         !metadata.contains(kNullableMeta)) {
         ThrowInfo(DataFormatBroken,
@@ -252,34 +254,78 @@ FmIndexLoader::PlanPacked(const storage::IndexEntryDirectory& directory,
         ThrowInfo(DataFormatBroken,
                   "invalid FM-index total_rows or nullable metadata");
     }
-    state->total_rows = rows.get<int64_t>();
-    state->nullable = metadata.at(kNullableMeta).get<bool>();
-    if (static_cast<uint64_t>(state->total_rows) >
+    state.total_rows = rows.get<int64_t>();
+    state.nullable = metadata.at(kNullableMeta).get<bool>();
+    if (static_cast<uint64_t>(state.total_rows) >
         std::numeric_limits<size_t>::max()) {
         ThrowInfo(DataFormatBroken, "FM-index row count exceeds size_t");
     }
-    if (state->runtime.nullable &&
-        *state->runtime.nullable != state->nullable) {
+    if (state.runtime.nullable && *state.runtime.nullable != state.nullable) {
         ThrowInfo(DataFormatBroken,
                   "FM-index runtime nullable disagrees with artifact");
     }
     if (!directory.HasEntry(kBlobEntry)) {
         ThrowInfo(DataFormatBroken, "FM-index blob is missing");
     }
-    state->blob_bytes = directory.At(kBlobEntry).plaintext_size;
-    if (state->blob_bytes == 0 ||
-        state->blob_bytes > std::numeric_limits<size_t>::max() - kMmapPadding) {
+    state.blob_bytes = directory.At(kBlobEntry).plaintext_size;
+    if (state.blob_bytes == 0 ||
+        state.blob_bytes > std::numeric_limits<size_t>::max() - kMmapPadding) {
         ThrowInfo(DataFormatBroken, "invalid FM-index blob size");
     }
     const bool has_nulls = directory.HasEntry(kNullBitmapEntry);
-    if (has_nulls != state->nullable ||
+    if (has_nulls != state.nullable ||
         (has_nulls && directory.At(kNullBitmapEntry).plaintext_size !=
-                          ExpectedNullBitmapBytes(state->total_rows))) {
+                          ExpectedNullBitmapBytes(state.total_rows))) {
         ThrowInfo(DataFormatBroken,
                   "FM-index null bitmap disagrees with metadata");
     }
     AssertInfo(opts.mmap_dir_path.find('\0') == std::string::npos,
                "FM-index load options contain an invalid staging path");
+}
+
+}  // namespace
+
+folly::coro::Task<std::unique_ptr<IndexLoader>>
+FmIndexLoader::Open(IndexOpenRequest request) {
+    return OpenIndexLoader(
+        std::move(request),
+        [](OpenedIndexInput input, storage::LoadOptions options)
+            -> folly::coro::Task<std::unique_ptr<IndexLoader>> {
+            (void)DeriveCaps(options.params);
+            if (!std::holds_alternative<PackedIndexSource>(input)) {
+                ThrowInfo(DataFormatBroken,
+                          "FM-index has no V1/V2 artifact representation");
+            }
+            auto loader = std::unique_ptr<FmIndexLoader>(
+                new FmIndexLoader(std::get<PackedIndexSource>(std::move(input)),
+                                  std::move(options)));
+            PackedFmState metadata;
+            ValidatePackedMetadata(metadata,
+                                   loader->input_.Directory(),
+                                   loader->input_.Metadata(),
+                                   loader->options_);
+            co_return loader;
+        });
+}
+
+folly::coro::Task<IIndexReaderBasePtr>
+FmIndexLoader::Load(milvus::OpContext* context) {
+    return RunPackedIndexLoad(
+        input_, options_, &PlanPacked, &FinishPacked, context);
+}
+
+ReaderCaps
+FmIndexLoader::DeriveCaps(const Config& index_meta) {
+    static_cast<void>(ParseRuntimeParams(index_meta));
+    return ReaderCaps{.pattern_match = true};
+}
+
+IndexLoadPlan
+FmIndexLoader::PlanPacked(const storage::IndexEntryDirectory& directory,
+                          const nlohmann::json& metadata,
+                          const storage::LoadOptions& opts) {
+    auto state = std::make_shared<PackedFmState>();
+    ValidatePackedMetadata(*state, directory, metadata, opts);
     IndexLoadPlan plan;
     plan.load_context = state;
     plan.entries.reserve(state->nullable ? 2 : 1);
@@ -317,8 +363,7 @@ FmIndexLoader::PlanPacked(const storage::IndexEntryDirectory& directory,
 folly::coro::Task<IIndexReaderBasePtr>
 FmIndexLoader::FinishPacked(IndexLoadPlan& plan,
                             const storage::LoadOptions& opts,
-                            bool use_async,
-                            folly::CancellationToken token) {
+                            bool use_async) {
     const auto priority =
         opts.op_ctx && opts.op_ctx->runtime_load_priority.value_or(0) != 0
             ? proto::common::LoadPriority::LOW

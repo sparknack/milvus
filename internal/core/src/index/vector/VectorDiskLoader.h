@@ -17,45 +17,76 @@
 #pragma once
 
 #include <string_view>
+#include <utility>
 
 #include "index/Families.h"
+#include "index/IndexLoader.h"
+#include "index/IndexLoadInput.h"
 #include "index/contracts/query/IIndexReaderBase.h"
 #include "storage/artifact/FileSource.h"
 #include "storage/artifact/LoadOptions.h"
 
 namespace milvus::index {
 
-// Stateless V1/V2 disk-vector loader. Non-streaming backends are materialized
-// into one unique DiskFileManager generation before knowhere Deserialize.
-// Streaming backends open only exact raw, unsliced objects advertised by the
-// current artifact inventory; small legacy sidecars still use FileSource.
-class VectorDiskLoader final {
+/**
+ * @brief Loads disk Knowhere readers from legacy artifacts.
+ *
+ * Non-streaming backends materialize a unique DiskFileManager generation.
+ * Streaming backends open exact raw, unsliced inventory objects; legacy
+ * sidecars still use FileSource. Owns the opened input and fixed load options;
+ * each Load creates a new reader.
+ */
+class VectorDiskLoader final : public IndexLoader {
  public:
     static constexpr std::string_view kFamily = families::kVectorDisk;
 
+    /** @brief Derive capabilities from runtime parameters without I/O. */
     static ReaderCaps
     DeriveCaps(const Config& index_meta);
 
-    static IIndexReaderBasePtr
-    Open(storage::FileSource& source, const storage::LoadOptions& opts);
+    /**
+     * @brief Validate legacy inventory, vector parameters and disk backend
+     * options.
+     * @param request Input/options; borrowed op_ctx must outlive this task.
+     * @return A ready loader with no retained opening context.
+     * @note Failure also detaches the source's opening context before the
+     * exception propagates.
+     */
+    static folly::coro::Task<std::unique_ptr<IndexLoader>>
+    Open(IndexOpenRequest request);
 
-    // Borrow source/options until completion. Run on the local-file executor:
-    // remote reads suspend, while native initialization and mmap remain local.
-    static folly::coro::Task<IIndexReaderBasePtr>
-    OpenAsync(storage::FileSource& source, const storage::LoadOptions& opts);
+    /** @copydoc IndexLoader::Load */
+    folly::coro::Task<IIndexReaderBasePtr>
+    Load(milvus::OpContext* context = nullptr) override;
 
-    // Select the native backend before inspecting remote envelopes. Stream
-    // backends prepare only sidecars; engine files remain lazily accessible.
+    /**
+     * @brief Select entries that need eager async reads for the disk backend.
+     * @return All entries for materialized backends; sidecars only for
+     * streaming.
+     * @note Selects the backend before inspecting remote engine envelopes.
+     */
     static std::vector<std::string>
     AsyncEntryNames(storage::FileSource& source,
                     const storage::LoadOptions& opts);
 
  private:
-    // Share validation, decoding and ownership across both transport modes.
+    LegacyIndexSource input_;
+    // Retained options never keep the Open caller's op_ctx.
+    storage::LoadOptions options_;
+
+    VectorDiskLoader(LegacyIndexSource input, storage::LoadOptions options)
+        : input_(std::move(input)), options_(std::move(options)) {
+    }
+
+    /**
+     * @brief Load disk-engine files through the selected backend and attach
+     * sidecars.
+     * @note Runs inside RunLegacyLoad; use_async controls source I/O only.
+     */
     static folly::coro::Task<IIndexReaderBasePtr>
-    OpenImpl(bool use_async,
-             storage::FileSource& source,
-             const storage::LoadOptions& opts);
+    LoadLegacy(storage::FileSource& source,
+               const storage::LoadOptions& opts,
+               bool use_async);
 };
 
 }  // namespace milvus::index

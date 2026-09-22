@@ -17,10 +17,11 @@
 #include "common/OpContext.h"
 #include "storage/LocalFileIOPool.h"
 #include "index/vector/VectorMemLoader.h"
+#include "index/IndexLoaderFactory.h"
+#include "index/LegacyIndexLoad.h"
 #include "index/vector/VectorLoadUtils.h"
 
 #include <cstdint>
-#include "folly/coro/BlockingWait.h"
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -56,6 +57,8 @@ using vector_load_params::ValidateLoadedShape;
 
 using RuntimeParams = NormalizedLoadMetadata;
 
+// Require memory-load routing and normalize vector shape and validity-map
+// options.
 RuntimeParams
 ParseRuntimeParams(const Config& params) {
     auto result = ParseNormalizedLoadMetadata(params, LoadBackend::Memory);
@@ -69,6 +72,9 @@ ParseRuntimeParams(const Config& params) {
     return result;
 }
 
+/**
+ * @brief Validated inventory and empty-index state; owns names, not payloads.
+ */
 struct EntryPlan {
     ArtifactState state{ArtifactState::Normal};
     std::vector<std::string> all_names;
@@ -78,6 +84,8 @@ struct EntryPlan {
     bool has_emb_raw{false};
 };
 
+// Validate sidecar combinations and distinguish normal, all-null and
+// empty-list payloads.
 EntryPlan
 PlanEntries(storage::FileSource& source, const RuntimeParams& params) {
     EntryPlan plan;
@@ -145,6 +153,8 @@ PlanEntries(storage::FileSource& source, const RuntimeParams& params) {
     return plan;
 }
 
+// Transfer entry bytes into BinarySet through shared ownership, without
+// copying the buffer.
 folly::coro::Task<void>
 AppendReadEntry(bool use_async,
                 storage::FileSource& source,
@@ -163,6 +173,7 @@ AppendReadEntry(bool use_async,
     entries.Append(name, std::move(data), size);
 }
 
+// Read the selected logical entries sequentially into an owning BinarySet.
 folly::coro::Task<knowhere::BinarySet>
 ReadEntries(bool use_async,
             storage::FileSource& source,
@@ -176,6 +187,8 @@ ReadEntries(bool use_async,
 
 using detail::EmptyEmbeddingListState;
 
+// Validate an empty-list sidecar before exposing its dimension and offsets to
+// Knowhere.
 EmptyEmbeddingListState
 DecodeEmptyEmbeddingList(const knowhere::BinarySet& entries) {
     const auto entry =
@@ -202,6 +215,8 @@ DecodeEmptyEmbeddingList(const knowhere::BinarySet& entries) {
     return result;
 }
 
+// Translate the load policy to Knowhere configuration; reject unknown policy
+// values.
 void
 SetWarmup(Config& config, storage::WarmupPolicy warmup) {
     switch (warmup) {
@@ -218,6 +233,7 @@ SetWarmup(Config& config, storage::WarmupPolicy warmup) {
     ThrowInfo(UnexpectedError, "unknown vector warmup policy");
 }
 
+// Preserve the Knowhere status category while adding deserialization context.
 [[noreturn]] void
 ThrowDeserializeError(knowhere::Status status) {
     ThrowInfo(KnowhereStatusToErrorCode(status),
@@ -270,6 +286,9 @@ RestoreValidity(bool use_async,
     co_return result;
 }
 
+/**
+ * @brief Per-load Knowhere engine owner until transfer into VectorIndexReader.
+ */
 struct OpenedMemState {
     explicit OpenedMemState(const RuntimeParams& params)
         : engine(params.physical_type,
@@ -282,6 +301,8 @@ struct OpenedMemState {
     KnowhereEngine engine;
 };
 
+// Populate a per-load engine from legacy entries; native deserialization
+// stays synchronous.
 folly::coro::Task<void>
 PopulateState(bool use_async,
               OpenedMemState& state,
@@ -476,6 +497,31 @@ PopulateState(bool use_async,
 
 }  // namespace
 
+folly::coro::Task<std::unique_ptr<IndexLoader>>
+VectorMemLoader::Open(IndexOpenRequest request) {
+    return OpenIndexLoader(
+        std::move(request),
+        [](OpenedIndexInput input, storage::LoadOptions options)
+            -> folly::coro::Task<std::unique_ptr<IndexLoader>> {
+            (void)DeriveCaps(options.params);
+            if (!std::holds_alternative<LegacyIndexSource>(input)) {
+                ThrowInfo(Unsupported,
+                          "vector indexes have no V3 persisted format");
+            }
+            auto loader = std::unique_ptr<VectorMemLoader>(new VectorMemLoader(
+                std::get<LegacyIndexSource>(std::move(input)),
+                std::move(options)));
+            (void)PlanEntries(*loader->input_.source,
+                              ParseRuntimeParams(loader->options_.params));
+            co_return loader;
+        });
+}
+
+folly::coro::Task<IIndexReaderBasePtr>
+VectorMemLoader::Load(milvus::OpContext* context) {
+    return RunLegacyLoad(input_, options_, &LoadLegacy, context);
+}
+
 ReaderCaps
 VectorMemLoader::DeriveCaps(const Config& index_meta) {
     (void)ParseRuntimeParams(index_meta);
@@ -485,9 +531,9 @@ VectorMemLoader::DeriveCaps(const Config& index_meta) {
 }
 
 folly::coro::Task<IIndexReaderBasePtr>
-VectorMemLoader::OpenImpl(bool use_async,
-                          storage::FileSource& source,
-                          const storage::LoadOptions& opts) {
+VectorMemLoader::LoadLegacy(storage::FileSource& source,
+                            const storage::LoadOptions& opts,
+                            bool use_async) {
     const auto params = ParseRuntimeParams(opts.params);
     if (source.Gen() != storage::Generation::V1V2) {
         ThrowInfo(Unsupported,
@@ -502,18 +548,6 @@ VectorMemLoader::OpenImpl(bool use_async,
     OpenedMemState state(params);
     co_await PopulateState(use_async, state, source, opts, params, plan);
     co_return std::make_unique<VectorIndexReader>(std::move(state.engine));
-}
-
-IIndexReaderBasePtr
-VectorMemLoader::Open(storage::FileSource& source,
-                      const storage::LoadOptions& opts) {
-    return folly::coro::blockingWait(OpenImpl(false, source, opts));
-}
-
-folly::coro::Task<IIndexReaderBasePtr>
-VectorMemLoader::OpenAsync(storage::FileSource& source,
-                           const storage::LoadOptions& opts) {
-    return OpenImpl(true, source, opts);
 }
 
 }  // namespace milvus::index

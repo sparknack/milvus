@@ -1,4 +1,4 @@
-# Async loading for legacy scalar and vector indexes
+# Index loader lifecycle and asynchronous loading
 
 ## Scope
 
@@ -14,8 +14,11 @@ BSON/JSON stats and the legacy TextMatch translator are outside this rollout.
 `SealedIndexTranslator` opens the logical legacy directory with
 `V1RemoteSource::OpenAsync`, including asynchronous slice-metadata loading.
 HYBRID's selector is read asynchronously before choosing the concrete loader.
-`LoaderEntry::open_async` runs each family's shared decoding implementation;
-`Open` selects the same implementation with synchronous source operations.
+`LoaderEntry::open` invokes the concrete family's coroutine factory.
+`Open(request)` retains the source, fixed options and parsed metadata in a loader;
+`Load(ctx)` creates the reader and its payload targets. Both synchronous and
+asynchronous transport use this lifecycle. Bitmap and sorted metadata are parsed
+once during Open; payload allocation and file staging remain in Load.
 There is no intermediate V3 file or preload-all adapter.
 
 `LegacyIndexLoader` validates each immutable physical object's envelope. Raw
@@ -31,6 +34,43 @@ native initialization and failure cleanup retain their existing synchronous
 semantics without blocking the remote read executor. When the local pool is
 disabled, the configured async executor remains the existing fallback.
 The cache's synchronous interface waits once at the coroutine boundary.
+
+## Module boundaries
+
+`IndexLoader` exposes only `Load(ctx)`. It does not expose storage format,
+entry directories, metadata accessors or an opening-finalization hook.
+
+`IndexLoadInput` describes unopened paths and opened inputs. Packed inputs own
+an EntryReader and expose its directory and metadata; legacy inputs own a
+FileSource and a transport choice. Vector loaders retain only a legacy input,
+and FM loaders retain only a packed input. Other families retain the explicit
+input variant they support.
+
+`IndexLoaderFactory` owns the complete opening operation: open the storage,
+construct the concrete family's metadata state, then detach the opening
+context on both success and failure. Family-local construction callbacks are
+implementation steps within that scope, not additional registry capabilities.
+It also owns the format-independent Open/Load bridge used by the synchronous
+cache boundary.
+
+`PackedIndexLoad` and `LegacyIndexLoad` execute format-specific loading and
+cleanup with per-call context. Concrete family loaders own their fixed options
+and parsed metadata, allocate their own reader targets and initialize readers.
+The registry only selects the factory and capability inspector.
+
+## Loader lifetime
+
+The current translator still opens and loads within each cache-cell request.
+Open can later move before translator construction without changing the reader
+loading API. The loader owns its source and does not retain the opening
+operation context or cancellation token after Open completes. Each Load binds
+its own context and owns its targets; sequential repeated loads are supported,
+but concurrent loads on the same loader are not. Borrowed-source adapters require
+the caller to keep the source alive.
+
+The synchronous bridge blocks once and runs both phases on the calling thread.
+Using coroutine return types does not itself add an executor hop. Scalar V3
+continues to use IndexEntryReader directly, without a FileSource adapter.
 
 ## Vector backends
 
@@ -77,8 +117,14 @@ reservations.
 Regression tests cover raw/Parquet/encrypted envelopes, exact slice assembly,
 real legacy scalar/vector loading, mmap, NULL and empty-list state, typed I/O
 and corruption errors, admission/read cancellation and local executor placement.
-Local validation on 2026-09-21: `index_tests` passed all 12,696 tests from
-52 suites, including 23 new legacy async tests and 64 FileWriter tests.
+Local validation on 2026-09-22: `index_tests` passed all 12,711 tests from
+53 suites. The two-stage regression cases cover metadata reuse, fresh operation
+contexts, cancellation followed by another Load, deferred mmap targets and
+readers outliving their loader. Failed-Open tests cancel the former opening
+context and directly reuse the borrowed source, verifying exception-path
+context cleanup for legacy and packed input. Registry coverage verifies that the synchronous
+bridge runs Open and Load on the calling thread. Existing cancellation tests
+also cover cancellation while legacy initialization waits for its executor.
 Changed C++ files passed clang-format 15; the segcore error-boundary guard and
 `git diff --check` passed. The build used at most 16 outer jobs and one job per
 nested dependency builder.

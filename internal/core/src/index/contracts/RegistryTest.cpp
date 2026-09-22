@@ -34,6 +34,8 @@
 #include "index/Families.h"
 #include "index/Meta.h"
 #include "index/contracts/Registry.h"
+#include "index/IndexLoaderFactory.h"
+#include "index/LegacyIndexLoad.h"
 #include "index/scalar/json/JsonProjectedIndexLoad.h"
 #include "index/test_utils/ArtifactTestUtils.h"
 #include "index/test_utils/CaseTestDriver.h"
@@ -110,7 +112,10 @@ class EmptyReader final : public IIndexReaderBase {
     ReaderCaps caps_;
 };
 
-struct LoaderProbeA {
+struct LoaderProbeA : IndexLoader {
+    storage::LoadOptions options_;
+    static inline std::thread::id open_thread;
+    static inline std::thread::id load_thread;
     static constexpr std::string_view kFamily = "test.registry.loader.a";
 
     static ReaderCaps
@@ -118,9 +123,22 @@ struct LoaderProbeA {
         return {.predicate = params.value("predicate", false)};
     }
 
-    static IIndexReaderBasePtr
-    Open(storage::FileSource&, const storage::LoadOptions& options) {
-        return std::make_unique<EmptyReader>(DeriveCaps(options.params));
+    static folly::coro::Task<std::unique_ptr<IndexLoader>>
+    Open(IndexOpenRequest request) {
+        return OpenIndexLoader(
+            std::move(request),
+            [](OpenedIndexInput, storage::LoadOptions options)
+                -> folly::coro::Task<std::unique_ptr<IndexLoader>> {
+                open_thread = std::this_thread::get_id();
+                auto result = std::make_unique<LoaderProbeA>();
+                result->options_ = std::move(options);
+                co_return result;
+            });
+    }
+    folly::coro::Task<IIndexReaderBasePtr>
+    Load(milvus::OpContext*) override {
+        load_thread = std::this_thread::get_id();
+        co_return std::make_unique<EmptyReader>(DeriveCaps(options_.params));
     }
 };
 
@@ -255,9 +273,16 @@ TEST(RegistryTest, LoaderDeriveAndOpenDispatchIndependently) {
     TestArtifactSource source(artifact);
     storage::LoadOptions options;
     options.params = {{"predicate", true}};
-    auto reader = entry.open(source, options);
+    auto reader = LoadIndex(
+        entry,
+        {OpenedIndexInput{LegacyIndexSource{
+             std::shared_ptr<storage::FileSource>(&source, [](auto*) {}),
+             false}},
+         options});
     ASSERT_NE(reader, nullptr);
     EXPECT_TRUE(reader->Caps().predicate);
+    EXPECT_EQ(LoaderProbeA::open_thread, std::this_thread::get_id());
+    EXPECT_EQ(LoaderProbeA::load_thread, std::this_thread::get_id());
 }
 
 TEST(RegistryTest, IndependentConcurrentRegistrationAndLookupAreSafe) {

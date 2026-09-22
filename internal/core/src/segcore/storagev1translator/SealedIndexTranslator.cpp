@@ -1,4 +1,5 @@
 #include "segcore/storagev1translator/SealedIndexTranslator.h"
+#include "index/IndexLoaderFactory.h"
 
 #include <filesystem>
 #include <limits>
@@ -32,6 +33,7 @@
 #include "segcore/Utils.h"
 #include "segcore/memory_planner.h"
 #include "storage/EntryStreamUtils.h"
+#include "storage/LocalFileIOPool.h"
 #include "storage/LoadOverheadController.h"
 #include "storage/ThreadPools.h"
 #include "storage/artifact/FileSource.h"
@@ -68,7 +70,27 @@ MakeRemoteSource(const index::IndexFamily& requested_family,
     const auto layout = UsesV1DiskLayout(requested_family)
                             ? storage::V1SourceLayout::DiskFiles
                             : storage::V1SourceLayout::MemoryEntries;
-    return index::OpenLegacyIndexSource(context, remote_paths, options, layout);
+    // Inspect metadata before the concrete family can be selected.
+    if (!context.use_async_load.value_or(
+            storagev2translator::StorageV2AsyncLoadEnabled())) {
+        return std::make_unique<storage::V1RemoteSource>(
+            context,
+            remote_paths,
+            options,
+            storage::ArtifactStoragePath::Index,
+            layout);
+    }
+    const auto priority =
+        options.op_ctx && options.op_ctx->runtime_load_priority.value_or(0) != 0
+            ? proto::common::LoadPriority::LOW
+            : proto::common::LoadPriority::HIGH;
+    return folly::coro::blockingWait(folly::coro::co_withExecutor(
+        storage::ResolveAsyncLoadExecutor({}, priority),
+        storage::V1RemoteSource::OpenAsync(context,
+                                           remote_paths,
+                                           options,
+                                           storage::ArtifactStoragePath::Index,
+                                           layout)));
 }
 
 }  // namespace
@@ -336,20 +358,22 @@ SealedIndexTranslator::get_cells(milvus::OpContext* ctx,
     if (packed_v3) {
         AssertInfo(index_load_info_.index_files.size() == 1,
                    "Packed scalar index requires one file");
-        reader =
-            index::LoadPackedIndexFile(loader,
-                                       file_manager_context_,
-                                       index_load_info_.index_files.front(),
-                                       options);
+        reader = index::LoadIndex(
+            loader,
+            {index::IndexFiles{file_manager_context_,
+                               {index_load_info_.index_files.front()},
+                               index::PackedIndexFile{true}},
+             options});
     } else {
         const auto layout = UsesV1DiskLayout(source_family_)
                                 ? storage::V1SourceLayout::DiskFiles
                                 : storage::V1SourceLayout::MemoryEntries;
-        reader = index::LoadLegacyIndexFile(loader,
-                                            file_manager_context_,
-                                            index_load_info_.index_files,
-                                            options,
-                                            layout);
+        reader = index::LoadIndex(
+            loader,
+            {index::IndexFiles{file_manager_context_,
+                               index_load_info_.index_files,
+                               index::LegacyIndexFiles{layout}},
+             options});
     }
     AssertInfo(reader != nullptr,
                "index loader for family {} returned a null reader",

@@ -14,16 +14,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "folly/CancellationToken.h"
-#include "folly/coro/Task.h"
 #include "folly/coro/WithCancellation.h"
 #include "storage/AsyncLoadExecutor.h"
 #include "storage/LocalFileIOPool.h"
 #include "common/OpContext.h"
-#include "storage/LocalFileIOPool.h"
-#include "folly/coro/BlockingWait.h"
-
 #include "index/scalar/inverted/InvertedIndexLoader.h"
+#include "index/IndexLoaderFactory.h"
+#include "index/PackedIndexLoad.h"
+#include "index/LegacyIndexLoad.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -62,12 +60,17 @@ namespace {
 
 using inverted_params::IsSupportedType;
 
+/**
+ * @brief Normalized runtime field semantics used to interpret persisted data.
+ */
 struct RuntimeParams {
     DataType field_type{DataType::NONE};
     DataType value_type{DataType::NONE};
     bool nested{false};
 };
 
+// Resolve scalar, array-element or JSON-cast types and reject incompatible
+// domains.
 RuntimeParams
 ParseRuntimeParams(const Config& params) {
     RuntimeParams result;
@@ -127,11 +130,14 @@ ParseRuntimeParams(const Config& params) {
     return result;
 }
 
+/** @brief Resolved local storage preferences for this load. */
 struct EffectiveLoadOptions {
     bool mmap{false};
     std::string directory_parent;
 };
 
+// Resolve explicit load options and legacy config fallbacks for local
+// staging.
 EffectiveLoadOptions
 ResolveLoadOptions(const storage::LoadOptions& opts) {
     EffectiveLoadOptions result;
@@ -154,11 +160,16 @@ ResolveLoadOptions(const storage::LoadOptions& opts) {
     return result;
 }
 
+/**
+ * @brief Validated legacy inventory separating engine files from null sidecars.
+ */
 struct PersistedEntries {
     std::vector<std::string> engine_files;
     bool has_null{false};
 };
 
+// Validate logical entry names and separate engine files from sidecars; no
+// payload I/O.
 PersistedEntries
 ReadPersistedEntries(storage::FileSource& source) {
     PersistedEntries result;
@@ -183,6 +194,8 @@ using storage::LocalEntryGuard;
 
 using storage::FileDescriptorGuard;
 
+// Stage null offsets before allocation; nested indexes retain
+// element-versus-row semantics.
 folly::coro::Task<std::shared_ptr<const std::vector<size_t>>>
 ReadNullOffsets(bool use_async,
                 const storage::LoadOptions& opts,
@@ -252,6 +265,8 @@ ReadNullOffsets(bool use_async,
         run_io());
 }
 
+// Account for retained payload bytes with overflow checks, using local file
+// sizes.
 size_t
 MaterializedBytes(const std::vector<std::string>& paths,
                   bool ram_payload_only) {
@@ -281,6 +296,10 @@ MaterializedBytes(const std::vector<std::string>& paths,
     return total;
 }
 
+/**
+ * @brief Own the initialized engine and its backing directory until reader
+ * creation.
+ */
 struct InvertedLoadState {
     // Declaration order makes the engine release before its backing directory.
     std::shared_ptr<storage::LocalDirectory> directory;
@@ -291,6 +310,8 @@ struct InvertedLoadState {
     size_t engine_bytes{0};
 };
 
+// Materialize legacy Tantivy files, open the engine, then read sidecars using
+// its row count.
 folly::coro::Task<InvertedLoadState>
 LoadState(bool use_async,
           storage::FileSource& source,
@@ -384,6 +405,8 @@ LoadState(bool use_async,
     co_return result;
 }
 
+// Share initialized state with the reader; retain the directory only for
+// file-backed use.
 std::unique_ptr<IIndexReaderBase>
 MakeReader(const InvertedLoadState& state) {
     AssertInfo(state.directory != nullptr,
@@ -431,6 +454,9 @@ MakeReader(const InvertedLoadState& state) {
     }
 }
 
+/**
+ * @brief Per-load payload owners and decoding state, retained by IndexLoadPlan.
+ */
 struct PackedInvertedState {
     PackedDirectoryTargets targets;
     RuntimeParams runtime;
@@ -439,6 +465,33 @@ struct PackedInvertedState {
 };
 
 }  // namespace
+
+folly::coro::Task<std::unique_ptr<IndexLoader>>
+InvertedIndexLoader::Open(IndexOpenRequest request) {
+    return OpenIndexLoader(
+        std::move(request),
+        [](OpenedIndexInput input, storage::LoadOptions options)
+            -> folly::coro::Task<std::unique_ptr<IndexLoader>> {
+            auto loader = std::unique_ptr<InvertedIndexLoader>(
+                new InvertedIndexLoader(std::move(input), std::move(options)));
+            (void)DeriveCaps(loader->options_.params);
+            if (const auto* legacy =
+                    std::get_if<LegacyIndexSource>(&loader->input_)) {
+                (void)ReadPersistedEntries(*legacy->source);
+            }
+            co_return loader;
+        });
+}
+
+folly::coro::Task<IIndexReaderBasePtr>
+InvertedIndexLoader::Load(milvus::OpContext* context) {
+    if (auto* packed = std::get_if<PackedIndexSource>(&input_)) {
+        return RunPackedIndexLoad(
+            *packed, options_, &PlanPacked, &FinishPacked, context);
+    }
+    return RunLegacyLoad(
+        std::get<LegacyIndexSource>(input_), options_, &LoadLegacy, context);
+}
 
 ReaderCaps
 InvertedIndexLoader::DeriveCaps(const Config& index_meta) {
@@ -454,16 +507,10 @@ InvertedIndexLoader::DeriveCaps(const Config& index_meta) {
         });
 }
 
-IIndexReaderBasePtr
-InvertedIndexLoader::Open(storage::FileSource& source,
-                          const storage::LoadOptions& opts) {
-    return folly::coro::blockingWait(OpenAsync(source, opts, false));
-}
-
 folly::coro::Task<IIndexReaderBasePtr>
-InvertedIndexLoader::OpenAsync(storage::FileSource& source,
-                               const storage::LoadOptions& opts,
-                               bool use_async) {
+InvertedIndexLoader::LoadLegacy(storage::FileSource& source,
+                                const storage::LoadOptions& opts,
+                                bool use_async) {
     auto projection =
         PrepareJsonProjectedOpen(families::kInverted, source, opts);
     auto state = (co_await LoadState(
@@ -501,8 +548,7 @@ InvertedIndexLoader::PlanPacked(const storage::IndexEntryDirectory& directory,
 folly::coro::Task<IIndexReaderBasePtr>
 InvertedIndexLoader::FinishPacked(IndexLoadPlan& plan,
                                   const storage::LoadOptions& opts,
-                                  bool use_async,
-                                  folly::CancellationToken token) {
+                                  bool use_async) {
     const auto& state =
         std::any_cast<const std::shared_ptr<PackedInvertedState>&>(
             plan.load_context);

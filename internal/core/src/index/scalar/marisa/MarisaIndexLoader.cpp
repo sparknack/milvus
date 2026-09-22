@@ -14,16 +14,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "folly/CancellationToken.h"
-#include "folly/coro/Task.h"
 #include "folly/coro/WithCancellation.h"
 #include "storage/AsyncLoadExecutor.h"
 #include "storage/LocalFileIOPool.h"
 #include "common/OpContext.h"
-#include "storage/LocalFileIOPool.h"
-#include "folly/coro/BlockingWait.h"
-
 #include "index/scalar/marisa/MarisaIndexLoader.h"
+#include "index/IndexLoaderFactory.h"
+#include "index/PackedIndexLoad.h"
+#include "index/LegacyIndexLoad.h"
 #include "index/scalar/marisa/MarisaIndexParams.h"
 
 #include <algorithm>
@@ -67,11 +65,14 @@ constexpr uint32_t kCsrFormatVersion = 1;
 constexpr std::string_view kCsrFormatVersionMeta = "marisa_csr_format_version";
 constexpr std::string_view kCsrNumKeysMeta = "csr_num_keys";
 
+/** @brief Resolved local storage preferences for this load. */
 struct EffectiveLoadOptions {
     bool enable_mmap{false};
     std::string mmap_dir;
 };
 
+// Resolve explicit load options and legacy config fallbacks for local
+// staging.
 EffectiveLoadOptions
 ResolveLoadOptions(const storage::LoadOptions& opts) {
     EffectiveLoadOptions result;
@@ -100,6 +101,7 @@ using storage::LocalEntryGuard;
 
 using storage::FileDescriptorGuard;
 
+// Stage an entry and check size/alignment before allocating the typed vector.
 template <typename T>
 folly::coro::Task<std::shared_ptr<std::vector<T>>>
 ReadEntryVector(bool use_async,
@@ -171,6 +173,8 @@ ReadEntryVector(bool use_async,
         run_io());
 }
 
+// Map a nonempty local file with RAII rollback; zero bytes produce an empty
+// guard.
 storage::MappedRegionGuard
 MapReadOnly(const std::string& path, size_t size) {
     if (size == 0) {
@@ -196,6 +200,8 @@ MapReadOnly(const std::string& path, size_t size) {
     return {mapped, size};
 }
 
+// Open an already-staged trie in heap or mmap mode and translate MARISA
+// failures.
 std::shared_ptr<marisa::Trie>
 OpenTrie(const std::string& path, bool mmap_enabled) {
     auto trie = std::make_shared<marisa::Trie>();
@@ -225,19 +231,8 @@ OpenTrie(const std::string& path, bool mmap_enabled) {
         }
         return trie;
     } catch (const marisa::Exception& error) {
-        // A blanket DataFormatBroken here would report an allocation failure
-        // as permanently corrupt data, so the index scheduler gives up on an
-        // artifact that a retry would have loaded: MARISA_MEMORY_ERROR must
-        // stay MemAllocateFailed (retriable).
-        //
-        // MARISA_IO_ERROR, however, is NOT transient at this site. `path` is
-        // always a file this loader already materialised into its own staging
-        // directory (ReadEntryToLocalFile above); any object-storage failure
-        // was raised there. What reaches marisa is the artifact's own bytes,
-        // so "size_read <= 0" means a truncated/corrupt payload -- permanent.
-        // Hence DataFormatBroken for both the IO and the format/size arm.
-        // (Master passes FileReadFailed here because its call sites read the
-        // index file directly; the refactor's staging step removes that case.)
+        // Preserve allocation failures separately. Other MARISA failures use
+        // the staged-payload classification supplied to ClassifyMarisaError.
         ThrowInfo(
             ClassifyMarisaError(error, DataFormatBroken, DataFormatBroken),
             "invalid marisa trie entry: {}",
@@ -245,6 +240,8 @@ OpenTrie(const std::string& path, bool mmap_enabled) {
     }
 }
 
+// Check the uint32 row domain and every key ID, allowing the historical null
+// sentinel.
 void
 ValidateStrIds(const int64_t* str_ids, size_t count, size_t num_keys) {
     AssertInfo(count <= std::numeric_limits<uint32_t>::max(),
@@ -265,6 +262,7 @@ ValidateStrIds(const int64_t* str_ids, size_t count, size_t num_keys) {
     }
 }
 
+// Reconstruct key-to-row CSR from legacy row-to-key IDs, excluding null rows.
 void
 BuildCsr(const int64_t* str_ids,
          size_t count,
@@ -298,6 +296,8 @@ BuildCsr(const int64_t* str_ids,
     }
 }
 
+// Cross-check CSR ranges, ordered row IDs and coverage against the row-to-key
+// mapping.
 void
 ValidateCsr(const int64_t* str_ids,
             size_t count,
@@ -365,12 +365,15 @@ ValidateCsr(const int64_t* str_ids,
     }
 }
 
+/** @brief Presence and byte sizes of the packed key-to-row CSR sidecars. */
 struct CsrPresence {
     bool complete{false};
     size_t index_bytes{0};
     size_t offsets_bytes{0};
 };
 
+// Accumulate retained file bytes without overflowing the reader resource
+// estimate.
 void
 AddObservedBytes(size_t& total, size_t value) {
     if (value > std::numeric_limits<size_t>::max() - total) {
@@ -379,6 +382,8 @@ AddObservedBytes(size_t& total, size_t value) {
     total += value;
 }
 
+// Load a legacy trie and row IDs; rebuild CSR and retain staging only for
+// mmap readers.
 folly::coro::Task<std::shared_ptr<const MarisaIndexStorage>>
 LoadState(bool use_async,
           storage::FileSource& source,
@@ -552,6 +557,9 @@ LoadState(bool use_async,
     co_return storage;
 }
 
+/**
+ * @brief Per-load payload owners and decoding state, retained by IndexLoadPlan.
+ */
 struct PackedMarisaState {
     std::shared_ptr<storage::LocalDirectory> directory;
     EffectiveLoadOptions effective;
@@ -571,6 +579,8 @@ struct PackedMarisaState {
     std::shared_ptr<std::vector<uint32_t>> csr_offsets;
 };
 
+// Read nonnegative persisted integer metadata without accepting signed
+// wraparound.
 uint64_t
 ReadPackedMarisaInteger(const nlohmann::json& metadata, std::string_view key) {
     const auto found = metadata.find(key);
@@ -599,6 +609,29 @@ PlanMarisaVector(IndexLoadPlan& plan, const std::string& name, size_t bytes) {
 
 }  // namespace
 
+folly::coro::Task<std::unique_ptr<IndexLoader>>
+MarisaIndexLoader::Open(IndexOpenRequest request) {
+    return OpenIndexLoader(
+        std::move(request),
+        [](OpenedIndexInput input, storage::LoadOptions options)
+            -> folly::coro::Task<std::unique_ptr<IndexLoader>> {
+            auto loader = std::unique_ptr<MarisaIndexLoader>(
+                new MarisaIndexLoader(std::move(input), std::move(options)));
+            (void)DeriveCaps(loader->options_.params);
+            co_return loader;
+        });
+}
+
+folly::coro::Task<IIndexReaderBasePtr>
+MarisaIndexLoader::Load(milvus::OpContext* context) {
+    if (auto* packed = std::get_if<PackedIndexSource>(&input_)) {
+        return RunPackedIndexLoad(
+            *packed, options_, &PlanPacked, &FinishPacked, context);
+    }
+    return RunLegacyLoad(
+        std::get<LegacyIndexSource>(input_), options_, &LoadLegacy, context);
+}
+
 ReaderCaps
 MarisaIndexLoader::DeriveCaps(const Config& index_meta) {
     if (ParseNested(index_meta)) {
@@ -613,16 +646,10 @@ MarisaIndexLoader::DeriveCaps(const Config& index_meta) {
                                               .cheap_value_lookup = true});
 }
 
-IIndexReaderBasePtr
-MarisaIndexLoader::Open(storage::FileSource& source,
-                        const storage::LoadOptions& opts) {
-    return folly::coro::blockingWait(OpenAsync(source, opts, false));
-}
-
 folly::coro::Task<IIndexReaderBasePtr>
-MarisaIndexLoader::OpenAsync(storage::FileSource& source,
-                             const storage::LoadOptions& opts,
-                             bool use_async) {
+MarisaIndexLoader::LoadLegacy(storage::FileSource& source,
+                              const storage::LoadOptions& opts,
+                              bool use_async) {
     auto projection = PrepareJsonProjectedOpen(families::kMarisa, source, opts);
     auto storage = (co_await LoadState(use_async, source, opts));
     auto reader = std::make_unique<MarisaIndexReader>(std::move(storage));
@@ -760,8 +787,7 @@ MarisaIndexLoader::PlanPacked(const storage::IndexEntryDirectory& directory,
 folly::coro::Task<IIndexReaderBasePtr>
 MarisaIndexLoader::FinishPacked(IndexLoadPlan& plan,
                                 const storage::LoadOptions& opts,
-                                bool use_async,
-                                folly::CancellationToken token) {
+                                bool use_async) {
     const auto priority =
         opts.op_ctx && opts.op_ctx->runtime_load_priority.value_or(0) != 0
             ? proto::common::LoadPriority::LOW

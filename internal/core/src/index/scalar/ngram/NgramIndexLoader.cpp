@@ -14,16 +14,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "folly/CancellationToken.h"
-#include "folly/coro/Task.h"
 #include "folly/coro/WithCancellation.h"
 #include "storage/AsyncLoadExecutor.h"
 #include "storage/LocalFileIOPool.h"
 #include "common/OpContext.h"
-#include "storage/LocalFileIOPool.h"
-#include "folly/coro/BlockingWait.h"
-
 #include "index/scalar/ngram/NgramIndexLoader.h"
+#include "index/IndexLoaderFactory.h"
+#include "index/PackedIndexLoad.h"
+#include "index/LegacyIndexLoad.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -69,6 +67,7 @@ using ngram_params::Upper;
 constexpr std::string_view kAvgRowSizeEntry = "ngram_avg_row_size";
 constexpr size_t kDefaultAvgRowSize = 5000;
 
+// Reject element-domain input because NGRAM readers expose row coordinates.
 void
 ValidateRowDomain(const Config& params) {
     if (ReadNestedConfigParam(params, "NGRAM").value_or(false)) {
@@ -77,12 +76,17 @@ ValidateRowDomain(const Config& params) {
     }
 }
 
+/**
+ * @brief Normalized runtime field semantics used to interpret persisted data.
+ */
 struct RuntimeParams {
     DataType value_type{DataType::VARCHAR};
     uintptr_t min_gram{0};
     uintptr_t max_gram{0};
 };
 
+// Validate string/JSON-cast semantics, gram bounds and the supported Tantivy
+// version.
 RuntimeParams
 ParseRuntimeParams(const Config& params) {
     if (!params.is_object()) {
@@ -147,11 +151,14 @@ ParseRuntimeParams(const Config& params) {
     return result;
 }
 
+/** @brief Resolved local storage preferences for this load. */
 struct EffectiveLoadOptions {
     bool mmap{false};
     std::string directory_parent;
 };
 
+// Resolve explicit load options and legacy config fallbacks for local
+// staging.
 EffectiveLoadOptions
 ResolveLoadOptions(const storage::LoadOptions& opts) {
     EffectiveLoadOptions result;
@@ -169,12 +176,17 @@ ResolveLoadOptions(const storage::LoadOptions& opts) {
     return result;
 }
 
+/**
+ * @brief Validated legacy inventory separating engine files from null sidecars.
+ */
 struct PersistedEntries {
     std::vector<std::string> engine_files;
     bool has_null{false};
     bool has_avg{false};
 };
 
+// Validate logical entry names and separate engine files from sidecars; no
+// payload I/O.
 PersistedEntries
 ReadPersistedEntries(storage::FileSource& source) {
     PersistedEntries result;
@@ -206,6 +218,8 @@ using storage::LocalEntryGuard;
 
 using storage::FileDescriptorGuard;
 
+// Stage the null sidecar and validate its byte count before allocating the
+// offset vector.
 folly::coro::Task<std::shared_ptr<const std::vector<size_t>>>
 ReadNullOffsets(bool use_async,
                 const storage::LoadOptions& opts,
@@ -274,6 +288,8 @@ ReadNullOffsets(bool use_async,
         run_io());
 }
 
+// Read the native-size_t sidecar, using the historical default when it is
+// absent.
 folly::coro::Task<size_t>
 ReadAvgRowSize(bool use_async, storage::FileSource& source, bool has_avg) {
     if (!has_avg) {
@@ -291,6 +307,8 @@ ReadAvgRowSize(bool use_async, storage::FileSource& source, bool has_avg) {
     co_return result;
 }
 
+// Account for retained payload bytes with overflow checks, using local file
+// sizes.
 size_t
 MaterializedBytes(const std::vector<std::string>& paths,
                   bool ram_payload_only) {
@@ -317,6 +335,7 @@ MaterializedBytes(const std::vector<std::string>& paths,
     return total;
 }
 
+/** @brief Per-load Tantivy engine, sidecars and directory retained until reader creation. */
 struct NgramLoadState {
     // Declaration order makes the engine release before its backing directory.
     std::shared_ptr<storage::LocalDirectory> directory;
@@ -328,6 +347,8 @@ struct NgramLoadState {
     size_t engine_bytes{0};
 };
 
+// Open staged Tantivy files and collect gram, null and resource state for
+// reader creation.
 folly::coro::Task<NgramLoadState>
 LoadState(bool use_async,
           storage::FileSource& source,
@@ -421,6 +442,8 @@ LoadState(bool use_async,
     co_return result;
 }
 
+// Share initialized state with the reader; retain the directory only for
+// file-backed use.
 std::unique_ptr<IIndexReaderBase>
 MakeReader(const NgramLoadState& state) {
     AssertInfo(state.directory != nullptr,
@@ -440,6 +463,9 @@ MakeReader(const NgramLoadState& state) {
         state.engine_bytes);
 }
 
+/**
+ * @brief Per-load payload owners and decoding state, retained by IndexLoadPlan.
+ */
 struct PackedNgramState {
     PackedDirectoryTargets targets;
     RuntimeParams runtime;
@@ -450,6 +476,33 @@ struct PackedNgramState {
 
 }  // namespace
 
+folly::coro::Task<std::unique_ptr<IndexLoader>>
+NgramIndexLoader::Open(IndexOpenRequest request) {
+    return OpenIndexLoader(
+        std::move(request),
+        [](OpenedIndexInput input, storage::LoadOptions options)
+            -> folly::coro::Task<std::unique_ptr<IndexLoader>> {
+            auto loader = std::unique_ptr<NgramIndexLoader>(
+                new NgramIndexLoader(std::move(input), std::move(options)));
+            (void)DeriveCaps(loader->options_.params);
+            if (const auto* legacy =
+                    std::get_if<LegacyIndexSource>(&loader->input_)) {
+                (void)ReadPersistedEntries(*legacy->source);
+            }
+            co_return loader;
+        });
+}
+
+folly::coro::Task<IIndexReaderBasePtr>
+NgramIndexLoader::Load(milvus::OpContext* context) {
+    if (auto* packed = std::get_if<PackedIndexSource>(&input_)) {
+        return RunPackedIndexLoad(
+            *packed, options_, &PlanPacked, &FinishPacked, context);
+    }
+    return RunLegacyLoad(
+        std::get<LegacyIndexSource>(input_), options_, &LoadLegacy, context);
+}
+
 ReaderCaps
 NgramIndexLoader::DeriveCaps(const Config& index_meta) {
     static_cast<void>(ParseRuntimeParams(index_meta));
@@ -459,16 +512,10 @@ NgramIndexLoader::DeriveCaps(const Config& index_meta) {
         ReaderCaps{.ngram_candidates = true, .exact = false});
 }
 
-IIndexReaderBasePtr
-NgramIndexLoader::Open(storage::FileSource& source,
-                       const storage::LoadOptions& opts) {
-    return folly::coro::blockingWait(OpenAsync(source, opts, false));
-}
-
 folly::coro::Task<IIndexReaderBasePtr>
-NgramIndexLoader::OpenAsync(storage::FileSource& source,
-                            const storage::LoadOptions& opts,
-                            bool use_async) {
+NgramIndexLoader::LoadLegacy(storage::FileSource& source,
+                             const storage::LoadOptions& opts,
+                             bool use_async) {
     auto projection = PrepareJsonProjectedOpen(families::kNgram, source, opts);
     auto state = (co_await LoadState(
         use_async, source, opts, ParseRuntimeParams(opts.params)));
@@ -517,8 +564,7 @@ NgramIndexLoader::PlanPacked(const storage::IndexEntryDirectory& directory,
 folly::coro::Task<IIndexReaderBasePtr>
 NgramIndexLoader::FinishPacked(IndexLoadPlan& plan,
                                const storage::LoadOptions& opts,
-                               bool use_async,
-                               folly::CancellationToken token) {
+                               bool use_async) {
     const auto& state = std::any_cast<const std::shared_ptr<PackedNgramState>&>(
         plan.load_context);
     AssertInfo(state != nullptr, "Ngram packed load context is null");

@@ -17,10 +17,11 @@
 #include "common/OpContext.h"
 #include "storage/LocalFileIOPool.h"
 #include "index/vector/VectorDiskLoader.h"
+#include "index/IndexLoaderFactory.h"
+#include "index/LegacyIndexLoad.h"
 #include "index/vector/VectorLoadUtils.h"
 
 #include <cstdint>
-#include "folly/coro/BlockingWait.h"
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -63,6 +64,7 @@ using vector_load_params::ValidateLoadedShape;
 constexpr const char* kEnableDiskMmap = "enable_disk_mmap";
 constexpr uint32_t kDefaultBeamwidth = 8;
 
+// Range-check a normalized integer before narrowing to a disk-backend option.
 uint32_t
 ParseUint32(const nlohmann::json& value, std::string_view key) {
     const auto parsed =
@@ -79,11 +81,16 @@ ParseUint32(const nlohmann::json& value, std::string_view key) {
 
 using RuntimeParams = NormalizedLoadMetadata;
 
+/**
+ * @brief Validated disk-backend initialization knobs, separate from transport.
+ */
 struct DiskOpenOptions {
     uint32_t beamwidth{kDefaultBeamwidth};
     std::optional<int32_t> load_threads;
 };
 
+// Validate DiskANN-specific initialization settings; other backends use
+// defaults.
 DiskOpenOptions
 ParseOpenOptions(const Config& params, const RuntimeParams& runtime) {
     DiskOpenOptions result;
@@ -104,6 +111,7 @@ ParseOpenOptions(const Config& params, const RuntimeParams& runtime) {
     return result;
 }
 
+// Require disk-load routing and normalize vector shape metadata.
 RuntimeParams
 ParseDiskLoadMetadata(const Config& params) {
     auto result = ParseNormalizedLoadMetadata(params, LoadBackend::Disk);
@@ -116,6 +124,7 @@ ParseDiskLoadMetadata(const Config& params) {
     return result;
 }
 
+// Combine disk-load metadata with validity-map mmap preferences.
 RuntimeParams
 ParseRuntimeParams(const Config& params) {
     auto result = ParseDiskLoadMetadata(params);
@@ -123,6 +132,9 @@ ParseRuntimeParams(const Config& params) {
     return result;
 }
 
+/**
+ * @brief Validated inventory and empty-index state; owns names, not payloads.
+ */
 struct EntryPlan {
     ArtifactState state{ArtifactState::Normal};
     std::vector<std::string> engine_names;
@@ -130,6 +142,8 @@ struct EntryPlan {
     bool has_empty_offsets{false};
 };
 
+// Classify engine and sidecar inventory, including all-null and empty
+// embedding-list artifacts.
 EntryPlan
 PlanEntries(storage::FileSource& source, const RuntimeParams& params) {
     EntryPlan plan;
@@ -233,6 +247,7 @@ RestoreValidity(bool use_async,
 
 using detail::EmptyEmbeddingListState;
 
+// Validate the persisted empty-list dimension and all-zero offset prefix sum.
 EmptyEmbeddingListState
 DecodeEmptyEmbeddingListBytes(const std::vector<uint8_t>& bytes) {
     constexpr auto header_size = detail::kEmptyEmbeddingListHeaderSize;
@@ -255,6 +270,8 @@ DecodeEmptyEmbeddingList(bool use_async, storage::FileSource& source) {
         co_await source.ReadEntryAsync(EMPTY_EMB_LIST_OFFSETS_KEY, use_async));
 }
 
+// Replace caller path/mmap settings with the selected backend generation
+// settings.
 void
 PrepareCommonLoadConfig(Config& config,
                         const RuntimeParams& params,
@@ -280,6 +297,8 @@ PrepareCommonLoadConfig(Config& config,
     config[DISK_ANN_THREADS_NUM] = *open_options.load_threads;
 }
 
+// Create the backend mmap prefix, reporting filesystem failures before
+// deserialization.
 void
 EnsureMmapDirectory(const std::string& path) {
     std::error_code error;
@@ -292,6 +311,7 @@ EnsureMmapDirectory(const std::string& path) {
     }
 }
 
+// Preserve the Knowhere status category while adding deserialization context.
 [[noreturn]] void
 ThrowDeserializeError(knowhere::Status status) {
     ThrowInfo(KnowhereStatusToErrorCode(status),
@@ -300,6 +320,8 @@ ThrowDeserializeError(knowhere::Status status) {
               knowhere::Status2String(status));
 }
 
+// Construct Knowhere with the file handle retained as the backing-resource
+// owner.
 KnowhereEngine
 MakeEngine(const RuntimeParams& params,
            const std::shared_ptr<storage::DiskEngineFileHandle>& handle) {
@@ -315,6 +337,8 @@ MakeEngine(const RuntimeParams& params,
                           true);
 }
 
+// Select streaming or materialized engine input, restore sidecars and
+// deserialize one reader.
 folly::coro::Task<std::unique_ptr<IIndexReaderBase>>
 OpenIndex(bool use_async,
           storage::FileSource& source,
@@ -485,6 +509,33 @@ OpenIndex(bool use_async,
 
 }  // namespace
 
+folly::coro::Task<std::unique_ptr<IndexLoader>>
+VectorDiskLoader::Open(IndexOpenRequest request) {
+    return OpenIndexLoader(
+        std::move(request),
+        [](OpenedIndexInput input, storage::LoadOptions options)
+            -> folly::coro::Task<std::unique_ptr<IndexLoader>> {
+            (void)DeriveCaps(options.params);
+            if (!std::holds_alternative<LegacyIndexSource>(input)) {
+                ThrowInfo(Unsupported,
+                          "vector indexes have no V3 persisted format");
+            }
+            auto loader =
+                std::unique_ptr<VectorDiskLoader>(new VectorDiskLoader(
+                    std::get<LegacyIndexSource>(std::move(input)),
+                    std::move(options)));
+            const auto runtime = ParseRuntimeParams(loader->options_.params);
+            (void)ParseOpenOptions(loader->options_.params, runtime);
+            (void)PlanEntries(*loader->input_.source, runtime);
+            co_return loader;
+        });
+}
+
+folly::coro::Task<IIndexReaderBasePtr>
+VectorDiskLoader::Load(milvus::OpContext* context) {
+    return RunLegacyLoad(input_, options_, &LoadLegacy, context);
+}
+
 ReaderCaps
 VectorDiskLoader::DeriveCaps(const Config& index_meta) {
     (void)ParseRuntimeParams(index_meta);
@@ -494,9 +545,9 @@ VectorDiskLoader::DeriveCaps(const Config& index_meta) {
 }
 
 folly::coro::Task<IIndexReaderBasePtr>
-VectorDiskLoader::OpenImpl(bool use_async,
-                           storage::FileSource& source,
-                           const storage::LoadOptions& opts) {
+VectorDiskLoader::LoadLegacy(storage::FileSource& source,
+                             const storage::LoadOptions& opts,
+                             bool use_async) {
     auto params = ParseDiskLoadMetadata(opts.params);
     const auto open_options = ParseOpenOptions(opts.params, params);
     ParseIdMapMmapMetadata(opts.params, params);
@@ -530,18 +581,6 @@ VectorDiskLoader::AsyncEntryNames(storage::FileSource& source,
         names.emplace_back(EMPTY_EMB_LIST_OFFSETS_KEY);
     }
     return names;
-}
-
-IIndexReaderBasePtr
-VectorDiskLoader::Open(storage::FileSource& source,
-                       const storage::LoadOptions& opts) {
-    return folly::coro::blockingWait(OpenImpl(false, source, opts));
-}
-
-folly::coro::Task<IIndexReaderBasePtr>
-VectorDiskLoader::OpenAsync(storage::FileSource& source,
-                            const storage::LoadOptions& opts) {
-    return OpenImpl(true, source, opts);
 }
 
 }  // namespace milvus::index

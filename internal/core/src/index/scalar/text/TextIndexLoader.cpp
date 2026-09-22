@@ -14,16 +14,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "folly/CancellationToken.h"
-#include "folly/coro/Task.h"
 #include "folly/coro/WithCancellation.h"
 #include "storage/AsyncLoadExecutor.h"
 #include "storage/LocalFileIOPool.h"
 #include "common/OpContext.h"
-#include "storage/LocalFileIOPool.h"
-#include "folly/coro/BlockingWait.h"
-
 #include "index/scalar/text/TextIndexLoader.h"
+#include "index/IndexLoaderFactory.h"
+#include "index/PackedIndexLoad.h"
+#include "index/LegacyIndexLoad.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -56,6 +54,7 @@
 namespace milvus::index {
 namespace {
 
+// Require an explicit row domain; text readers cannot address array elements.
 bool
 ReadRequiredRowDomain(const Config& params) {
     if (ReadRequiredNestedParam(params, "text loader")) {
@@ -65,6 +64,9 @@ ReadRequiredRowDomain(const Config& params) {
     return false;
 }
 
+/**
+ * @brief Normalized runtime field semantics used to interpret persisted data.
+ */
 struct RuntimeParams {
     DataType value_type{DataType::NONE};
     std::string analyzer_name;
@@ -72,11 +74,14 @@ struct RuntimeParams {
     std::string analyzer_extra_info;
 };
 
+// Validate string input and resolve analyzer settings required by the loaded
+// engine.
 RuntimeParams
 ParseRuntimeParams(const Config& params) {
     if (!params.is_object()) {
         ThrowInfo(DataTypeInvalid, "text load parameters must be an object");
     }
+
     static_cast<void>(ReadRequiredRowDomain(params));
     const auto field_type =
         ReadDataTypeParam(params, "field_type").value_or(DataType::NONE);
@@ -108,11 +113,14 @@ ParseRuntimeParams(const Config& params) {
     return result;
 }
 
+/** @brief Resolved local storage preferences for this load. */
 struct EffectiveLoadOptions {
     bool file_backed{false};
     std::string directory_parent;
 };
 
+// Resolve explicit load options and legacy config fallbacks for local
+// staging.
 EffectiveLoadOptions
 ResolveLoadOptions(const storage::LoadOptions& opts) {
     EffectiveLoadOptions result;
@@ -131,11 +139,16 @@ ResolveLoadOptions(const storage::LoadOptions& opts) {
     return result;
 }
 
+/**
+ * @brief Validated legacy inventory separating engine files from null sidecars.
+ */
 struct PersistedEntries {
     std::vector<std::string> engine_files;
     bool has_null{false};
 };
 
+// Validate logical entry names and separate engine files from sidecars; no
+// payload I/O.
 PersistedEntries
 ReadPersistedEntries(storage::FileSource& source) {
     PersistedEntries result;
@@ -163,6 +176,8 @@ using storage::LocalEntryGuard;
 
 using storage::FileDescriptorGuard;
 
+// Require strictly increasing, unique null row IDs within the engine row
+// count.
 void
 ValidateNullOffsets(const std::vector<size_t>& offsets, size_t count) {
     size_t previous = 0;
@@ -179,6 +194,8 @@ ValidateNullOffsets(const std::vector<size_t>& offsets, size_t count) {
     }
 }
 
+// Stage the null sidecar and validate its byte count before allocating the
+// offset vector.
 folly::coro::Task<std::shared_ptr<const std::vector<size_t>>>
 ReadNullOffsets(bool use_async,
                 const storage::LoadOptions& opts,
@@ -255,6 +272,10 @@ ReadNullOffsets(bool use_async,
         run_io());
 }
 
+/**
+ * @brief Own the initialized engine and its backing directory until reader
+ * creation.
+ */
 struct TextLoadState {
     // Declaration order makes the engine release before the final directory
     // owner on every success and exception path.
@@ -267,6 +288,8 @@ struct TextLoadState {
     size_t payload_bytes{0};
 };
 
+// Open staged Tantivy files, register the analyzer and validate null rows
+// before reader creation.
 folly::coro::Task<TextLoadState>
 LoadState(bool use_async,
           storage::FileSource& source,
@@ -367,6 +390,8 @@ LoadState(bool use_async,
     co_return result;
 }
 
+// Share initialized state with the reader; retain the directory only for
+// file-backed use.
 std::unique_ptr<IIndexReaderBase>
 MakeReader(const TextLoadState& state) {
     AssertInfo(state.directory != nullptr,
@@ -385,6 +410,9 @@ MakeReader(const TextLoadState& state) {
         state.payload_bytes);
 }
 
+/**
+ * @brief Per-load payload owners and decoding state, retained by IndexLoadPlan.
+ */
 struct PackedTextState {
     PackedDirectoryTargets targets;
     RuntimeParams runtime;
@@ -393,22 +421,43 @@ struct PackedTextState {
 
 }  // namespace
 
+folly::coro::Task<std::unique_ptr<IndexLoader>>
+TextIndexLoader::Open(IndexOpenRequest request) {
+    return OpenIndexLoader(
+        std::move(request),
+        [](OpenedIndexInput input, storage::LoadOptions options)
+            -> folly::coro::Task<std::unique_ptr<IndexLoader>> {
+            auto loader = std::unique_ptr<TextIndexLoader>(
+                new TextIndexLoader(std::move(input), std::move(options)));
+            (void)DeriveCaps(loader->options_.params);
+            if (const auto* legacy =
+                    std::get_if<LegacyIndexSource>(&loader->input_)) {
+                (void)ReadPersistedEntries(*legacy->source);
+            }
+            co_return loader;
+        });
+}
+
+folly::coro::Task<IIndexReaderBasePtr>
+TextIndexLoader::Load(milvus::OpContext* context) {
+    if (auto* packed = std::get_if<PackedIndexSource>(&input_)) {
+        return RunPackedIndexLoad(
+            *packed, options_, &PlanPacked, &FinishPacked, context);
+    }
+    return RunLegacyLoad(
+        std::get<LegacyIndexSource>(input_), options_, &LoadLegacy, context);
+}
+
 ReaderCaps
 TextIndexLoader::DeriveCaps(const Config& index_meta) {
     static_cast<void>(ParseRuntimeParams(index_meta));
     return ReaderCaps{.text_match = true};
 }
 
-IIndexReaderBasePtr
-TextIndexLoader::Open(storage::FileSource& source,
-                      const storage::LoadOptions& opts) {
-    return folly::coro::blockingWait(OpenAsync(source, opts, false));
-}
-
 folly::coro::Task<IIndexReaderBasePtr>
-TextIndexLoader::OpenAsync(storage::FileSource& source,
-                           const storage::LoadOptions& opts,
-                           bool use_async) {
+TextIndexLoader::LoadLegacy(storage::FileSource& source,
+                            const storage::LoadOptions& opts,
+                            bool use_async) {
     auto state = (co_await LoadState(
         use_async, source, opts, ParseRuntimeParams(opts.params)));
     co_return MakeReader(state);
@@ -438,8 +487,7 @@ TextIndexLoader::PlanPacked(const storage::IndexEntryDirectory& directory,
 folly::coro::Task<IIndexReaderBasePtr>
 TextIndexLoader::FinishPacked(IndexLoadPlan& plan,
                               const storage::LoadOptions& opts,
-                              bool use_async,
-                              folly::CancellationToken token) {
+                              bool use_async) {
     const auto& state = std::any_cast<const std::shared_ptr<PackedTextState>&>(
         plan.load_context);
     AssertInfo(state != nullptr, "Text packed load context is null");

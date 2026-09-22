@@ -50,11 +50,13 @@ constexpr std::string_view kComplete = "complete";
 constexpr std::string_view kLegacyUnknown = "legacy_unknown";
 constexpr std::string_view kHasNonExistMeta = "has_non_exist";
 
+/** @brief Validated JSON path and cast used to decorate a scalar reader. */
 struct ProjectedParams {
     std::string json_path;
     JsonCastType cast_type;
 };
 
+/** @brief Completeness evidence read from inventory/metadata, before sidecar loading. */
 struct ObservedCompleteness {
     JsonProjectionCompleteness completeness{
         JsonProjectionCompleteness::LegacyUnknown};
@@ -62,6 +64,8 @@ struct ObservedCompleteness {
     std::optional<size_t> declared_non_exist_bytes;
 };
 
+// Detect JSON candidates in textual or numeric input before strict normalized
+// parsing.
 bool
 IsJsonFieldType(const Config& params) {
     if (!params.is_object() || !params.contains("field_type")) {
@@ -81,6 +85,8 @@ IsJsonFieldType(const Config& params) {
     return false;
 }
 
+// Read a normalized numeric type or use the fallback only when the key is
+// absent.
 DataType
 ParseNormalizedDataType(const Config& params,
                         std::string_view key,
@@ -122,6 +128,8 @@ ParseNormalizedDataType(const Config& params,
     return static_cast<DataType>(static_cast<int32_t>(encoded));
 }
 
+// Require a string parameter and report missing/type errors with the
+// parameter name.
 std::string
 ParseString(const Config& params, std::string_view key) {
     try {
@@ -134,6 +142,7 @@ ParseString(const Config& params, std::string_view key) {
     }
 }
 
+// Require an actual boolean; do not coerce numeric or textual values.
 bool
 ParseNormalizedBool(const Config& params, std::string_view key) {
     try {
@@ -151,6 +160,7 @@ ParseNormalizedBool(const Config& params, std::string_view key) {
     }
 }
 
+// Accept only the scalar/array cast types supported by typed JSON projection.
 JsonCastType
 ParseCastType(const Config& params) {
     if (!params.contains(JSON_CAST_TYPE)) {
@@ -167,6 +177,8 @@ ParseCastType(const Config& params) {
     return JsonCastType::FromString(text);
 }
 
+// Check the cast against the selected family, including HYBRID family
+// restrictions.
 void
 ValidateFamilyCast(std::string_view family,
                    const Config& params,
@@ -216,6 +228,7 @@ ValidateFamilyCast(std::string_view family,
     }
 }
 
+// Validate JSON projection parameters; return nullopt for non-JSON inputs.
 std::optional<ProjectedParams>
 ParseProjectedParams(std::string_view family, const Config& params) {
     if (!IsJsonFieldType(params)) {
@@ -289,6 +302,8 @@ ParseProjectedParams(std::string_view family, const Config& params) {
     return ProjectedParams{std::move(path), cast_type};
 }
 
+// A legacy non-exist sidecar proves completeness; its absence leaves
+// completeness unknown.
 ObservedCompleteness
 InspectCompleteness(storage::FileSource& source) {
     ObservedCompleteness result;
@@ -300,6 +315,8 @@ InspectCompleteness(storage::FileSource& source) {
     return result;
 }
 
+// Cross-check packed completeness metadata with sidecar presence and declared
+// size.
 ObservedCompleteness
 InspectPackedCompleteness(const storage::IndexEntryDirectory& directory,
                           const nlohmann::json& metadata) {
@@ -332,6 +349,7 @@ InspectPackedCompleteness(const storage::IndexEntryDirectory& directory,
     return result;
 }
 
+// Require a recognized runtime annotation produced during cold-load planning.
 JsonProjectionCompleteness
 ReadAnnotation(const Config& params) {
     AssertInfo(params.contains(kCompletenessRuntimeKey),
@@ -349,8 +367,10 @@ ReadAnnotation(const Config& params) {
     AssertInfo(false, "typed JSON completeness annotation is invalid");
 }
 
+/** @brief Remove temporary JSON sidecars when their per-load owner is released. */
 class StagingDirectory final {
  public:
+    // Create an owned child under the configured parent or system temp directory.
     static StagingDirectory
     Create(const std::string& parent) {
         std::error_code error;
@@ -413,6 +433,8 @@ class StagingDirectory final {
 
 using storage::FileDescriptorGuard;
 
+// Stage and size-check the sidecar against the reader row count before heap
+// allocation.
 folly::coro::Task<std::vector<size_t>>
 ReadNonExistOffsets(bool use_async,
                     const JsonProjectedOpenPlan& plan,

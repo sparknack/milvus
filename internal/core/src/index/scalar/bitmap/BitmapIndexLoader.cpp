@@ -14,12 +14,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "folly/CancellationToken.h"
-#include "folly/coro/Task.h"
 #include "storage/LocalFileIOPool.h"
-#include "folly/coro/BlockingWait.h"
-
 #include "index/scalar/bitmap/BitmapIndexLoader.h"
+#include "index/IndexLoaderFactory.h"
+#include "index/PackedIndexLoad.h"
+#include "index/LegacyIndexLoad.h"
 
 #include <bit>
 #include <cerrno>
@@ -37,20 +36,19 @@
 #include <utility>
 #include <vector>
 
+#include <folly/ScopeGuard.h>
+#include <folly/coro/CurrentExecutor.h>
 #include <yaml-cpp/yaml.h>
-#include "folly/ScopeGuard.h"
-#include "folly/coro/BlockingWait.h"
-#include "folly/coro/CurrentExecutor.h"
-#include "folly/coro/WithCancellation.h"
-#include "common/OpContext.h"
-#include "storage/FileWriter.h"
-#include "storage/EntryStreamUtils.h"
 
 #include "index/ParamUtils.h"
 #include "index/IndexLoadUtils.h"
 #include "common/Consts.h"
 #include "common/EasyAssert.h"
 #include "storage/artifact/FileSourceUtils.h"
+#include "storage/FileWriter.h"
+#include "storage/EntryStreamUtils.h"
+#include "folly/coro/WithCancellation.h"
+#include "common/OpContext.h"
 #include "storage/artifact/LocalFileUtils.h"
 #include "index/Families.h"
 #include "index/Meta.h"
@@ -71,6 +69,9 @@ constexpr uint64_t kMaxCoordinateCount =
 constexpr std::string_view kLegacyNestedKey = "is_nested_index";
 constexpr std::string_view kV3NestedKey = "is_nested";
 
+/**
+ * @brief Normalized runtime field semantics used to interpret persisted data.
+ */
 struct RuntimeParams {
     DataType field_type{DataType::NONE};
     DataType value_type{DataType::NONE};
@@ -80,6 +81,7 @@ struct RuntimeParams {
     bool offset_cache{false};
 };
 
+// Resolve the value type and row/element domain used by posting decoding.
 RuntimeParams
 ParseRuntimeParams(const Config& params) {
     RuntimeParams result;
@@ -112,6 +114,7 @@ ParseRuntimeParams(const Config& params) {
     return result;
 }
 
+/** @brief Persisted posting/coordinate counts and optional legacy nesting metadata. */
 struct BitmapMeta {
     size_t index_length{0};
     size_t count{0};
@@ -119,6 +122,8 @@ struct BitmapMeta {
     bool has_nested{false};
 };
 
+// Accept legacy JSON or YAML metadata; YAML is a fallback only for JSON
+// syntax errors.
 BitmapMeta
 ParseLegacyMeta(const std::vector<uint8_t>& encoded) {
     const std::string text(encoded.begin(), encoded.end());
@@ -156,12 +161,16 @@ ParseLegacyMeta(const std::vector<uint8_t>& encoded) {
     }
 }
 
+// Read the metadata entry with the selected transport; leave postings
+// unopened.
 folly::coro::Task<BitmapMeta>
 ReadMeta(bool use_async, storage::FileSource& source) {
     co_return ParseLegacyMeta(
         co_await source.ReadEntryAsync(BITMAP_INDEX_META, use_async));
 }
 
+// Check the coordinate domain and posting-count bounds before payload
+// allocation.
 void
 ValidateMeta(const BitmapMeta& meta, const RuntimeParams& params) {
     if (meta.count > kMaxCoordinateCount ||
@@ -187,6 +196,7 @@ PackedValidityBytes(size_t count) {
     return count / 8 + static_cast<size_t>(count % 8 != 0);
 }
 
+// Decode a byte-packed validity bitmap after checking its exact length.
 TargetBitmap
 DecodeValidity(const std::vector<uint8_t>& encoded, size_t count) {
     const auto expected = PackedValidityBytes(count);
@@ -205,6 +215,8 @@ DecodeValidity(const std::vector<uint8_t>& encoded, size_t count) {
     return result;
 }
 
+// Expand a posting into the declared coordinate domain, rejecting
+// out-of-range IDs.
 TargetBitmap
 ToBitset(const roaring::Roaring& posting, size_t count) {
     TargetBitmap result(count, false);
@@ -220,6 +232,8 @@ ToBitset(const roaring::Roaring& posting, size_t count) {
     return result;
 }
 
+// Consume one native-layout key, advancing cursor only within the supplied
+// payload.
 template <typename T>
 T
 ReadKey(const uint8_t*& cursor, const uint8_t* end) {
@@ -250,6 +264,7 @@ ReadKey(const uint8_t*& cursor, const uint8_t* end) {
     }
 }
 
+// Consume one portable Roaring posting and check its coordinate bounds.
 template <typename T>
 roaring::Roaring
 ReadPosting(const uint8_t*& cursor,
@@ -290,6 +305,8 @@ ReadPosting(const uint8_t*& cursor,
     return posting;
 }
 
+// Decode exactly index_length distinct keys; reject truncation and trailing
+// bytes.
 template <typename T>
 BitmapRoaringPostingMap<T>
 DecodePostings(const uint8_t* data,
@@ -326,6 +343,7 @@ DecodePostings(const uint8_t* data,
     return postings;
 }
 
+// Reject overlapping postings when each coordinate may have only one value.
 template <typename T>
 void
 ValidateCoordinateOwnership(const BitmapRoaringPostingMap<T>& postings,
@@ -344,6 +362,7 @@ ValidateCoordinateOwnership(const BitmapRoaringPostingMap<T>& postings,
     }
 }
 
+/** @brief Close and unlink a temporary payload until ownership is released. */
 class TemporaryFileGuard {
  public:
     explicit TemporaryFileGuard(std::string path) : path_(std::move(path)) {
@@ -426,6 +445,7 @@ class TemporaryFileGuard {
     int fd_{-1};
 };
 
+// Create an owned staging file; the guard closes and removes it on failure.
 TemporaryFileGuard
 CreateTemporaryFile(const std::string& directory, std::string_view prefix) {
     if (directory.empty()) {
@@ -446,6 +466,7 @@ CreateTemporaryFile(const std::string& directory, std::string_view prefix) {
     return file;
 }
 
+// Round a frozen posting up to its mmap alignment without overflowing size_t.
 size_t
 AlignFrozenSize(size_t size) {
     if (size > std::numeric_limits<size_t>::max() - (kFrozenAlignment - 1)) {
@@ -454,6 +475,7 @@ AlignFrozenSize(size_t size) {
     return (size + kFrozenAlignment - 1) & ~(kFrozenAlignment - 1);
 }
 
+/** @brief Frozen posting views paired with the mapping that keeps them valid. */
 template <typename T>
 struct FrozenPostings {
     // Declared first so the posting views are destroyed before their mapping.
@@ -461,6 +483,8 @@ struct FrozenPostings {
     BitmapRoaringPostingMap<T> postings;
 };
 
+// Map the frozen file and transfer its lifetime to the owner backing posting
+// views.
 std::shared_ptr<BitmapMmapOwner>
 FinishFrozenFile(TemporaryFileGuard file, size_t file_size) {
     AssertInfo(file_size != 0,
@@ -495,6 +519,8 @@ FinishFrozenFile(TemporaryFileGuard file, size_t file_size) {
     return owner;
 }
 
+// Convert portable postings into an aligned frozen file, decoding one posting
+// at a time.
 template <typename T>
 folly::coro::Task<FrozenPostings<T>>
 DecodeFrozenPostings(const uint8_t* data,
@@ -641,6 +667,8 @@ DecodeFrozenPostings(const uint8_t* data,
     co_return result;
 }
 
+// Recover validity from posting membership when the artifact has no validity
+// sidecar.
 template <typename T>
 void
 RebuildValidity(const BitmapRoaringPostingMap<T>& postings,
@@ -664,6 +692,8 @@ MakeReaderOptions(TargetBitmap validity,
                                .offset_cache = params.offset_cache};
 }
 
+// Validate decoded postings, rebuild missing validity and create the selected
+// heap layout.
 template <typename T>
 std::unique_ptr<IIndexReaderBase>
 OpenDecodedState(const uint8_t* data,
@@ -693,6 +723,7 @@ OpenDecodedState(const uint8_t* data,
                                       std::move(options));
 }
 
+// Build a reader whose frozen posting views retain the mapped-file owner.
 template <typename T>
 folly::coro::Task<std::unique_ptr<IIndexReaderBase>>
 OpenDecodedMmapState(const uint8_t* data,
@@ -720,6 +751,8 @@ OpenDecodedMmapState(const uint8_t* data,
                                          std::move(frozen.owner));
 }
 
+// Dispatch supported persisted key types without converting their payload
+// representation.
 template <typename Result, typename F>
 Result
 DispatchBitmapType(DataType value_type, F&& fn) {
@@ -795,25 +828,15 @@ DispatchMmapOpen(DataType value_type,
         });
 }
 
+// Load legacy payloads; mmap mode stages portable bytes before producing
+// frozen views.
 folly::coro::Task<std::unique_ptr<IIndexReaderBase>>
 LoadBitmapPayload(bool use_async,
                   storage::FileSource& source,
                   const storage::LoadOptions& opts,
-                  const RuntimeParams& params) {
-    auto meta = (co_await ReadMeta(use_async, source));
-    if (meta.has_nested && meta.nested != params.nested) {
-        ThrowInfo(DataFormatBroken,
-                  "bitmap persisted nested value {} disagrees with runtime "
-                  "value {}",
-                  meta.nested,
-                  params.nested);
-    }
-    // Old artifacts may lack this metadata. The adapter-supplied runtime
-    // value is mandatory, so capability derivation and opening still use the
-    // same coordinate domain without eagerly reading artifact metadata.
-    meta.nested = params.nested;
-    ValidateMeta(meta, params);
-
+                  const RuntimeParams& params,
+                  const BitmapMeta& meta,
+                  BitmapLayout layout) {
     TargetBitmap validity(meta.count, meta.nested || !params.nullable);
     bool rebuild_validity = params.nullable && !meta.nested;
     if (source.HasEntry(BITMAP_INDEX_VALID_BITSET)) {
@@ -823,11 +846,6 @@ LoadBitmapPayload(bool use_async,
         rebuild_validity = false;
     }
 
-    const auto layout =
-        meta.index_length <=
-                static_cast<size_t>(DEFAULT_BITMAP_INDEX_BUILD_MODE_BOUND)
-            ? BitmapLayout::Bitset
-            : BitmapLayout::Roaring;
     if (opts.enable_mmap && layout == BitmapLayout::Roaring) {
         const auto priority =
             opts.op_ctx && opts.op_ctx->runtime_load_priority.value_or(0) != 0
@@ -938,7 +956,11 @@ LoadBitmapPayload(bool use_async,
                            layout);
 }
 
+/**
+ * @brief Per-load payload owners and decoding state, retained by IndexLoadPlan.
+ */
 struct PackedBitmapState {
+    folly::CancellationToken cancellation_token;
     RuntimeParams params;
     BitmapMeta meta;
     BitmapLayout layout;
@@ -950,6 +972,146 @@ struct PackedBitmapState {
 };
 
 }  // namespace
+
+/** @brief Validated metadata reused by Load; no reader or payload ownership. */
+struct BitmapIndexLoader::OpenedState {
+    RuntimeParams params;
+    BitmapMeta meta;
+    BitmapLayout layout;
+};
+
+BitmapIndexLoader::BitmapIndexLoader(OpenedIndexInput input,
+                                     storage::LoadOptions options)
+    : input_(std::move(input)), options_(std::move(options)) {
+}
+
+BitmapIndexLoader::~BitmapIndexLoader() = default;
+
+BitmapIndexLoader::OpenedState
+BitmapIndexLoader::ParsePackedState(
+    const storage::IndexEntryDirectory& directory,
+    const nlohmann::json& metadata,
+    const storage::LoadOptions& options) {
+    OpenedState state;
+    state.params = ParseRuntimeParams(options.params);
+    const auto& params = state.params;
+    if (params.value_type == DataType::NONE ||
+        params.value_type == DataType::ARRAY) {
+        ThrowInfo(DataTypeInvalid,
+                  "bitmap loader requires value_type or array_element_type");
+    }
+    auto& meta = state.meta;
+    meta.index_length =
+        ReadRequiredIndexMeta<size_t>(metadata, BITMAP_INDEX_LENGTH);
+    meta.count = ReadRequiredIndexMeta<size_t>(metadata, BITMAP_INDEX_NUM_ROWS);
+    meta.has_nested = metadata.contains(kV3NestedKey);
+    if (meta.has_nested)
+        meta.nested = ReadRequiredIndexMeta<bool>(metadata, "is_nested");
+    if (meta.has_nested && meta.nested != params.nested) {
+        ThrowInfo(DataFormatBroken,
+                  "bitmap persisted nested flag disagrees with runtime");
+    }
+    meta.nested = params.nested;
+    ValidateMeta(meta, params);
+    state.layout =
+        meta.index_length <=
+                static_cast<size_t>(DEFAULT_BITMAP_INDEX_BUILD_MODE_BOUND)
+            ? BitmapLayout::Bitset
+            : BitmapLayout::Roaring;
+    const auto bytes = directory.At(BITMAP_INDEX_DATA).plaintext_size;
+    if (directory.HasEntry(BITMAP_INDEX_VALID_BITSET) &&
+        directory.At(BITMAP_INDEX_VALID_BITSET).plaintext_size !=
+            PackedValidityBytes(meta.count)) {
+        ThrowInfo(DataFormatBroken,
+                  "bitmap validity size disagrees with row count");
+    }
+    if (options.enable_mmap && state.layout == BitmapLayout::Roaring &&
+        bytes == 0) {
+        ThrowInfo(DataFormatBroken, "bitmap mmap payload is empty");
+    }
+    return state;
+}
+
+folly::coro::Task<std::unique_ptr<IndexLoader>>
+BitmapIndexLoader::Open(IndexOpenRequest request) {
+    return OpenIndexLoader(
+        std::move(request),
+        [](OpenedIndexInput input, storage::LoadOptions options)
+            -> folly::coro::Task<std::unique_ptr<IndexLoader>> {
+            auto loader = std::unique_ptr<BitmapIndexLoader>(
+                new BitmapIndexLoader(std::move(input), std::move(options)));
+            auto state = std::make_unique<OpenedState>();
+            if (const auto* packed =
+                    std::get_if<PackedIndexSource>(&loader->input_)) {
+                *state = ParsePackedState(
+                    packed->Directory(), packed->Metadata(), loader->options_);
+            } else {
+                const auto& legacy =
+                    std::get<LegacyIndexSource>(loader->input_);
+                state->params = ParseRuntimeParams(loader->options_.params);
+                const auto& params = state->params;
+                if (params.value_type == DataType::NONE ||
+                    params.value_type == DataType::ARRAY) {
+                    ThrowInfo(DataTypeInvalid,
+                              "bitmap loader requires value_type or "
+                              "array_element_type");
+                }
+                auto& meta = state->meta;
+                meta = co_await ReadMeta(legacy.use_async, *legacy.source);
+                if (meta.has_nested && meta.nested != params.nested) {
+                    ThrowInfo(
+                        DataFormatBroken,
+                        "bitmap persisted nested flag disagrees with runtime");
+                }
+                meta.nested = params.nested;
+                ValidateMeta(meta, params);
+                state->layout =
+                    meta.index_length <=
+                            static_cast<size_t>(
+                                DEFAULT_BITMAP_INDEX_BUILD_MODE_BOUND)
+                        ? BitmapLayout::Bitset
+                        : BitmapLayout::Roaring;
+                if (!legacy.source->HasEntry(BITMAP_INDEX_DATA)) {
+                    ThrowInfo(DataFormatBroken,
+                              "bitmap artifact data is missing");
+                }
+            }
+            loader->state_ = std::move(state);
+            co_return loader;
+        });
+}
+
+folly::coro::Task<IIndexReaderBasePtr>
+BitmapIndexLoader::Load(milvus::OpContext* context) {
+    const auto operation_token =
+        context ? context->cancellation_token : folly::CancellationToken{};
+    const auto token = folly::cancellation_token_merge(
+        operation_token, co_await folly::coro::co_current_cancellation_token);
+    if (auto* packed = std::get_if<PackedIndexSource>(&input_)) {
+        co_return co_await RunPackedIndexLoad(
+            *packed,
+            options_,
+            [this, token](const auto& directory,
+                          const auto& metadata,
+                          const auto& options) {
+                auto plan =
+                    PlanPacked(directory, metadata, options, state_.get());
+                std::any_cast<const std::shared_ptr<PackedBitmapState>&>(
+                    plan.load_context)
+                    ->cancellation_token = token;
+                return plan;
+            },
+            &FinishPacked,
+            context);
+    }
+    co_return co_await RunLegacyLoad(
+        std::get<LegacyIndexSource>(input_),
+        options_,
+        [this](auto& source, const auto& options, bool use_async) {
+            return LoadLegacy(source, options, use_async);
+        },
+        context);
+}
 
 ReaderCaps
 BitmapIndexLoader::DeriveCaps(const Config& index_meta) {
@@ -966,24 +1128,13 @@ BitmapIndexLoader::DeriveCaps(const Config& index_meta) {
             .exact = !params.nested});
 }
 
-IIndexReaderBasePtr
-BitmapIndexLoader::Open(storage::FileSource& source,
-                        const storage::LoadOptions& opts) {
-    return folly::coro::blockingWait(OpenAsync(source, opts, false));
-}
-
 folly::coro::Task<IIndexReaderBasePtr>
-BitmapIndexLoader::OpenAsync(storage::FileSource& source,
-                             const storage::LoadOptions& opts,
-                             bool use_async) {
+BitmapIndexLoader::LoadLegacy(storage::FileSource& source,
+                              const storage::LoadOptions& opts,
+                              bool use_async) {
     auto projection = PrepareJsonProjectedOpen(families::kBitmap, source, opts);
-    const auto params = ParseRuntimeParams(opts.params);
-    if (params.value_type == DataType::NONE ||
-        params.value_type == DataType::ARRAY) {
-        ThrowInfo(DataTypeInvalid,
-                  "bitmap loader requires value_type or array_element_type");
-    }
-    auto inner = (co_await LoadBitmapPayload(use_async, source, opts, params));
+    auto inner = co_await LoadBitmapPayload(
+        use_async, source, opts, state_->params, state_->meta, state_->layout);
     co_return (co_await FinishJsonProjectedOpenAsync(
         use_async, std::move(projection), source, std::move(inner)));
 }
@@ -991,31 +1142,17 @@ BitmapIndexLoader::OpenAsync(storage::FileSource& source,
 IndexLoadPlan
 BitmapIndexLoader::PlanPacked(const storage::IndexEntryDirectory& directory,
                               const nlohmann::json& metadata,
-                              const storage::LoadOptions& opts) {
+                              const storage::LoadOptions& opts,
+                              const OpenedState* cached) {
+    std::optional<OpenedState> parsed;
+    if (cached == nullptr) {
+        parsed = ParsePackedState(directory, metadata, opts);
+        cached = &*parsed;
+    }
     auto state = std::make_shared<PackedBitmapState>();
-    state->params = ParseRuntimeParams(opts.params);
-    if (state->params.value_type == DataType::NONE ||
-        state->params.value_type == DataType::ARRAY) {
-        ThrowInfo(DataTypeInvalid,
-                  "bitmap loader requires value_type or array_element_type");
-    }
-    state->meta.index_length =
-        ReadRequiredIndexMeta<size_t>(metadata, BITMAP_INDEX_LENGTH);
-    state->meta.count =
-        ReadRequiredIndexMeta<size_t>(metadata, BITMAP_INDEX_NUM_ROWS);
-    state->meta.nested = state->params.nested;
-    if (metadata.contains(kV3NestedKey) &&
-        ReadRequiredIndexMeta<bool>(metadata, "is_nested") !=
-            state->params.nested) {
-        ThrowInfo(DataFormatBroken,
-                  "bitmap persisted nested flag disagrees with runtime");
-    }
-    ValidateMeta(state->meta, state->params);
-    state->layout =
-        state->meta.index_length <=
-                static_cast<size_t>(DEFAULT_BITMAP_INDEX_BUILD_MODE_BOUND)
-            ? BitmapLayout::Bitset
-            : BitmapLayout::Roaring;
+    state->params = cached->params;
+    state->meta = cached->meta;
+    state->layout = cached->layout;
     const bool has_validity = directory.HasEntry(BITMAP_INDEX_VALID_BITSET);
     state->rebuild_validity =
         !has_validity && state->params.nullable && !state->meta.nested;
@@ -1071,11 +1208,7 @@ BitmapIndexLoader::PlanPacked(const storage::IndexEntryDirectory& directory,
 folly::coro::Task<IIndexReaderBasePtr>
 BitmapIndexLoader::FinishPacked(IndexLoadPlan& plan,
                                 const storage::LoadOptions& opts,
-                                bool use_async,
-                                folly::CancellationToken token) {
-    const auto operation_token = opts.op_ctx ? opts.op_ctx->cancellation_token
-                                             : folly::CancellationToken{};
-    token = folly::cancellation_token_merge(token, operation_token);
+                                bool use_async) {
     const auto state =
         std::any_cast<std::shared_ptr<PackedBitmapState>>(plan.load_context);
     if (state->meta.count % 8 != 0) {
@@ -1134,7 +1267,7 @@ BitmapIndexLoader::FinishPacked(IndexLoadPlan& plan,
                 std::move(*state->validity),
                 state->rebuild_validity,
                 opts,
-                token,
+                state->cancellation_token,
                 use_async);
         } catch (...) {
             failure = std::current_exception();

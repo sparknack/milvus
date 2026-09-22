@@ -1079,6 +1079,13 @@ class V1RemoteSource::Impl {
     mutable std::unordered_map<std::string, std::string> staged_files;
 };
 
+void
+V1RemoteSource::SetLoadContext(proto::common::LoadPriority priority,
+                               folly::CancellationToken token) {
+    impl_->load_priority = priority;
+    impl_->cancellation_token = std::move(token);
+}
+
 V1RemoteSource::V1RemoteSource(const FileManagerContext& context,
                                std::vector<std::string> remote_paths,
                                LoadOptions options,

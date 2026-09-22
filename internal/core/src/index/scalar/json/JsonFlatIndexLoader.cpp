@@ -14,16 +14,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "folly/CancellationToken.h"
-#include "folly/coro/Task.h"
 #include "folly/coro/WithCancellation.h"
 #include "storage/AsyncLoadExecutor.h"
 #include "storage/LocalFileIOPool.h"
 #include "common/OpContext.h"
-#include "storage/LocalFileIOPool.h"
-#include "folly/coro/BlockingWait.h"
-
 #include "index/scalar/json/JsonFlatIndexLoader.h"
+#include "index/IndexLoaderFactory.h"
+#include "index/PackedIndexLoad.h"
+#include "index/LegacyIndexLoad.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -68,6 +66,8 @@ using json_flat_params::ValidateRowDomain;
 constexpr std::string_view kJsonPathParam = "json_path";
 constexpr std::string_view kJsonCastTypeParam = "json_cast_type";
 
+// Normalize the two path aliases and reject conflicts or invalid JSON
+// pointers.
 std::string
 ParseJsonPath(const Config& params) {
     const bool has_json_path = params.contains(kJsonPathParam);
@@ -94,6 +94,8 @@ ParseJsonPath(const Config& params) {
     return result;
 }
 
+// Validate runtime engine-version selectors before opening a Tantivy
+// artifact.
 void
 ValidateTantivyVersion(const Config& params) {
     const auto scalar_version =
@@ -116,10 +118,15 @@ ValidateTantivyVersion(const Config& params) {
     }
 }
 
+/**
+ * @brief Normalized runtime field semantics used to interpret persisted data.
+ */
 struct RuntimeParams {
     std::string nested_path;
 };
 
+// Require row-domain JSON input and normalize its root path and engine
+// settings.
 RuntimeParams
 ParseRuntimeParams(const Config& params) {
     if (!params.is_object()) {
@@ -150,11 +157,14 @@ ParseRuntimeParams(const Config& params) {
     return RuntimeParams{.nested_path = ParseJsonPath(params)};
 }
 
+/** @brief Resolved local storage preferences for this load. */
 struct EffectiveLoadOptions {
     bool mmap{false};
     std::string directory_parent;
 };
 
+// Resolve explicit load options and legacy config fallbacks for local
+// staging.
 EffectiveLoadOptions
 ResolveLoadOptions(const storage::LoadOptions& opts) {
     EffectiveLoadOptions result;
@@ -176,11 +186,16 @@ ResolveLoadOptions(const storage::LoadOptions& opts) {
     return result;
 }
 
+/**
+ * @brief Validated legacy inventory separating engine files from null sidecars.
+ */
 struct PersistedEntries {
     std::vector<std::string> engine_files;
     bool has_null{false};
 };
 
+// Validate logical entry names and separate engine files from sidecars; no
+// payload I/O.
 PersistedEntries
 ReadPersistedEntries(storage::FileSource& source) {
     PersistedEntries result;
@@ -210,6 +225,8 @@ using storage::LocalEntryGuard;
 
 using storage::FileDescriptorGuard;
 
+// Stage the null sidecar and validate its byte count before allocating the
+// offset vector.
 folly::coro::Task<std::shared_ptr<const std::vector<size_t>>>
 ReadNullOffsets(bool use_async,
                 const storage::LoadOptions& opts,
@@ -272,6 +289,8 @@ ReadNullOffsets(bool use_async,
         run_io());
 }
 
+// Account for retained payload bytes with overflow checks, using local file
+// sizes.
 size_t
 MaterializedBytes(const std::vector<std::string>& paths) {
     size_t total = 0;
@@ -293,6 +312,7 @@ MaterializedBytes(const std::vector<std::string>& paths) {
     return total;
 }
 
+// Use Tantivy RAM payload accounting and reject values outside size_t.
 size_t
 RamPayloadBytes(milvus::tantivy::TantivyIndexWrapper& engine) {
     const auto bytes = engine.index_size_bytes();
@@ -303,6 +323,8 @@ RamPayloadBytes(milvus::tantivy::TantivyIndexWrapper& engine) {
     return static_cast<size_t>(bytes);
 }
 
+// Open staged Tantivy files and retain their directory only when the reader
+// is file-backed.
 folly::coro::Task<std::shared_ptr<const JsonFlatIndexReaderState>>
 LoadState(bool use_async,
           storage::FileSource& source,
@@ -399,6 +421,9 @@ LoadState(bool use_async,
         directory->PathHeapBytes());
 }
 
+/**
+ * @brief Per-load payload owners and decoding state, retained by IndexLoadPlan.
+ */
 struct PackedJsonFlatState {
     PackedDirectoryTargets targets;
     RuntimeParams runtime;
@@ -407,22 +432,43 @@ struct PackedJsonFlatState {
 
 }  // namespace
 
+folly::coro::Task<std::unique_ptr<IndexLoader>>
+JsonFlatIndexLoader::Open(IndexOpenRequest request) {
+    return OpenIndexLoader(
+        std::move(request),
+        [](OpenedIndexInput input, storage::LoadOptions options)
+            -> folly::coro::Task<std::unique_ptr<IndexLoader>> {
+            auto loader = std::unique_ptr<JsonFlatIndexLoader>(
+                new JsonFlatIndexLoader(std::move(input), std::move(options)));
+            (void)DeriveCaps(loader->options_.params);
+            if (const auto* legacy =
+                    std::get_if<LegacyIndexSource>(&loader->input_)) {
+                (void)ReadPersistedEntries(*legacy->source);
+            }
+            co_return loader;
+        });
+}
+
+folly::coro::Task<IIndexReaderBasePtr>
+JsonFlatIndexLoader::Load(milvus::OpContext* context) {
+    if (auto* packed = std::get_if<PackedIndexSource>(&input_)) {
+        return RunPackedIndexLoad(
+            *packed, options_, &PlanPacked, &FinishPacked, context);
+    }
+    return RunLegacyLoad(
+        std::get<LegacyIndexSource>(input_), options_, &LoadLegacy, context);
+}
+
 ReaderCaps
 JsonFlatIndexLoader::DeriveCaps(const Config& index_meta) {
     static_cast<void>(ParseRuntimeParams(index_meta));
     return ReaderCaps{.json_paths = true, .exact = true};
 }
 
-IIndexReaderBasePtr
-JsonFlatIndexLoader::Open(storage::FileSource& source,
-                          const storage::LoadOptions& opts) {
-    return folly::coro::blockingWait(OpenAsync(source, opts, false));
-}
-
 folly::coro::Task<IIndexReaderBasePtr>
-JsonFlatIndexLoader::OpenAsync(storage::FileSource& source,
-                               const storage::LoadOptions& opts,
-                               bool use_async) {
+JsonFlatIndexLoader::LoadLegacy(storage::FileSource& source,
+                                const storage::LoadOptions& opts,
+                                bool use_async) {
     co_return std::make_unique<JsonFlatIndexReader>(
         (co_await LoadState(use_async, source, opts)));
 }
@@ -452,8 +498,7 @@ JsonFlatIndexLoader::PlanPacked(const storage::IndexEntryDirectory& directory,
 folly::coro::Task<IIndexReaderBasePtr>
 JsonFlatIndexLoader::FinishPacked(IndexLoadPlan& plan,
                                   const storage::LoadOptions& opts,
-                                  bool use_async,
-                                  folly::CancellationToken token) {
+                                  bool use_async) {
     const auto& state =
         std::any_cast<const std::shared_ptr<PackedJsonFlatState>&>(
             plan.load_context);

@@ -14,15 +14,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "folly/CancellationToken.h"
-#include "folly/coro/Task.h"
 #include "folly/coro/WithCancellation.h"
 #include "storage/AsyncLoadExecutor.h"
 #include "storage/LocalFileIOPool.h"
-#include "folly/coro/BlockingWait.h"
-
-#include "index/scalar/sort/SortedIndexLoader.h"
 #include "common/OpContext.h"
+#include "index/scalar/sort/SortedIndexLoader.h"
+#include "index/IndexLoaderFactory.h"
+#include "index/PackedIndexLoad.h"
+#include "index/LegacyIndexLoad.h"
 
 #include <cerrno>
 #include <cstring>
@@ -41,6 +40,7 @@
 #include "index/ParamUtils.h"
 #include "index/IndexLoadUtils.h"
 #include "common/EasyAssert.h"
+#include "common/OpContext.h"
 #include "index/scalar/ScalarIndexUtils.h"
 #include "storage/artifact/LocalFileUtils.h"
 #include "index/Families.h"
@@ -54,6 +54,9 @@
 namespace milvus::index {
 namespace {
 
+/**
+ * @brief Normalized runtime field semantics used to interpret persisted data.
+ */
 struct RuntimeParams {
     DataType field_type{DataType::NONE};
     DataType value_type{DataType::NONE};
@@ -62,6 +65,8 @@ struct RuntimeParams {
     bool one_value_per_coordinate{true};
 };
 
+// Normalize field/value types and row-versus-element semantics before
+// decoding.
 RuntimeParams
 ParseRuntimeParams(const Config& params) {
     RuntimeParams result;
@@ -145,6 +150,7 @@ ParseRuntimeParams(const Config& params) {
     return result;
 }
 
+// Read one native-layout scalar and require an exact sizeof(T) entry.
 template <typename T>
 folly::coro::Task<T>
 ReadRequiredPod(bool use_async,
@@ -167,6 +173,8 @@ ReadRequiredPod(bool use_async,
     co_return result;
 }
 
+// Treat a missing legacy metadata entry as absent; validate present entries
+// strictly.
 template <typename T>
 folly::coro::Task<std::optional<T>>
 ReadOptionalPod(bool use_async,
@@ -178,16 +186,20 @@ ReadOptionalPod(bool use_async,
     co_return (co_await ReadRequiredPod<T>(use_async, source, name));
 }
 
+/** @brief Persisted coordinate count and optional legacy nesting metadata. */
 struct CommonMeta {
     size_t count{0};
     bool nested{false};
     bool has_nested{false};
 };
 
+/** @brief Numeric posting count alongside the shared coordinate-domain metadata. */
 struct NumericMeta : CommonMeta {
     size_t index_length{0};
 };
 
+// Read numeric metadata, falling back to entry count for legacy artifacts
+// without row count.
 folly::coro::Task<NumericMeta>
 ReadNumericMeta(bool use_async, storage::FileSource& source) {
     NumericMeta result;
@@ -204,6 +216,7 @@ ReadNumericMeta(bool use_async, storage::FileSource& source) {
     co_return result;
 }
 
+// Read string metadata and reject unsupported persisted layout versions.
 folly::coro::Task<CommonMeta>
 ReadStringMeta(bool use_async, storage::FileSource& source) {
     CommonMeta result;
@@ -225,6 +238,8 @@ ReadStringMeta(bool use_async, storage::FileSource& source) {
     co_return result;
 }
 
+// Reject conflicting persisted/runtime domains; use runtime metadata when
+// legacy data omits it.
 void
 ResolveNested(CommonMeta& meta, bool runtime_nested) {
     if (meta.has_nested && meta.nested != runtime_nested) {
@@ -237,6 +252,7 @@ ResolveNested(CommonMeta& meta, bool runtime_nested) {
     meta.nested = runtime_nested;
 }
 
+// Enforce the int32 coordinate domain used by sorted reverse offsets.
 void
 CheckCount(size_t count) {
     if (count > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
@@ -246,6 +262,8 @@ CheckCount(size_t count) {
     }
 }
 
+// Compute persisted payload sizes without wrapping before allocation or
+// mapping.
 size_t
 CheckedMultiply(size_t left, size_t right, std::string_view label) {
     if (right != 0 && left > std::numeric_limits<size_t>::max() / right) {
@@ -254,6 +272,8 @@ CheckedMultiply(size_t left, size_t right, std::string_view label) {
     return left * right;
 }
 
+// Create a closed staging file whose path guard removes it until ownership
+// transfers.
 storage::LocalEntryGuard
 CreateLocalFile(const std::string& configured_dir, std::string_view prefix) {
     const auto directory = configured_dir.empty()
@@ -282,6 +302,8 @@ CreateLocalFile(const std::string& configured_dir, std::string_view prefix) {
     return file;
 }
 
+// Stage and check the exact entry size before allocating its final typed
+// vector.
 template <typename T>
 folly::coro::Task<std::shared_ptr<std::vector<T>>>
 ReadEntryVector(bool use_async,
@@ -343,6 +365,8 @@ ReadEntryVector(bool use_async,
         run_io());
 }
 
+// Stage and map an entry with a retained file owner; an empty entry returns
+// null.
 folly::coro::Task<std::shared_ptr<SortedMmapOwner>>
 MapEntry(bool use_async,
          const storage::LoadOptions& opts,
@@ -408,6 +432,8 @@ MapEntry(bool use_async,
         run_io());
 }
 
+// Decode byte-packed validity only after checking its length against the row
+// count.
 TargetBitmap
 DecodePackedValidity(const std::vector<uint8_t>& bytes, size_t count) {
     const auto expected = (count + 7) / 8;
@@ -426,6 +452,8 @@ DecodePackedValidity(const std::vector<uint8_t>& bytes, size_t count) {
     return result;
 }
 
+// Check sort order and coordinate bounds before auxiliary arrays index those
+// coordinates.
 template <typename T>
 void
 ValidateNumericData(const IndexStructure<T>* data, size_t size, size_t count) {
@@ -442,6 +470,8 @@ ValidateNumericData(const IndexStructure<T>* data, size_t size, size_t count) {
     }
 }
 
+// Rebuild validity and reverse offsets; require unique coordinates where the
+// domain demands it.
 template <typename T>
 std::pair<TargetBitmap, std::shared_ptr<std::vector<int32_t>>>
 RebuildNumericAux(const IndexStructure<T>* data,
@@ -468,6 +498,8 @@ RebuildNumericAux(const IndexStructure<T>* data,
     return {std::move(validity), std::move(offsets)};
 }
 
+// Cross-check supplied validity and reverse offsets against already
+// range-checked postings.
 template <typename T>
 void
 ValidateNumericAux(const IndexStructure<T>* data,
@@ -532,6 +564,8 @@ ValidateNumericAux(const IndexStructure<T>* data,
     }
 }
 
+// Load heap or mmap numeric data and rebuild the auxiliary state omitted by
+// legacy artifacts.
 template <typename T>
 folly::coro::Task<typename SortedIndexReader<T>::OpenArgs>
 LoadNumericState(bool use_async,
@@ -596,6 +630,8 @@ LoadNumericState(bool use_async,
     co_return args;
 }
 
+// Cross-check validity and reverse lookup against the validated string
+// layout.
 void
 ValidateStringAux(const SortedStringLayout& layout,
                   const TargetBitmap& validity,
@@ -649,6 +685,8 @@ ValidateStringAux(const SortedStringLayout& layout,
     }
 }
 
+// Load the string layout and validity, then rebuild and validate reverse
+// offsets.
 folly::coro::Task<SortedIndexReader<std::string_view>::OpenArgs>
 LoadStringState(bool use_async,
                 storage::FileSource& source,
@@ -707,6 +745,9 @@ LoadStringState(bool use_async,
     co_return args;
 }
 
+/**
+ * @brief Per-load payload owners and decoding state, retained by IndexLoadPlan.
+ */
 struct PackedSortedState {
     RuntimeParams params;
     NumericMeta meta;
@@ -723,6 +764,8 @@ struct PackedSortedState {
     bool has_offsets{false};
 };
 
+// Select the typed numeric decoder; TIMESTAMPTZ shares the int64
+// representation.
 template <typename F>
 decltype(auto)
 DispatchPackedNumeric(DataType type, F&& function) {
@@ -749,6 +792,8 @@ DispatchPackedNumeric(DataType type, F&& function) {
     }
 }
 
+// Register a prepared mmap destination, transferring temporary-path cleanup
+// to the target.
 std::shared_ptr<storage::IndexFileTarget>
 PlanSortedFile(IndexLoadPlan& plan,
                std::string_view name,
@@ -767,6 +812,8 @@ PlanSortedFile(IndexLoadPlan& plan,
     return file;
 }
 
+// Map a completed nonempty target; its owner retains the view and path for
+// the reader.
 std::shared_ptr<SortedMmapOwner>
 MapSortedTarget(const storage::IndexFileTarget& file) {
     AssertInfo(file.Prepared() && file.file_size != 0,
@@ -794,6 +841,8 @@ MapSortedTarget(const storage::IndexFileTarget& file) {
     return owner;
 }
 
+// Attach loaded payload owners and validate or rebuild auxiliary arrays
+// before publication.
 template <typename T>
 IIndexReaderBasePtr
 FinishPackedSortedState(PackedSortedState& state,
@@ -886,6 +935,107 @@ FinishPackedSortedState(PackedSortedState& state,
 
 }  // namespace
 
+/** @brief Validated metadata reused by Load; no reader or payload ownership. */
+struct SortedIndexLoader::OpenedState {
+    RuntimeParams params;
+    NumericMeta meta;
+};
+
+SortedIndexLoader::SortedIndexLoader(OpenedIndexInput input,
+                                     storage::LoadOptions options)
+    : input_(std::move(input)), options_(std::move(options)) {
+}
+
+SortedIndexLoader::~SortedIndexLoader() = default;
+
+SortedIndexLoader::OpenedState
+SortedIndexLoader::ParsePackedState(const storage::IndexEntryDirectory&,
+                                    const nlohmann::json& metadata,
+                                    const storage::LoadOptions& options) {
+    OpenedState state;
+    state.params = ParseRuntimeParams(options.params);
+    state.meta.count =
+        ReadRequiredIndexMeta<size_t>(metadata, sort_format::kNumRows.data());
+    CheckCount(state.meta.count);
+    if (metadata.contains(sort_format::kNested)) {
+        state.meta.has_nested = true;
+        state.meta.nested =
+            ReadRequiredIndexMeta<bool>(metadata, sort_format::kNested.data());
+    }
+    ResolveNested(state.meta, state.params.nested);
+    const bool string = IsStringDataType(state.params.value_type);
+    if (string) {
+        const auto version = ReadRequiredIndexMeta<uint32_t>(
+            metadata, sort_format::kVersion.data());
+        if (version != sort_format::kStringVersion) {
+            ThrowInfo(
+                Unsupported, "unsupported sorted string version {}", version);
+        }
+    } else {
+        state.meta.index_length = ReadRequiredIndexMeta<size_t>(
+            metadata, sort_format::kIndexLength.data());
+        CheckCount(state.meta.index_length);
+    }
+    return state;
+}
+
+folly::coro::Task<std::unique_ptr<IndexLoader>>
+SortedIndexLoader::Open(IndexOpenRequest request) {
+    return OpenIndexLoader(
+        std::move(request),
+        [](OpenedIndexInput input, storage::LoadOptions options)
+            -> folly::coro::Task<std::unique_ptr<IndexLoader>> {
+            auto loader = std::unique_ptr<SortedIndexLoader>(
+                new SortedIndexLoader(std::move(input), std::move(options)));
+            auto opened = std::make_unique<OpenedState>();
+            if (const auto* packed =
+                    std::get_if<PackedIndexSource>(&loader->input_)) {
+                *opened = ParsePackedState(
+                    packed->Directory(), packed->Metadata(), loader->options_);
+            } else {
+                const auto& legacy =
+                    std::get<LegacyIndexSource>(loader->input_);
+                opened->params = ParseRuntimeParams(loader->options_.params);
+                if (IsStringDataType(opened->params.value_type)) {
+                    static_cast<CommonMeta&>(opened->meta) =
+                        co_await ReadStringMeta(legacy.use_async,
+                                                *legacy.source);
+                } else {
+                    opened->meta = co_await ReadNumericMeta(legacy.use_async,
+                                                            *legacy.source);
+                }
+                ResolveNested(opened->meta, opened->params.nested);
+                CheckCount(opened->meta.count);
+                CheckCount(opened->meta.index_length);
+            }
+            loader->state_ = std::move(opened);
+            co_return loader;
+        });
+}
+
+folly::coro::Task<IIndexReaderBasePtr>
+SortedIndexLoader::Load(milvus::OpContext* context) {
+    if (auto* packed = std::get_if<PackedIndexSource>(&input_)) {
+        return RunPackedIndexLoad(
+            *packed,
+            options_,
+            [this](const auto& directory,
+                   const auto& metadata,
+                   const auto& options) {
+                return PlanPacked(directory, metadata, options, state_.get());
+            },
+            &FinishPacked,
+            context);
+    }
+    return RunLegacyLoad(
+        std::get<LegacyIndexSource>(input_),
+        options_,
+        [this](auto& source, const auto& options, bool use_async) {
+            return LoadLegacy(source, options, use_async);
+        },
+        context);
+}
+
 ReaderCaps
 SortedIndexLoader::DeriveCaps(const Config& index_meta) {
     const auto params = ParseRuntimeParams(index_meta);
@@ -905,25 +1055,19 @@ SortedIndexLoader::DeriveCaps(const Config& index_meta) {
                    .exact = !params.nested});
 }
 
-IIndexReaderBasePtr
-SortedIndexLoader::Open(storage::FileSource& source,
-                        const storage::LoadOptions& opts) {
-    return folly::coro::blockingWait(OpenAsync(source, opts, false));
-}
-
 folly::coro::Task<IIndexReaderBasePtr>
-SortedIndexLoader::OpenAsync(storage::FileSource& source,
-                             const storage::LoadOptions& opts,
-                             bool use_async) {
+SortedIndexLoader::LoadLegacy(storage::FileSource& source,
+                              const storage::LoadOptions& opts,
+                              bool use_async) {
     auto projection = PrepareJsonProjectedOpen(families::kSort, source, opts);
-    const auto params = ParseRuntimeParams(opts.params);
+    const auto& params = state_->params;
     if (params.value_type == DataType::NONE ||
         params.value_type == DataType::ARRAY) {
         ThrowInfo(DataTypeInvalid,
                   "sorted loader requires value_type or array_element_type");
     }
     if (IsStringDataType(params.value_type)) {
-        const auto meta = co_await ReadStringMeta(use_async, source);
+        const auto& meta = state_->meta;
         auto state =
             co_await LoadStringState(use_async, source, opts, meta, params);
         auto inner = std::make_unique<SortedIndexReader<std::string_view>>(
@@ -932,7 +1076,7 @@ SortedIndexLoader::OpenAsync(storage::FileSource& source,
             use_async, std::move(projection), source, std::move(inner));
     }
 
-    const auto meta = (co_await ReadNumericMeta(use_async, source));
+    const auto& meta = state_->meta;
     std::unique_ptr<IIndexReaderBase> inner;
     switch (params.value_type) {
         case DataType::BOOL:
@@ -983,31 +1127,17 @@ SortedIndexLoader::OpenAsync(storage::FileSource& source,
 IndexLoadPlan
 SortedIndexLoader::PlanPacked(const storage::IndexEntryDirectory& directory,
                               const nlohmann::json& metadata,
-                              const storage::LoadOptions& opts) {
+                              const storage::LoadOptions& opts,
+                              const OpenedState* cached) {
+    std::optional<OpenedState> parsed;
+    if (cached == nullptr) {
+        parsed = ParsePackedState(directory, metadata, opts);
+        cached = &*parsed;
+    }
     auto state = std::make_shared<PackedSortedState>();
-    state->params = ParseRuntimeParams(opts.params);
-    state->meta.count =
-        ReadRequiredIndexMeta<size_t>(metadata, sort_format::kNumRows.data());
-    CheckCount(state->meta.count);
-    if (metadata.contains(sort_format::kNested)) {
-        state->meta.has_nested = true;
-        state->meta.nested =
-            ReadRequiredIndexMeta<bool>(metadata, sort_format::kNested.data());
-    }
-    ResolveNested(state->meta, state->params.nested);
+    state->params = cached->params;
+    state->meta = cached->meta;
     const bool string = IsStringDataType(state->params.value_type);
-    if (string) {
-        const auto version = ReadRequiredIndexMeta<uint32_t>(
-            metadata, sort_format::kVersion.data());
-        if (version != sort_format::kStringVersion) {
-            ThrowInfo(
-                Unsupported, "unsupported sorted string version {}", version);
-        }
-    } else {
-        state->meta.index_length = ReadRequiredIndexMeta<size_t>(
-            metadata, sort_format::kIndexLength.data());
-        CheckCount(state->meta.index_length);
-    }
     state->has_offsets = directory.HasEntry(sort_format::kIdxToOffsets);
     const bool has_validity = directory.HasEntry(sort_format::kValidBitset);
     if ((string && !has_validity) ||
@@ -1102,8 +1232,7 @@ SortedIndexLoader::PlanPacked(const storage::IndexEntryDirectory& directory,
 folly::coro::Task<IIndexReaderBasePtr>
 SortedIndexLoader::FinishPacked(IndexLoadPlan& plan,
                                 const storage::LoadOptions& opts,
-                                bool use_async,
-                                folly::CancellationToken token) {
+                                bool use_async) {
     const auto state =
         std::any_cast<std::shared_ptr<PackedSortedState>>(plan.load_context);
     const auto priority =

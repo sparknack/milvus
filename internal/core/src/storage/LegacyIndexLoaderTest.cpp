@@ -92,8 +92,8 @@ class LegacyIndexLoaderTest : public ::testing::Test {
     T
     Run(folly::coro::Task<T> task,
         proto::common::LoadPriority priority = kPriority) {
-        return folly::coro::blockingWait(
-            std::move(task).scheduleOn(ResolveAsyncLoadExecutor({}, priority)));
+        return folly::coro::blockingWait(folly::coro::co_withExecutor(
+            ResolveAsyncLoadExecutor({}, priority), std::move(task)));
     }
     std::shared_ptr<RemoteInputStream>
     Open(std::vector<uint8_t> content) {

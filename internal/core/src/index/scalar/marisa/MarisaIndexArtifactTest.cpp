@@ -15,6 +15,7 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
+#include "index/IndexLoaderFactory.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -224,13 +225,20 @@ TEST(MarisaIndexArtifactTest, AsyncCancellationRemovesPlannedFiles) {
             source->IndexMeta());
         const auto loader = LoaderRegistry::Instance().Lookup(backend.Family());
         input->armed = true;
-        co_return co_await LoadPackedIndexAsync(
-            loader, *source, opts, priority, cancellation.getToken());
+        IndexOpenRequest request{
+            OpenedIndexInput{PackedIndexSource{
+                std::shared_ptr<storage::AsyncIndexEntryReader>(
+                    std::move(source))}},
+            opts};
+        co_return co_await folly::coro::co_withCancellation(
+            cancellation.getToken(),
+            LoadIndexAsync(loader, std::move(request)));
     };
     ExpectSegcoreError(ErrorCode::FollyCancel, [&] {
-        folly::coro::blockingWait(
-            load().scheduleOn(storage::ResolveAsyncLoadExecutor(
-                {}, proto::common::LoadPriority::HIGH)));
+        folly::coro::blockingWait(folly::coro::co_withExecutor(
+            storage::ResolveAsyncLoadExecutor(
+                {}, proto::common::LoadPriority::HIGH),
+            load()));
     });
     EXPECT_TRUE(cancellation.isCancellationRequested());
     EXPECT_TRUE(std::filesystem::is_empty(staging->Path()));

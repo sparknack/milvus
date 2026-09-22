@@ -14,16 +14,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "folly/CancellationToken.h"
-#include "folly/coro/Task.h"
 #include "folly/coro/WithCancellation.h"
 #include "storage/AsyncLoadExecutor.h"
 #include "storage/LocalFileIOPool.h"
 #include "common/OpContext.h"
-#include "storage/LocalFileIOPool.h"
-#include "folly/coro/BlockingWait.h"
-
 #include "index/scalar/spatial/RTreeIndexLoader.h"
+#include "index/IndexLoaderFactory.h"
+#include "index/PackedIndexLoad.h"
+#include "index/LegacyIndexLoad.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -68,6 +66,8 @@ EndsWith(std::string_view value, std::string_view suffix) {
            value.substr(value.size() - suffix.size()) == suffix;
 }
 
+// Accept integer or decimal-string row counts only within the nonnegative
+// int64 domain.
 int64_t
 ParseRowCountValue(const nlohmann::json& value, std::string_view key) {
     if (value.is_number_unsigned()) {
@@ -96,6 +96,8 @@ ParseRowCountValue(const nlohmann::json& value, std::string_view key) {
               key);
 }
 
+// Require authoritative runtime row count and agreement between supported
+// aliases.
 int64_t
 ReadRequiredRowCount(const Config& params) {
     std::optional<int64_t> result;
@@ -124,6 +126,7 @@ ReadRequiredRowCount(const Config& params) {
     return *result;
 }
 
+// Require safe, unique engine basenames with exactly one .bgi archive.
 void
 ValidateEntryNames(const std::vector<std::string>& names) {
     std::set<std::string> unique;
@@ -152,11 +155,16 @@ ValidateEntryNames(const std::vector<std::string>& names) {
     }
 }
 
+/**
+ * @brief Validated legacy inventory separating engine files from null sidecars.
+ */
 struct PersistedEntries {
     std::vector<std::string> engine_files;
     bool has_null{false};
 };
 
+// Validate logical entry names and separate engine files from sidecars; no
+// payload I/O.
 PersistedEntries
 ReadPersistedEntries(storage::FileSource& source) {
     PersistedEntries result;
@@ -181,6 +189,7 @@ ReadPersistedEntries(storage::FileSource& source) {
     return result;
 }
 
+// Return the archive path without .bgi, as required by the R-tree engine.
 std::string
 FindBasePath(const std::vector<std::string>& local_paths) {
     for (const auto& path : local_paths) {
@@ -196,6 +205,8 @@ using storage::LocalEntryGuard;
 
 using storage::FileDescriptorGuard;
 
+// Stage the null sidecar and validate its byte count before allocating the
+// offset vector.
 folly::coro::Task<std::shared_ptr<const std::vector<size_t>>>
 ReadNullOffsets(bool use_async,
                 const storage::LoadOptions& opts,
@@ -270,6 +281,8 @@ ReadNullOffsets(bool use_async,
         run_io());
 }
 
+// Deserialize the staged archive to heap state and read null offsets using
+// runtime row count.
 folly::coro::Task<std::shared_ptr<const RTreeIndexState>>
 LoadState(bool use_async,
           storage::FileSource& source,
@@ -337,6 +350,9 @@ LoadState(bool use_async,
         std::move(engine), std::move(null_offsets), total_num_rows);
 }
 
+/**
+ * @brief Per-load payload owners and decoding state, retained by IndexLoadPlan.
+ */
 struct PackedRTreeState {
     PackedDirectoryTargets targets;
     int64_t total_rows{0};
@@ -344,22 +360,44 @@ struct PackedRTreeState {
 
 }  // namespace
 
+folly::coro::Task<std::unique_ptr<IndexLoader>>
+RTreeIndexLoader::Open(IndexOpenRequest request) {
+    return OpenIndexLoader(
+        std::move(request),
+        [](OpenedIndexInput input, storage::LoadOptions options)
+            -> folly::coro::Task<std::unique_ptr<IndexLoader>> {
+            auto loader = std::unique_ptr<RTreeIndexLoader>(
+                new RTreeIndexLoader(std::move(input), std::move(options)));
+            (void)DeriveCaps(loader->options_.params);
+            (void)ReadRequiredRowCount(loader->options_.params);
+            if (const auto* legacy =
+                    std::get_if<LegacyIndexSource>(&loader->input_)) {
+                (void)ReadPersistedEntries(*legacy->source);
+            }
+            co_return loader;
+        });
+}
+
+folly::coro::Task<IIndexReaderBasePtr>
+RTreeIndexLoader::Load(milvus::OpContext* context) {
+    if (auto* packed = std::get_if<PackedIndexSource>(&input_)) {
+        return RunPackedIndexLoad(
+            *packed, options_, &PlanPacked, &FinishPacked, context);
+    }
+    return RunLegacyLoad(
+        std::get<LegacyIndexSource>(input_), options_, &LoadLegacy, context);
+}
+
 ReaderCaps
 RTreeIndexLoader::DeriveCaps(const Config& index_meta) {
     ValidateGeometryParams(index_meta);
     return ReaderCaps{.spatial = true, .exact = false};
 }
 
-IIndexReaderBasePtr
-RTreeIndexLoader::Open(storage::FileSource& source,
-                       const storage::LoadOptions& opts) {
-    return folly::coro::blockingWait(OpenAsync(source, opts, false));
-}
-
 folly::coro::Task<IIndexReaderBasePtr>
-RTreeIndexLoader::OpenAsync(storage::FileSource& source,
-                            const storage::LoadOptions& opts,
-                            bool use_async) {
+RTreeIndexLoader::LoadLegacy(storage::FileSource& source,
+                             const storage::LoadOptions& opts,
+                             bool use_async) {
     // Boost's R-tree archive has no mmap view. `enable_mmap` is a preference;
     // preserve the baseline heap fallback and report the resulting heap bytes.
     co_return std::make_unique<RTreeIndexReader>(
@@ -405,8 +443,7 @@ RTreeIndexLoader::PlanPacked(const storage::IndexEntryDirectory& directory,
 folly::coro::Task<IIndexReaderBasePtr>
 RTreeIndexLoader::FinishPacked(IndexLoadPlan& plan,
                                const storage::LoadOptions& opts,
-                               bool use_async,
-                               folly::CancellationToken token) {
+                               bool use_async) {
     const auto& state = std::any_cast<const std::shared_ptr<PackedRTreeState>&>(
         plan.load_context);
     AssertInfo(state != nullptr, "RTree packed load context is null");

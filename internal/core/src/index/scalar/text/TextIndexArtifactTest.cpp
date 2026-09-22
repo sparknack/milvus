@@ -14,7 +14,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "folly/coro/BlockingWait.h"
+#include "index/test_utils/LoaderTestAccess.h"
+
 #include <gtest/gtest.h>
 
 #include <string>
@@ -125,7 +126,8 @@ TEST(TextIndexArtifactTest, PackedTargetsRetainMmapFilesAfterPlanRelease) {
         IIndexReaderBasePtr reader;
         std::vector<std::pair<std::string, bool>> paths;
         {
-            auto plan = TextIndexLoader::PlanPacked(directory, metadata, opts);
+            auto plan = LoaderTestAccess::Plan<TextIndexLoader>(
+                directory, metadata, opts);
             for (auto& entry : plan.entries) {
                 const auto& bytes = persisted.entries.at(entry.name);
                 if (auto* file =
@@ -142,8 +144,7 @@ TEST(TextIndexArtifactTest, PackedTargetsRetainMmapFilesAfterPlanRelease) {
                     std::memcpy(memory.data, bytes.data(), bytes.size());
                 }
             }
-            reader = folly::coro::blockingWait(
-                TextIndexLoader::FinishPacked(plan, opts, false, {}));
+            reader = LoaderTestAccess::Finish<TextIndexLoader>(plan, opts);
             plan.Commit();
         }
         ASSERT_NE(reader, nullptr);

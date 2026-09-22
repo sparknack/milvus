@@ -24,6 +24,8 @@
 #include <vector>
 
 #include "folly/coro/Task.h"
+#include "folly/CancellationToken.h"
+#include "pb/common.pb.h"
 #include "storage/artifact/FileSink.h"
 #include "storage/artifact/LoadOptions.h"
 
@@ -136,6 +138,11 @@ class V1RemoteSource final : public FileSource {
               LoadOptions options = {},
               ArtifactStoragePath storage_path = ArtifactStoragePath::Index,
               V1SourceLayout layout = V1SourceLayout::MemoryEntries);
+
+    // Set per-load state only between fully drained sequential operations.
+    void
+    SetLoadContext(proto::common::LoadPriority priority,
+                   folly::CancellationToken token);
 
     folly::coro::Task<int64_t>
     EntrySizeAsync(std::string_view name, bool use_async = true) override;

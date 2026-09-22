@@ -17,52 +17,65 @@
 #pragma once
 
 #include <string_view>
+#include <utility>
 
 #include "index/Families.h"
+#include "index/IndexLoader.h"
+#include "index/IndexLoadInput.h"
 #include "index/contracts/query/IIndexReaderBase.h"
 #include "storage/artifact/FileSource.h"
 #include "storage/artifact/LoadOptions.h"
 
-// Stateless loader for in-memory knowhere families. Materialized loading reads
-// logical entries into a BinarySet; mmap loading streams ordered engine entries
-// to a local file through FileSource::ReadEntriesToLocalFile.
-// Embedding-list sidecars remain separate files, and validity/empty-list
-// metadata is decoded separately rather than concatenated into the engine file.
-// The source is borrowed during Open only; local backing files must remain
-// owned for the resulting reader's lifetime.
-
 namespace milvus::index {
 
-class VectorMemLoader final {
+/**
+ * @brief Loads in-memory Knowhere readers from legacy artifacts.
+ *
+ * Materialized loads populate a BinarySet; mmap loads stream ordered engine
+ * entries to a local file. Embedding-list sidecars and validity remain
+ * separate. Owns the opened input and fixed load options; each Load creates a
+ * new reader.
+ */
+class VectorMemLoader final : public IndexLoader {
  public:
     static constexpr std::string_view kFamily = families::kVectorMem;
 
-    // The concrete knowhere index type remains runtime load metadata parsed by
-    // this provider; it is not a dynamic registry family and is not persisted
-    // under a new key.
-
-    // Derive capabilities before payload open. ReaderCaps currently contains scalar
-    // query bits, not vector raw-value or refinement availability. A vector reader
-    // returns those bits false and exact true; consumers must not treat that as a
-    // complete vector capability description. TODO: represent load-time-derivable
-    // vector capabilities without opening a cold reader just to inspect them.
+    /** @brief Derive capabilities from runtime parameters without I/O. */
     static ReaderCaps
     DeriveCaps(const Config& index_meta);
 
-    static IIndexReaderBasePtr
-    Open(storage::FileSource& source, const storage::LoadOptions& opts);
+    /**
+     * @brief Validate legacy entry inventory and runtime vector parameters.
+     * @param request Input/options; borrowed op_ctx must outlive this task.
+     * @return A ready loader with no retained opening context.
+     * @note Failure also detaches the source's opening context before the
+     * exception propagates.
+     */
+    static folly::coro::Task<std::unique_ptr<IndexLoader>>
+    Open(IndexOpenRequest request);
 
-    // Borrow source/options until completion. Run on the local-file executor:
-    // remote reads suspend, while native initialization and mmap remain local.
-    static folly::coro::Task<IIndexReaderBasePtr>
-    OpenAsync(storage::FileSource& source, const storage::LoadOptions& opts);
+    /** @copydoc IndexLoader::Load */
+    folly::coro::Task<IIndexReaderBasePtr>
+    Load(milvus::OpContext* context = nullptr) override;
 
  private:
-    // Share validation, decoding and ownership across both transport modes.
+    LegacyIndexSource input_;
+    // Retained options never keep the Open caller's op_ctx.
+    storage::LoadOptions options_;
+
+    VectorMemLoader(LegacyIndexSource input, storage::LoadOptions options)
+        : input_(std::move(input)), options_(std::move(options)) {
+    }
+
+    /**
+     * @brief Populate Knowhere from buffers or an mmap file and load its
+     * sidecars.
+     * @note Runs inside RunLegacyLoad; use_async controls source I/O only.
+     */
     static folly::coro::Task<IIndexReaderBasePtr>
-    OpenImpl(bool use_async,
-             storage::FileSource& source,
-             const storage::LoadOptions& opts);
+    LoadLegacy(storage::FileSource& source,
+               const storage::LoadOptions& opts,
+               bool use_async);
 };
 
 }  // namespace milvus::index

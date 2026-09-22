@@ -17,9 +17,6 @@
 #pragma once
 
 #include <concepts>
-#include <variant>
-#include "folly/CancellationToken.h"
-#include "folly/coro/Task.h"
 #include <functional>
 #include <memory>
 #include <string>
@@ -27,7 +24,8 @@
 
 #include "common/Types.h"
 #include "index/contracts/build/IArtifactBuilder.h"
-#include "index/IndexLoadPlan.h"
+#include "index/IndexLoader.h"
+#include "index/IndexLoadInput.h"
 #include "storage/IndexEntryFormat.h"
 #include "index/contracts/query/IIndexReaderBase.h"
 #include "index/contracts/query/ReaderCaps.h"
@@ -46,95 +44,62 @@ namespace milvus::index {
 // and, for the scalar hybrid family, the persisted selector.
 using IndexFamily = std::string;
 
+/**
+ * @brief Family lookup result: capability inspection and complete Open factory.
+ * @note The registry owns no source or loader state and performs no I/O.
+ */
 struct LoaderEntry {
     using DeriveCapsFn = ReaderCaps (*)(const Config&);
-    using OpenFn = IIndexReaderBasePtr (*)(storage::FileSource&,
-                                           const storage::LoadOptions&);
+    using OpenFn =
+        folly::coro::Task<std::unique_ptr<IndexLoader>> (*)(IndexOpenRequest);
 
-    using OpenAsyncFn = folly::coro::Task<IIndexReaderBasePtr> (*)(
-        storage::FileSource&, const storage::LoadOptions&);
-
-    using PlanPackedFn = IndexLoadPlan (*)(const storage::IndexEntryDirectory&,
-                                           const nlohmann::json&,
-                                           const storage::LoadOptions&);
-    using FinishPackedSyncFn =
-        IIndexReaderBasePtr (*)(IndexLoadPlan&, const storage::LoadOptions&);
-    // Async finalizers yield between batches; false preserves inline execution.
-    using FinishPackedAsyncFn =
-        folly::coro::Task<IIndexReaderBasePtr> (*)(IndexLoadPlan&,
-                                                   const storage::LoadOptions&,
-                                                   bool,
-                                                   folly::CancellationToken);
-    using FinishPackedFn =
-        std::variant<FinishPackedSyncFn, FinishPackedAsyncFn>;
-
-    // Derive capabilities from load-time metadata without opening payloads.
-    // Inventory uses this before pinning and compares it with Reader::Caps()
-    // after open.
     DeriveCapsFn derive_caps{nullptr};
-
-    // Open persisted bytes into one uniquely owned reader. mmap providers may
-    // parse bounded metadata while leaving bulk payloads file-backed.
+    // Open returns reusable family state; each Load supplies its own context.
     OpenFn open{nullptr};
-
-    // Packed loaders plan final destinations before any payload read. The
-    // orchestrator retains the plan through initialization and commits only
-    // after a complete reader has been constructed. Null for legacy-only families.
-    PlanPackedFn plan_packed{nullptr};
-    FinishPackedFn finish_packed{FinishPackedSyncFn{nullptr}};
-
-    // Legacy transport suspends; the orchestrator supplies the loading executor.
-    OpenAsyncFn open_async{nullptr};
 
     explicit operator bool() const noexcept {
         return derive_caps != nullptr && open != nullptr;
     }
 };
 
+/** @brief Compile-time contract for a family registered in LoaderRegistry. */
 template <typename Provider>
 concept StaticLoaderProvider =
-    requires(const Config& params,
-             storage::FileSource& source,
-             const storage::LoadOptions& options) {
+    std::derived_from<Provider, IndexLoader> &&
+    requires(const Config& params, IndexOpenRequest request) {
         { Provider::kFamily } -> std::convertible_to<std::string_view>;
         { Provider::DeriveCaps(params) } -> std::same_as<ReaderCaps>;
         {
-            Provider::Open(source, options)
-            } -> std::same_as<IIndexReaderBasePtr>;
+            Provider::Open(std::move(request))
+            } -> std::same_as<folly::coro::Task<std::unique_ptr<IndexLoader>>>;
     };
 
-// Family-keyed registry of stateless load function pairs. Load planning uses
-// the selected entry to derive metadata-only capabilities before opening any
-// payload.
+/**
+ * @brief Select complete family factories and metadata-only capability
+ * inspectors.
+ * @note Stores stateless function pointers, not opened inputs or reader state.
+ * Storage opening and lifecycle management belong to the selected factory.
+ */
 class LoaderRegistry {
  public:
+    /** @return Process-wide registry of stateless family entry points. */
     static LoaderRegistry&
     Instance();
 
+    /**
+     * @brief Register one family's capability inspector and Open entry point.
+     */
     template <StaticLoaderProvider Provider>
     void
     Register() {
         LoaderEntry entry{&Provider::DeriveCaps, &Provider::Open};
-        if constexpr (requires {
-                          &Provider::PlanPacked;
-                          &Provider::FinishPacked;
-                      }) {
-            entry.plan_packed = &Provider::PlanPacked;
-            entry.finish_packed = &Provider::FinishPacked;
-        }
-        if constexpr (requires(storage::FileSource & source,
-                               const storage::LoadOptions& options) {
-                          Provider::OpenAsync(source, options);
-                      }) {
-            entry.open_async = [](storage::FileSource& source,
-                                  const storage::LoadOptions& options) {
-                return Provider::OpenAsync(source, options);
-            };
-        }
         RegisterEntry(Provider::kFamily, entry);
     }
 
-    // An empty entry means unknown family; callers decide how to report it.
+    /**
+     * @brief Find the registered entry points for a family without opening it.
+     * @return The family entry, or an empty entry for an unknown family.
+     */
     LoaderEntry
     Lookup(const IndexFamily& family) const;
 

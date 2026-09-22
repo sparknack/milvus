@@ -17,6 +17,7 @@
 #pragma once
 
 #include <gtest/gtest.h>
+#include "index/IndexLoaderFactory.h"
 #include <arrow/io/memory.h>
 
 #include <filesystem>
@@ -31,6 +32,7 @@
 #include "storage/RemoteInputStream.h"
 #include "storage/RemoteOutputStream.h"
 #include "index/contracts/Registry.h"
+#include "index/LegacyIndexLoad.h"
 #include "index/scalar/json/JsonProjectedIndexLoad.h"
 #include "index/test_utils/AssertHelpers.h"
 #include "index/test_utils/ScalarReaderFactory.h"
@@ -98,10 +100,18 @@ OpenFromSource(const ReaderBackend& backend,
     if (options.enable_mmap) {
         options.mmap_dir_path = std::filesystem::temp_directory_path().string();
     }
-    options.params = AnnotateJsonProjectionCompleteness(
-        backend.LoadParams(metadata), source);
+    options.params = backend.LoadParams(metadata);
+    if (family != families::kJsonFlat) {
+        options.params = AnnotateJsonProjectionCompleteness(
+            std::move(options.params), source);
+    }
     const auto expected_caps = loader.derive_caps(options.params);
-    auto reader = loader.open(source, options);
+    auto reader = LoadIndex(
+        loader,
+        {OpenedIndexInput{LegacyIndexSource{
+             std::shared_ptr<storage::FileSource>(&source, [](auto*) {}),
+             false}},
+         options});
     CheckReaderBackend(reader, backend, expected_caps);
     return reader;
 }
@@ -136,14 +146,17 @@ OpenV3(const ReaderBackend& backend,
     if (options.enable_mmap) {
         options.mmap_dir_path = std::filesystem::temp_directory_path().string();
     }
-    options.params = AnnotateJsonProjectionCompleteness(
-        backend.LoadParams(metadata), source->Directory(), source->IndexMeta());
+    options.params = backend.LoadParams(metadata);
+    if (backend.Family() != families::kJsonFlat) {
+        options.params =
+            AnnotateJsonProjectionCompleteness(std::move(options.params),
+                                               source->Directory(),
+                                               source->IndexMeta());
+    }
     const auto family = ResolvePackedLoadFamily(
         backend.Family(), source->IndexMeta(), options.params);
     const auto loader = LoaderRegistry::Instance().Lookup(family);
-    if (!loader || !loader.plan_packed ||
-        !std::visit([](auto fn) { return fn != nullptr; },
-                    loader.finish_packed)) {
+    if (!loader) {
         throw std::logic_error(backend.Name() + ": missing packed loader for " +
                                family);
     }
@@ -154,14 +167,23 @@ OpenV3(const ReaderBackend& backend,
             const auto priority = proto::common::LoadPriority::HIGH;
             auto async_source = co_await storage::AsyncIndexEntryReader::Open(
                 input, 0, priority);
-            co_return co_await LoadPackedIndexAsync(
-                loader, *async_source, options, priority);
+            IndexOpenRequest request{
+                OpenedIndexInput{PackedIndexSource{
+                    std::shared_ptr<storage::AsyncIndexEntryReader>(
+                        std::move(async_source))}},
+                options};
+            co_return co_await LoadIndexAsync(loader, std::move(request));
         };
-        reader = folly::coro::blockingWait(
-            load().scheduleOn(storage::ResolveAsyncLoadExecutor(
-                {}, proto::common::LoadPriority::HIGH)));
+        reader = folly::coro::blockingWait(folly::coro::co_withExecutor(
+            storage::ResolveAsyncLoadExecutor(
+                {}, proto::common::LoadPriority::HIGH),
+            load()));
     } else {
-        reader = LoadPackedIndex(loader, *source, options);
+        reader = LoadIndex(loader,
+                           {OpenedIndexInput{PackedIndexSource{
+                                std::shared_ptr<storage::IndexEntryReader>(
+                                    std::move(source))}},
+                            options});
     }
     CheckReaderBackend(reader, backend, expected_caps);
     return reader;
