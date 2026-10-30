@@ -31,6 +31,9 @@ endif ()
 # Disable benchmark for milvus-storage (we don't need it and it may have missing deps)
 set(WITH_BENCHMARK OFF CACHE BOOL "" FORCE)
 
+# Enable the storage AWS CRT reader and the Rust S3 CRT bridge for this build.
+set(WITH_CRT ON CACHE BOOL "Build milvus-storage with AWS S3 CRT support" FORCE)
+
 # Conan 2.x: CMAKE_PREFIX_PATH is set by conan_toolchain.cmake.
 # find_package(Protobuf) sets Protobuf_PROTOC_EXECUTABLE automatically.
 # Fallback: search CMAKE_BINARY_DIR/bin for protoc installed by conan imports.
