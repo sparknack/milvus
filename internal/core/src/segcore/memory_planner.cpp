@@ -21,6 +21,7 @@
 #include <future>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <string>
 #include <utility>
@@ -109,20 +110,46 @@ BatchReaderMemoryLimit(int64_t batch_loaded_memory_bytes,
     return std::max<int64_t>(capped, FieldDataReadWindowBytes());
 }
 
+// One entry per immutable file in a BatchReaderFactory. Only metadata is shared;
+// each batch owns its reader, cursor, and read buffers. The factory (and thus
+// this metadata) dies when the current get_cells operation has joined its tasks.
+struct FileBatchMetadata {
+    std::mutex mutex;
+    std::shared_ptr<milvus_storage::PackedFileMetadata> metadata;
+};
+
 arrow::Result<std::vector<std::shared_ptr<arrow::Table>>>
 ReadFileRowGroupBlock(const milvus_storage::ArrowFileSystemPtr& fs,
                       const std::string& file,
                       int64_t rg_offset,
                       int64_t rg_count,
-                      int64_t reader_memory_limit) {
-    ARROW_ASSIGN_OR_RAISE(auto reader,
-                          milvus_storage::FileRowGroupReader::Make(
-                              fs,
-                              file,
-                              nullptr,
-                              reader_memory_limit,
-                              milvus::storage::GetReaderProperties(),
-                              milvus::storage::GetArrowReaderProperties()));
+                      int64_t reader_memory_limit,
+                      FileBatchMetadata& cached) {
+    auto open_reader =
+        [&](std::shared_ptr<milvus_storage::PackedFileMetadata> metadata) {
+            return milvus_storage::FileRowGroupReader::Make(
+                fs,
+                file,
+                nullptr,
+                reader_memory_limit,
+                milvus::storage::GetReaderProperties(),
+                milvus::storage::GetArrowReaderProperties(),
+                std::move(metadata));
+        };
+    std::shared_ptr<milvus_storage::FileRowGroupReader> reader;
+    {
+        std::unique_lock lock(cached.mutex);
+        if (!cached.metadata) {
+            // Publish only a successfully opened reader's metadata. A failed
+            // first open leaves the entry empty so a later attempt can retry.
+            ARROW_ASSIGN_OR_RAISE(reader, open_reader(nullptr));
+            cached.metadata = reader->file_metadata();
+        } else {
+            auto metadata = cached.metadata;
+            lock.unlock();
+            ARROW_ASSIGN_OR_RAISE(reader, open_reader(std::move(metadata)));
+        }
+    }
     auto close_guard = folly::makeGuard([&reader]() { (void)reader->Close(); });
     ARROW_RETURN_NOT_OK(reader->SetRowGroupOffsetAndCount(rg_offset, rg_count));
     std::vector<std::shared_ptr<arrow::Table>> tables;
@@ -509,15 +536,25 @@ MakeFileReaderFactory(std::vector<std::string> remote_files,
                       milvus_storage::ArrowFileSystemPtr fs) {
     auto files =
         std::make_shared<std::vector<std::string>>(std::move(remote_files));
-    return [files, fs](size_t batch_key,
-                       int64_t rg_offset,
-                       int64_t total_rg_count,
-                       int64_t reader_memory_limit)
-               -> arrow::Result<std::vector<std::shared_ptr<arrow::Table>>> {
-        const auto& file = (*files)[batch_key];
-        return ReadFileRowGroupBlock(
-            fs, file, rg_offset, total_rg_count, reader_memory_limit);
-    };
+    std::vector<std::shared_ptr<FileBatchMetadata>> metadata;
+    metadata.reserve(files->size());
+    for (size_t i = 0; i < files->size(); ++i) {
+        metadata.push_back(std::make_shared<FileBatchMetadata>());
+    }
+    return
+        [files, fs, metadata = std::move(metadata)](size_t batch_key,
+                                                    int64_t rg_offset,
+                                                    int64_t total_rg_count,
+                                                    int64_t reader_memory_limit)
+            -> arrow::Result<std::vector<std::shared_ptr<arrow::Table>>> {
+            const auto& file = (*files)[batch_key];
+            return ReadFileRowGroupBlock(fs,
+                                         file,
+                                         rg_offset,
+                                         total_rg_count,
+                                         reader_memory_limit,
+                                         *metadata[batch_key]);
+        };
 }
 
 BatchReaderFactory
