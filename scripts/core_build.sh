@@ -97,6 +97,7 @@ GPU_VERSION="OFF" #defaults to CPU version
 CUDA_ARCH="DEFAULT"
 EMBEDDED_MILVUS="OFF"
 BUILD_DISK_ANN="OFF"
+WITH_CRT="OFF"
 USE_ASAN="OFF"
 USE_DYNAMIC_SIMD="ON"
 USE_SVS="OFF"
@@ -112,7 +113,7 @@ fi
 : "${USE_UNITY_BUILD:="OFF"}"
 : "${USE_SPLIT_DWARF:="OFF"}"
 
-while getopts "p:t:s:n:a:y:x:f:S:ulcgbZh" arg; do
+while getopts "p:t:s:n:r:a:y:x:f:S:ulcgbZh" arg; do
   case $arg in
   p)
     INSTALL_PREFIX=$OPTARG
@@ -141,6 +142,9 @@ while getopts "p:t:s:n:a:y:x:f:S:ulcgbZh" arg; do
     ;;
   n)
     BUILD_DISK_ANN=$OPTARG
+    ;;
+  r)
+    WITH_CRT=$OPTARG
     ;;
   a)
     ENV_VAL=$OPTARG
@@ -175,6 +179,7 @@ parameter:
 -e: build without prometheus(default: OFF)
 -s: build with CUDA arch(default:DEFAULT), for example '-gencode=compute_61,code=sm_61;-gencode=compute_75,code=sm_75'
 -b: build embedded milvus(default: OFF)
+-r: build milvus-storage with AWS S3 CRT support: ON/OFF(default: OFF)
 -a: build milvus with AddressSanitizer(default: false)
 -Z: build milvus without azure-sdk-for-cpp, so cannot use azure blob
 -S: build milvus with SVS/Intel Scalable Vector Search(default: OFF)
@@ -182,7 +187,7 @@ parameter:
 -h: help
 
 usage:
-./core_build.sh -p \${INSTALL_PREFIX} -t \${BUILD_TYPE} -s \${CUDA_ARCH} -f \${TANTIVY_FEATURES} [-u] [-l] [-c] [-z] [-g] [-m] [-e] [-h] [-b] [-o]
+./core_build.sh -p \${INSTALL_PREFIX} -t \${BUILD_TYPE} -s \${CUDA_ARCH} -f \${TANTIVY_FEATURES} [-r ON|OFF] [-u] [-l] [-c] [-z] [-g] [-m] [-e] [-h] [-b] [-o]
                 "
     exit 0
     ;;
@@ -192,6 +197,14 @@ usage:
     ;;
   esac
 done
+
+case "$WITH_CRT" in
+  ON|OFF) ;;
+  *)
+    echo "ERROR! -r must be ON or OFF (got: $WITH_CRT)"
+    exit 1
+    ;;
+esac
 
 # Azure SDK build has been removed as we now use Arrow with Azure support directly
 
@@ -248,6 +261,7 @@ ${CMAKE_EXTRA_ARGS} \
 -DMILVUS_CUDA_ARCH=${CUDA_ARCH} \
 -DEMBEDDED_MILVUS=${EMBEDDED_MILVUS} \
 -DBUILD_DISK_ANN=${BUILD_DISK_ANN} \
+-DWITH_CRT=${WITH_CRT} \
 -DUSE_ASAN=${USE_ASAN} \
 -DUSE_DYNAMIC_SIMD=${USE_DYNAMIC_SIMD} \
 -DCPU_ARCH=${CPU_ARCH} \
