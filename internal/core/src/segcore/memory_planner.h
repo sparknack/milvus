@@ -169,11 +169,15 @@ LoadCellBatchAsync(milvus::OpContext* op_ctx,
  * FileRowGroupReader. This factory uses one reader for the requested contiguous
  * row group range and leaves row group internals to the storage/Arrow reader.
  * The returned factory owns a copy of remote_files, so the caller's vector
- * need not outlive the factory.
+ * need not outlive the factory. cell_specs describes exactly one attempt per
+ * requested row group; metadata is released when that file's attempts finish.
+ * The token cancels waits for another batch's first open, not in-flight I/O.
  */
 BatchReaderFactory
 MakeFileReaderFactory(std::vector<std::string> remote_files,
-                      milvus_storage::ArrowFileSystemPtr fs);
+                      milvus_storage::ArrowFileSystemPtr fs,
+                      const std::vector<CellSpec>& cell_specs,
+                      folly::CancellationToken cancellation_token = {});
 
 /**
  * Creates a BatchReaderFactory that reads from a ChunkReader via batch

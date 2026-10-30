@@ -16,6 +16,7 @@
 #include <cxxabi.h>
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <exception>
 #include <future>
@@ -110,11 +111,14 @@ BatchReaderMemoryLimit(int64_t batch_loaded_memory_bytes,
     return std::max<int64_t>(capped, FieldDataReadWindowBytes());
 }
 
-// One entry per immutable file in a BatchReaderFactory. Only metadata is shared;
-// each batch owns its reader, cursor, and read buffers. The factory (and thus
-// this metadata) dies when the current get_cells operation has joined its tasks.
+// Share metadata only while this file still has planned reads. Completed files
+// do not retain metadata until unrelated files finish loading.
 struct FileBatchMetadata {
     std::mutex mutex;
+    std::condition_variable ready;
+    bool opening = false;
+    bool initialized = false;
+    uint64_t remaining_row_groups = 0;
     std::shared_ptr<milvus_storage::PackedFileMetadata> metadata;
 };
 
@@ -124,7 +128,8 @@ ReadFileRowGroupBlock(const milvus_storage::ArrowFileSystemPtr& fs,
                       int64_t rg_offset,
                       int64_t rg_count,
                       int64_t reader_memory_limit,
-                      FileBatchMetadata& cached) {
+                      FileBatchMetadata& cached,
+                      const folly::CancellationToken& cancellation_token) {
     auto open_reader =
         [&](std::shared_ptr<milvus_storage::PackedFileMetadata> metadata) {
             return milvus_storage::FileRowGroupReader::Make(
@@ -136,14 +141,46 @@ ReadFileRowGroupBlock(const milvus_storage::ArrowFileSystemPtr& fs,
                 milvus::storage::GetArrowReaderProperties(),
                 std::move(metadata));
         };
+    auto release_metadata = folly::makeGuard([&cached, rg_count]() {
+        std::lock_guard lock(cached.mutex);
+        cached.remaining_row_groups -= std::min<uint64_t>(
+            cached.remaining_row_groups, std::max<int64_t>(rg_count, 0));
+        if (cached.remaining_row_groups == 0) {
+            cached.metadata.reset();
+            cached.initialized = false;
+        }
+    });
+    // Never hold the state mutex during I/O: cancellation must be able to wake
+    // waiting batches even while the first reader is blocked in the filesystem.
+    folly::CancellationCallback on_cancel(cancellation_token, [&cached]() {
+        std::lock_guard lock(cached.mutex);
+        cached.ready.notify_all();
+    });
     std::shared_ptr<milvus_storage::FileRowGroupReader> reader;
     {
         std::unique_lock lock(cached.mutex);
-        if (!cached.metadata) {
-            // Publish only a successfully opened reader's metadata. A failed
-            // first open leaves the entry empty so a later attempt can retry.
+        cached.ready.wait(lock, [&]() {
+            return !cached.opening ||
+                   cancellation_token.isCancellationRequested();
+        });
+        milvus::storage::ThrowIfCancelled(cancellation_token,
+                                          "ReadFileRowGroupBlock");
+        if (!cached.initialized) {
+            cached.opening = true;
+            lock.unlock();
+            auto finish_open = folly::makeGuard([&cached]() {
+                std::lock_guard lock(cached.mutex);
+                cached.opening = false;
+                cached.ready.notify_all();
+            });
+            // Failed opens publish nothing. Encrypted files disable reuse after
+            // their first successful open; later readers open independently.
             ARROW_ASSIGN_OR_RAISE(reader, open_reader(nullptr));
-            cached.metadata = reader->file_metadata();
+            std::lock_guard publish_lock(cached.mutex);
+            cached.initialized = true;
+            if (reader->file_metadata()->reusable_for_reading()) {
+                cached.metadata = reader->file_metadata();
+            }
         } else {
             auto metadata = cached.metadata;
             lock.unlock();
@@ -151,6 +188,8 @@ ReadFileRowGroupBlock(const milvus_storage::ArrowFileSystemPtr& fs,
         }
     }
     auto close_guard = folly::makeGuard([&reader]() { (void)reader->Close(); });
+    milvus::storage::ThrowIfCancelled(cancellation_token,
+                                      "ReadFileRowGroupBlock");
     ARROW_RETURN_NOT_OK(reader->SetRowGroupOffsetAndCount(rg_offset, rg_count));
     std::vector<std::shared_ptr<arrow::Table>> tables;
     tables.reserve(rg_count);
@@ -533,7 +572,9 @@ LoadCellBatchAsync(milvus::OpContext* op_ctx,
 
 BatchReaderFactory
 MakeFileReaderFactory(std::vector<std::string> remote_files,
-                      milvus_storage::ArrowFileSystemPtr fs) {
+                      milvus_storage::ArrowFileSystemPtr fs,
+                      const std::vector<CellSpec>& cell_specs,
+                      folly::CancellationToken cancellation_token) {
     auto files =
         std::make_shared<std::vector<std::string>>(std::move(remote_files));
     std::vector<std::shared_ptr<FileBatchMetadata>> metadata;
@@ -541,20 +582,33 @@ MakeFileReaderFactory(std::vector<std::string> remote_files,
     for (size_t i = 0; i < files->size(); ++i) {
         metadata.push_back(std::make_shared<FileBatchMetadata>());
     }
-    return
-        [files, fs, metadata = std::move(metadata)](size_t batch_key,
-                                                    int64_t rg_offset,
-                                                    int64_t total_rg_count,
-                                                    int64_t reader_memory_limit)
-            -> arrow::Result<std::vector<std::shared_ptr<arrow::Table>>> {
-            const auto& file = (*files)[batch_key];
-            return ReadFileRowGroupBlock(fs,
-                                         file,
-                                         rg_offset,
-                                         total_rg_count,
-                                         reader_memory_limit,
-                                         *metadata[batch_key]);
-        };
+    for (const auto& cell : cell_specs) {
+        AssertInfo(cell.file_idx < metadata.size() && cell.rg_count > 0,
+                   "Invalid file index or row group count in load cell");
+        auto& remaining = metadata[cell.file_idx]->remaining_row_groups;
+        AssertInfo(static_cast<uint64_t>(cell.rg_count) <=
+                       std::numeric_limits<uint64_t>::max() - remaining,
+                   "Row group count overflows in file reader factory");
+        remaining += cell.rg_count;
+    }
+    return [files,
+            fs,
+            metadata = std::move(metadata),
+            cancellation_token = std::move(cancellation_token)](
+               size_t batch_key,
+               int64_t rg_offset,
+               int64_t total_rg_count,
+               int64_t reader_memory_limit)
+               -> arrow::Result<std::vector<std::shared_ptr<arrow::Table>>> {
+        const auto& file = (*files)[batch_key];
+        return ReadFileRowGroupBlock(fs,
+                                     file,
+                                     rg_offset,
+                                     total_rg_count,
+                                     reader_memory_limit,
+                                     *metadata[batch_key],
+                                     cancellation_token);
+    };
 }
 
 BatchReaderFactory

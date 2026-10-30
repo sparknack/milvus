@@ -365,7 +365,11 @@ GroupChunkTranslator::get_cells(milvus::OpContext* ctx,
     // Submit cell-batch loading tasks
     auto fs = milvus::segcore::GetDefaultArrowFileSystem();
 
-    auto factory = milvus::segcore::MakeFileReaderFactory(insert_files_, fs);
+    auto factory = milvus::segcore::MakeFileReaderFactory(
+        insert_files_,
+        fs,
+        cell_specs,
+        ctx ? ctx->cancellation_token : folly::CancellationToken());
     auto finalize_cell =
         [this](const std::vector<std::shared_ptr<arrow::Table>>& tables,
                int64_t cid) {

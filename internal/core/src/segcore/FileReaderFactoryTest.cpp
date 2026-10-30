@@ -15,6 +15,8 @@
 // limitations under the License.
 
 #include <atomic>
+#include <chrono>
+#include <functional>
 #include <future>
 #include <map>
 #include <memory>
@@ -30,6 +32,7 @@
 #include "milvus-storage/common/constants.h"
 #include "milvus-storage/common/metadata.h"
 #include "segcore/memory_planner.h"
+#include "common/EasyAssert.h"
 
 namespace milvus::segcore {
 namespace {
@@ -122,6 +125,9 @@ class CountingFileSystem : public arrow::fs::LocalFileSystem {
     using LocalFileSystem::OpenInputFile;
     arrow::Result<std::shared_ptr<arrow::io::RandomAccessFile>>
     OpenInputFile(const std::string& path) override {
+        ++open_calls;
+        if (on_open)
+            on_open(path);
         if (fail_open.exchange(false)) {
             return arrow::Status::IOError("injected open failure");
         }
@@ -130,6 +136,8 @@ class CountingFileSystem : public arrow::fs::LocalFileSystem {
     std::map<std::string, std::shared_ptr<arrow::Buffer>> files;
     std::shared_ptr<ReadCounters> counters = std::make_shared<ReadCounters>();
     std::atomic<bool> fail_open{false};
+    std::atomic<int> open_calls{0};
+    std::function<void(const std::string&)> on_open;
 };
 
 // Real packed Parquet bytes, with four distinguishable row groups.
@@ -191,7 +199,8 @@ class FileReaderFactoryTest : public ::testing::Test {
 };
 
 TEST_F(FileReaderFactoryTest, ConcurrentBatchesReadOneFooterPerFile) {
-    auto factory = MakeFileReaderFactory({"first", "second"}, fs);
+    auto factory = MakeFileReaderFactory(
+        {"first", "second"}, fs, {{0, 0, 0, 12}, {1, 1, 0, 8}});
     std::promise<void> start;
     auto ready = start.get_future().share();
     std::vector<std::future<void>> tasks;
@@ -218,7 +227,7 @@ TEST_F(FileReaderFactoryTest, ConcurrentBatchesReadOneFooterPerFile) {
 }
 
 TEST_F(FileReaderFactoryTest, FailedFirstOpenIsNotCached) {
-    auto factory = MakeFileReaderFactory({"first"}, fs);
+    auto factory = MakeFileReaderFactory({"first"}, fs, {{0, 0, 0, 3}});
     fs->fail_open = true;
     auto failed = factory(0, 0, 1, 32);
     ASSERT_FALSE(failed.ok());
@@ -230,7 +239,7 @@ TEST_F(FileReaderFactoryTest, FailedFirstOpenIsNotCached) {
 }
 
 TEST_F(FileReaderFactoryTest, FailedFooterReadIsNotCached) {
-    auto factory = MakeFileReaderFactory({"first"}, fs);
+    auto factory = MakeFileReaderFactory({"first"}, fs, {{0, 0, 0, 3}});
     fs->counters->fail_read = true;
     auto failed = factory(0, 0, 1, 32);
     ASSERT_FALSE(failed.ok());
@@ -240,7 +249,7 @@ TEST_F(FileReaderFactoryTest, FailedFooterReadIsNotCached) {
 }
 
 TEST_F(FileReaderFactoryTest, DataFailureDoesNotPoisonCachedMetadata) {
-    auto factory = MakeFileReaderFactory({"first"}, fs);
+    auto factory = MakeFileReaderFactory({"first"}, fs, {{0, 0, 0, 3}});
     ASSERT_TRUE(factory(0, 0, 1, 32).ok());
     fs->counters->fail_read = true;
     auto failed = factory(0, 1, 1, 32);
@@ -252,13 +261,13 @@ TEST_F(FileReaderFactoryTest, DataFailureDoesNotPoisonCachedMetadata) {
 
 TEST_F(FileReaderFactoryTest, NewFactoryHasItsOwnMetadataLifetime) {
     {
-        auto factory = MakeFileReaderFactory({"first"}, fs);
+        auto factory = MakeFileReaderFactory({"first"}, fs, {{0, 0, 0, 3}});
         ASSERT_TRUE(factory(0, 0, 1, 32).ok());
     }
     auto replacement = MakePackedFile(1000);
     ASSERT_TRUE(replacement.ok()) << replacement.status();
     fs->files["first"] = *replacement;
-    auto factory = MakeFileReaderFactory({"first"}, fs);
+    auto factory = MakeFileReaderFactory({"first"}, fs, {{0, 0, 0, 3}});
     auto result = factory(0, 0, 1, 32);
     ASSERT_TRUE(result.ok()) << result.status();
     EXPECT_EQ(std::static_pointer_cast<arrow::Int64Array>(
@@ -270,9 +279,105 @@ TEST_F(FileReaderFactoryTest, NewFactoryHasItsOwnMetadataLifetime) {
 
 TEST_F(FileReaderFactoryTest, CorruptFooterRemainsAnError) {
     fs->files["broken"] = arrow::Buffer::FromString("not parquet");
-    auto factory = MakeFileReaderFactory({"broken"}, fs);
+    auto factory = MakeFileReaderFactory({"broken"}, fs, {{0, 0, 0, 2}});
     EXPECT_FALSE(factory(0, 0, 1, 32).ok());
     EXPECT_FALSE(factory(0, 0, 1, 32).ok());
+}
+
+TEST_F(FileReaderFactoryTest,
+       CompletedFileDropsMetadataBeforeOtherFilesFinish) {
+    auto factory = MakeFileReaderFactory(
+        {"first", "second"}, fs, {{0, 0, 0, 2}, {1, 1, 0, 1}});
+    ASSERT_TRUE(factory(0, 0, 1, 32).ok());
+    ASSERT_TRUE(factory(0, 1, 1, 32).ok());
+    EXPECT_EQ(fs->counters->footer_reads, 1);
+    // Probe the completed file again while the second file is still pending.
+    // Its cache must already be gone, even though this factory is still alive.
+    ASSERT_TRUE(factory(0, 2, 1, 32).ok());
+    EXPECT_EQ(fs->counters->footer_reads, 2);
+    ASSERT_TRUE(factory(1, 0, 1, 32).ok());
+    EXPECT_EQ(fs->counters->footer_reads, 3);
+}
+
+TEST_F(FileReaderFactoryTest, FailedLastReadAlsoDropsMetadata) {
+    auto factory = MakeFileReaderFactory(
+        {"first", "second"}, fs, {{0, 0, 0, 2}, {1, 1, 0, 1}});
+    ASSERT_TRUE(factory(0, 0, 1, 32).ok());
+    fs->counters->fail_read = true;
+    EXPECT_FALSE(factory(0, 1, 1, 32).ok());
+    ASSERT_TRUE(factory(0, 2, 1, 32).ok());
+    EXPECT_EQ(fs->counters->footer_reads, 2);
+}
+
+TEST_F(FileReaderFactoryTest, CancellationWakesWaiterWhileFirstOpenIsBlocked) {
+    folly::CancellationSource source;
+    auto factory =
+        MakeFileReaderFactory({"first"}, fs, {{0, 0, 0, 2}}, source.getToken());
+    std::promise<void> entered, release, waiter_started;
+    auto entered_future = entered.get_future();
+    auto released = release.get_future().share();
+    std::atomic<bool> first_open{true};
+    fs->on_open = [&](const std::string&) {
+        if (first_open.exchange(false)) {
+            entered.set_value();
+            released.wait();
+        }
+    };
+    auto read = [&]() {
+        try {
+            (void)factory(0, 0, 1, 32);
+            return false;
+        } catch (const milvus::SegcoreError& error) {
+            return error.get_error_code() == milvus::ErrorCode::FollyCancel;
+        }
+    };
+    auto first = std::async(std::launch::async, read);
+    EXPECT_EQ(entered_future.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    auto waiter = std::async(std::launch::async, [&]() {
+        waiter_started.set_value();
+        return read();
+    });
+    waiter_started.get_future().wait();
+    auto cancel =
+        std::async(std::launch::async, [&]() { source.requestCancellation(); });
+    auto cancel_status = cancel.wait_for(std::chrono::seconds(2));
+    auto waiter_status = waiter.wait_for(std::chrono::seconds(2));
+    auto calls_before_release = fs->open_calls.load();
+    // Always unblock the leader before assertions or future destruction.
+    release.set_value();
+    cancel.get();
+    EXPECT_EQ(cancel_status, std::future_status::ready);
+    EXPECT_EQ(waiter_status, std::future_status::ready);
+    EXPECT_EQ(calls_before_release, 1);
+    EXPECT_TRUE(waiter.get());
+    EXPECT_TRUE(first.get());
+}
+
+TEST_F(FileReaderFactoryTest, FirstOpenFailureWakesWaitingBatch) {
+    auto factory = MakeFileReaderFactory({"first"}, fs, {{0, 0, 0, 2}});
+    std::promise<void> entered, release;
+    auto released = release.get_future().share();
+    std::atomic<bool> first_open{true};
+    fs->fail_open = true;
+    fs->on_open = [&](const std::string&) {
+        if (first_open.exchange(false)) {
+            entered.set_value();
+            released.wait();
+        }
+    };
+    auto first =
+        std::async(std::launch::async, [&]() { return factory(0, 0, 1, 32); });
+    entered.get_future().wait();
+    auto waiter =
+        std::async(std::launch::async, [&]() { return factory(0, 1, 1, 32); });
+    release.set_value();
+    auto failed = first.get();
+    EXPECT_FALSE(failed.ok());
+    EXPECT_TRUE(failed.status().IsIOError());
+    auto result = waiter.get();
+    ASSERT_TRUE(result.ok()) << result.status();
+    EXPECT_EQ(fs->counters->footer_reads, 1);
 }
 
 }  // namespace
