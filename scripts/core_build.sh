@@ -97,7 +97,7 @@ GPU_VERSION="OFF" #defaults to CPU version
 CUDA_ARCH="DEFAULT"
 EMBEDDED_MILVUS="OFF"
 BUILD_DISK_ANN="OFF"
-WITH_CRT="OFF"
+: "${WITH_CRT:="OFF"}"
 USE_ASAN="OFF"
 USE_DYNAMIC_SIMD="ON"
 USE_SVS="OFF"
@@ -179,7 +179,7 @@ parameter:
 -e: build without prometheus(default: OFF)
 -s: build with CUDA arch(default:DEFAULT), for example '-gencode=compute_61,code=sm_61;-gencode=compute_75,code=sm_75'
 -b: build embedded milvus(default: OFF)
--r: build milvus-storage with AWS S3 CRT support: ON/OFF(default: OFF)
+-r: build milvus-storage with AWS S3 CRT support: ON/OFF(default: WITH_CRT environment variable, or OFF)
 -a: build milvus with AddressSanitizer(default: false)
 -Z: build milvus without azure-sdk-for-cpp, so cannot use azure blob
 -S: build milvus with SVS/Intel Scalable Vector Search(default: OFF)
