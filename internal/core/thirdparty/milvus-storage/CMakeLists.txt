@@ -14,7 +14,9 @@
 # Update milvus-storage_VERSION for the first occurrence
 milvus_add_pkg_config("milvus-storage")
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY INCLUDE_DIRECTORIES "")
-set( milvus-storage_VERSION f38765d)
+# StorageV2 footer LRU, including plaintext caching with decryption configured.
+# Pin before the later PreparedParquetFile replacement for the LRU experiment.
+set( milvus-storage_VERSION 33c7ac44301039255de7caf37681b882912f4250)
 set( GIT_REPOSITORY  "https://github.com/milvus-io/milvus-storage.git")
 message(STATUS "milvus-storage repo: ${GIT_REPOSITORY}")
 message(STATUS "milvus-storage version: ${milvus-storage_VERSION}")
