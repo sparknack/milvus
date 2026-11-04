@@ -1,3 +1,12 @@
+# Keep all builders serial in this disposable CI diagnostic branch.
+override export MAKEFLAGS := -j1
+override export jobs := 1
+override export CONAN_CPU_COUNT := 1
+override export CMAKE_BUILD_PARALLEL_LEVEL := 1
+override export CARGO_BUILD_JOBS := 1
+override export GOFLAGS += -p=1
+override export CMAKE_EXTRA_ARGS += -DMAKE_BUILD_ARGS=-j1
+
 # Copyright (C) 2019-2020 Zilliz. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance

@@ -31,12 +31,6 @@ if [[ ! ${jobs+1} ]]; then
     fi
 fi
 
-# Bound this disposable CI diagnostic build, including nested builders.
-if (( jobs > 4 )); then jobs=4; fi
-export CONAN_CPU_COUNT=1 CMAKE_BUILD_PARALLEL_LEVEL=1 CARGO_BUILD_JOBS=1
-export GOFLAGS="${GOFLAGS:+${GOFLAGS} }-p=1"
-export CMAKE_EXTRA_ARGS="${CMAKE_EXTRA_ARGS:-} -DMAKE_BUILD_ARGS=-j1"
-
 function get_cpu_arch {
   local CPU_ARCH=$1
 
