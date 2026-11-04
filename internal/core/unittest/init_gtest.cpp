@@ -11,6 +11,8 @@
 
 #include <gtest/gtest.h>
 #include <stdint.h>
+#include <unistd.h>
+#include <cstdio>
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
@@ -44,6 +46,33 @@ std::string TestMmapPath;
 
 int
 main(int argc, char** argv) {
+    if (std::filesystem::path(argv[0]).filename() == "index_tests" &&
+        std::getenv("MILVUS_INDEX_CI_GDB") == nullptr) {
+        execlp("gdb",
+               "gdb",
+               "--batch",
+               "--return-child-result",
+               "-ex",
+               "set pagination off",
+               "-ex",
+               "set print thread-events off",
+               "-ex",
+               "set environment MILVUS_INDEX_CI_GDB 1",
+               "-ex",
+               "run",
+               "-ex",
+               "thread apply all bt 40",
+               "-ex",
+               "info registers",
+               "-ex",
+               "x/12i $pc-24",
+               "--args",
+               argv[0],
+               "--gtest_filter=LegacyIndexLoadTest.*",
+               nullptr);
+        std::perror("exec gdb");
+        return 127;
+    }
     ::testing::InitGoogleTest(&argc, argv);
     folly::Init follyInit(&argc, &argv, false);
 
