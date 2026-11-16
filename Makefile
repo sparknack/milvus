@@ -9,6 +9,16 @@
 # is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 # or implied. See the License for the specific language governing permissions and limitations under the License.
 
+# Local reproduction only: serialize stages and cap nested builders at 16.
+.NOTPARALLEL:
+override export jobs := 16
+override export CONAN_CPU_COUNT := 16
+override export CMAKE_BUILD_PARALLEL_LEVEL := 16
+# Cargo runs inside one of Ninja's 16 jobs, alongside C++ compilation.
+override export CARGO_BUILD_JOBS := 1
+override export GOFLAGS += -p=16
+override export CMAKE_EXTRA_ARGS += -DMAKE_BUILD_ARGS=-j16
+
 GO		  ?= go
 PYTHON	  ?= python3
 RUFF	  ?= ruff

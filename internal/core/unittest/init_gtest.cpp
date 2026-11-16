@@ -11,12 +11,15 @@
 
 #include <gtest/gtest.h>
 #include <stdint.h>
+#include <unistd.h>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "cachinglayer/Manager.h"
 #include "common/common_type_c.h"
@@ -44,6 +47,37 @@ std::string TestMmapPath;
 
 int
 main(int argc, char** argv) {
+    // Diagnostic branch only: isolate the CI crash and preserve its stack.
+    if (std::filesystem::path(argv[0]).filename() != "all_tests") {
+        return 0;
+    }
+    bool listing = false;
+    for (int i = 1; i < argc; ++i) {
+        listing |= std::string(argv[i]).starts_with("--gtest_list_tests");
+    }
+    if (!listing && std::getenv("PR55513_GDB_CHILD") == nullptr) {
+        setenv("PR55513_GDB_CHILD", "1", 1);
+        std::vector<std::string> arguments{
+            "gdb", "--batch", "--return-child-result",
+            "-ex", "set pagination off",
+            "-ex", "set print thread-events off",
+            "-ex", "run",
+            "-ex", "thread apply all bt 25", "--args"};
+        for (int i = 0; i < argc; ++i) {
+            arguments.emplace_back(argv[i]);
+        }
+        arguments.emplace_back("--gtest_filter=AsyncIndexEntryReaderTest.CancelledMetadataAdmissionPreservesErrorCode");
+        arguments.emplace_back("--gtest_repeat=1000");
+        arguments.emplace_back("--gtest_break_on_failure");
+        std::vector<char*> command;
+        for (auto& argument : arguments) {
+            command.push_back(argument.data());
+        }
+        command.push_back(nullptr);
+        execvp(command[0], command.data());
+        std::perror("Cannot launch GDB for PR #55513 reproduction");
+        return 2;
+    }
     ::testing::InitGoogleTest(&argc, argv);
     folly::Init follyInit(&argc, &argv, false);
 
