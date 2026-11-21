@@ -466,10 +466,7 @@ PrepareTargetsAsync(const std::vector<EntryLoadPlan>& entries,
                          "AsyncIndexEntryReader::PrepareTarget");
         co_await folly::coro::co_withExecutor(
             ResolveAsyncLoadExecutor(
-                LocalFileIOPool::GetInstance().GetExecutor(),
-                priority,
-                GetAsyncLoadSequence(
-                    co_await folly::coro::co_current_executor)),
+                LocalFileIOPool::GetInstance().GetExecutor(), priority),
             PrepareFileTargetAsync(target, priority, cancellation_token));
         ThrowIfCancelled(cancellation_token,
                          "AsyncIndexEntryReader::PrepareTarget");
@@ -526,10 +523,7 @@ AsyncIndexEntryReader::ReadEntriesAsyncImpl(
     ThrowIfCancelled(operation_cancellation_token,
                      "AsyncIndexEntryReader::PlanValidation");
     ValidatePlan(Directory(), entries);
-    auto work_executor = ResolveAsyncLoadExecutor(
-        {},
-        priority,
-        GetAsyncLoadSequence(co_await folly::coro::co_current_executor));
+    auto work_executor = ResolveAsyncLoadExecutor({}, priority);
     AssertInfo(static_cast<bool>(work_executor),
                "Shared LoadExecutor is unavailable");
     co_await PrepareTargetsAsync(
@@ -644,11 +638,10 @@ AsyncIndexEntryReader::ReadEntriesAsyncImpl(
         auto [entry_index, slice_index] = *next;
         const auto& slice = states[entry_index]->slices[slice_index];
         try {
-            auto lease = co_await budget.AcquireAsync(
-                {slice.admission_bytes, 1},
-                budget_priority,
-                effective_cancellation_token,
-                GetAsyncLoadSequence(work_executor.get()));
+            auto lease =
+                co_await budget.AcquireAsync({slice.admission_bytes, 1},
+                                             budget_priority,
+                                             effective_cancellation_token);
             if (failure_state->FirstError() != nullptr) {
                 break;
             }
@@ -692,10 +685,7 @@ AsyncIndexEntryReader::ReadEntriesAsyncImpl(
     if (!cleanup_targets.empty()) {
         co_await folly::coro::co_withExecutor(
             ResolveAsyncLoadExecutor(
-                LocalFileIOPool::GetInstance().GetExecutor(),
-                priority,
-                GetAsyncLoadSequence(
-                    co_await folly::coro::co_current_executor)),
+                LocalFileIOPool::GetInstance().GetExecutor(), priority),
             FinishFileTargetsAsync(cleanup_targets,
                                    operation_cancellation_token));
     }

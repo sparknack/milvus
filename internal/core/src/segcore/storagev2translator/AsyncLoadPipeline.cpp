@@ -212,11 +212,8 @@ LoadWindowAsync(const int64_t segment_id,
         }
 
         co_await folly::coro::co_withExecutor(
-            storage::ResolveAsyncLoadExecutor(
-                std::move(finalization_executor),
-                load_priority,
-                storage::GetAsyncLoadSequence(
-                    co_await folly::coro::co_current_executor)),
+            storage::ResolveAsyncLoadExecutor(std::move(finalization_executor),
+                                              load_priority),
             FinalizeWindowAsync(segment_id,
                                 cancellation_token,
                                 std::move(window),
@@ -308,11 +305,10 @@ ReadCellsAsyncImpl(
                     windows[i].budget_bytes,
                     priority_name);
             }
-            auto lease = co_await admission.AcquireAsync(
-                {windows[i].budget_bytes, 1},
-                admission_priority,
-                window_cancellation_token,
-                storage::GetAsyncLoadSequence(work_executor.get()));
+            auto lease =
+                co_await admission.AcquireAsync({windows[i].budget_bytes, 1},
+                                                admission_priority,
+                                                window_cancellation_token);
             if (debug_logging_enabled) {
                 const auto admission_wait_us =
                     std::chrono::duration_cast<std::chrono::microseconds>(
@@ -450,10 +446,8 @@ ReadCellsAsync(const milvus::OpContext* ctx,
                CellReadCallback consume_cell,
                AsyncLoadPipelineOptions options) {
     try {
-        auto executor_keep_alive =
-            storage::ResolveAsyncLoadExecutor(std::move(options.executor),
-                                              options.load_priority,
-                                              ctx ? ctx->sequence_id : 0);
+        auto executor_keep_alive = storage::ResolveAsyncLoadExecutor(
+            std::move(options.executor), options.load_priority);
         auto finalization_executor_provider =
             std::move(options.finalization_executor_provider);
         const auto admission_priority =

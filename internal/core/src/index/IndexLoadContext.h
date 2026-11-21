@@ -15,8 +15,6 @@
 
 #pragma once
 
-#include <optional>
-
 #include "common/OpContext.h"
 
 namespace milvus::index {
@@ -26,11 +24,10 @@ namespace milvus::index {
 class IndexLoadContext {
  public:
     IndexLoadContext(milvus::OpContext* parent, int32_t configured_priority)
-        : ctx(parent ? parent->cancellation_token : folly::CancellationToken{},
-              parent ? std::make_optional(parent->sequence_id) : std::nullopt),
-          parent_(parent) {
+        : parent_(parent) {
         ctx.runtime_load_priority = configured_priority;
         if (parent_ != nullptr) {
+            ctx.cancellation_token = parent_->cancellation_token;
             ctx.runtime_load_priority =
                 parent_->runtime_load_priority.value_or(configured_priority);
             ctx.coload_fields = parent_->coload_fields;

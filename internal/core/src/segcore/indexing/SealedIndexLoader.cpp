@@ -85,8 +85,7 @@ MakeRemoteSource(const index::IndexFamily& requested_family,
             ? proto::common::LoadPriority::LOW
             : proto::common::LoadPriority::HIGH;
     return folly::coro::blockingWait(folly::coro::co_withExecutor(
-        storage::ResolveAsyncLoadExecutor(
-            {}, priority, options.op_ctx ? options.op_ctx->sequence_id : 0),
+        storage::ResolveAsyncLoadExecutor({}, priority),
         storage::V1RemoteSource::OpenAsync(
             context,
             remote_paths,
@@ -223,8 +222,7 @@ SealedIndexLoader::SealedIndexLoader(
         if (*file_manager_context_.use_async_load) {
             resolved_family =
                 folly::coro::blockingWait(folly::coro::co_withExecutor(
-                    storage::ResolveAsyncLoadExecutor(
-                        {}, priority, metadata_ctx.ctx.sequence_id),
+                    storage::ResolveAsyncLoadExecutor({}, priority),
                     index::ResolveLoadFamilyAsync(
                         adapted.family, *source, config_)));
         } else {
@@ -265,8 +263,7 @@ SealedIndexLoader::SealedIndexLoader(
                 folly::coro::blockingWait(folly::coro::co_withExecutor(
                     storage::ResolveAsyncLoadExecutor(
                         storage::LocalFileIOPool::GetInstance().GetExecutor(),
-                        priority,
-                        metadata_ctx.ctx.sequence_id),
+                        priority),
                     index::LegacyScalarIndexLoadResourceAsync(
                         index_load_info_.field_type,
                         index_load_info_.index_size,
@@ -308,8 +305,7 @@ SealedIndexLoader::SealedIndexLoader(
             folly::coro::blockingWait(folly::coro::co_withExecutor(
                 storage::ResolveAsyncLoadExecutor(
                     storage::LocalFileIOPool::GetInstance().GetExecutor(),
-                    priority,
-                    metadata_ctx.ctx.sequence_id),
+                    priority),
                 index::LegacyVectorFileLoadResourceAsync(
                     load_resource_request_,
                     Family() == index::families::kVectorDisk,

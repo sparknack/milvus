@@ -18,9 +18,7 @@
 
 #include <chrono>
 #include <cstddef>
-#include <cstdint>
-#include <limits>
-#include <map>
+#include <list>
 #include <memory>
 #include <mutex>
 
@@ -86,8 +84,7 @@ class LoadAdmissionLease {
 // Jointly admits transient bytes and slots held by submitted load work. Zero
 // capacity disables that dimension's limit. Oversized byte requests may run
 // when no other bytes are reserved, but must still satisfy the slot limit.
-// High priority precedes low priority; each class uses sequence_id then FIFO.
-// Unspecified sequences follow numbered loads within their priority. Sustained high
+// High priority precedes low priority; each class is FIFO. Sustained high
 // priority traffic may starve low priority work. Waiters reserve neither resource.
 // A weighted request above the total slot capacity waits for a capacity increase
 // or cancellation; callers must size requests to permit progress.
@@ -101,13 +98,11 @@ class LoadAdmissionController {
     static void
     SetLoadTransientBudgetBytes(size_t bytes);
 
-    // Asynchronously waits for a cancellable RAII reservation. Within a priority,
-    // older sequence_id values run first; 0 follows numbered loads, with FIFO ties.
+    // Asynchronously waits for a cancellable RAII reservation.
     [[nodiscard]] folly::coro::Future<LoadAdmissionLease>
     AcquireAsync(LoadAdmissionRequest request,
                  LoadAdmissionPriority priority,
-                 const folly::CancellationToken& cancellation_token = {},
-                 uint64_t sequence_id = 0);
+                 const folly::CancellationToken& cancellation_token = {});
 
     // Blocks until the requested reservation is admitted. The caller must not
     // hold inflight work whose completion is needed to release budget.
@@ -161,8 +156,7 @@ class LoadAdmissionController {
  private:
     using Clock = std::chrono::steady_clock;
     struct PendingAdmission;
-    using PendingQueue =
-        std::multimap<uint64_t, std::shared_ptr<PendingAdmission>>;
+    using PendingQueue = std::list<std::shared_ptr<PendingAdmission>>;
 
     struct PendingAdmission {
         enum class State {
@@ -205,10 +199,8 @@ class LoadAdmissionController {
     CanAcquireCapacityLocked(LoadAdmissionRequest request) const;
 
     [[nodiscard]] bool
-    CanAdmitImmediatelyLocked(
-        LoadAdmissionPriority priority,
-        LoadAdmissionRequest request,
-        uint64_t sequence_id = std::numeric_limits<uint64_t>::max()) const;
+    CanAdmitImmediatelyLocked(LoadAdmissionPriority priority,
+                              LoadAdmissionRequest request) const;
 
     // Transfers the single node prepared outside mu_ into its priority queue.
     void

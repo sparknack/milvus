@@ -16,8 +16,6 @@
 
 #pragma once
 
-#include <cstdint>
-
 #include "folly/Executor.h"
 #include "pb/common.pb.h"
 
@@ -33,34 +31,11 @@ SetAsyncLoadThreadPoolSize(int threads);
 [[nodiscard]] int
 GetAsyncLoadThreadPoolSize();
 
-// Sets task-count weights in URGENT/HIGH/LOW order without creating the pool.
-// Non-positive values restore 32:8:1. Existing queues start a fresh quota round.
-void
-SetAsyncLoadSchedulingWeights(int urgent, int high, int low);
-
-// Reads the immutable sequence bound to a coroutine's current executor; 0 if absent.
-[[nodiscard]] uint64_t
-GetAsyncLoadSequence(const folly::Executor* executor) noexcept;
-
-// CPU scheduling classes; independent of the two-class wire/admission priority.
-enum class AsyncLoadPriority { Urgent, High, Low };
-
-// Binds priority and sequence_id to every submission/resumption. The default pool
-// uses configured URGENT:HIGH:LOW task quotas (default 32:8:1), skipping empty classes.
-// Within a class: sequence_id, then FIFO; 0 follows numbered loads.
-// Custom executors keep their own queue discipline but retain the bound sequence.
-// An already bound executor retains its sequence when sequence_id is omitted.
-// Quotas count task reservations, not CPU time; running tasks are not preempted.
-// Default Linux workers use nice 19 independently of their task priority.
+// Returns a priority-aware keep-alive for the supplied executor, or for the
+// process-wide async-load executor when executor is empty.
+// Default Linux workers use nice 19 independently of their HIGH/LOW task queue.
 [[nodiscard]] folly::Executor::KeepAlive<>
 ResolveAsyncLoadExecutor(folly::Executor::KeepAlive<> executor,
-                         AsyncLoadPriority priority,
-                         uint64_t sequence_id = 0);
-
-// Existing wire priorities map to High/Low; this does not promote Search.
-[[nodiscard]] folly::Executor::KeepAlive<>
-ResolveAsyncLoadExecutor(folly::Executor::KeepAlive<> executor,
-                         milvus::proto::common::LoadPriority load_priority,
-                         uint64_t sequence_id = 0);
+                         milvus::proto::common::LoadPriority load_priority);
 
 }  // namespace milvus::storage
