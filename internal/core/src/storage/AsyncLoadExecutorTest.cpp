@@ -15,6 +15,9 @@
 // limitations under the License.
 
 #include "storage/AsyncLoadExecutor.h"
+#include "storage/ThreadPools.h"
+#include "folly/futures/Future.h"
+#include "folly/executors/thread_factory/NamedThreadFactory.h"
 
 #include <atomic>
 #include <array>
@@ -39,6 +42,134 @@
 
 namespace milvus::storage {
 namespace {
+
+// Freeze one worker so assertions concern pending-queue order, not racing
+// completion times. Use the actual MIDDLE factory and operation binding.
+TEST(AsyncLoadExecutorTest, MiddleOrdersOlderCompletionBeforeNewFields) {
+    auto& pool = ThreadPools::GetExecutor(MIDDLE);
+    auto ratio = MIDDLE_PRIORITY_THREAD_CORE_COEFFICIENT.load();
+    auto restore =
+        folly::makeGuard([&] { ThreadPools::ResizeThreadPool(MIDDLE, ratio); });
+    ThreadPools::ResizeThreadPool(MIDDLE, 1.0F / CPU_NUM);
+    ASSERT_EQ(pool.getNumPriorities(), 3);
+    std::promise<void> release, started;
+    auto gate = release.get_future().share();
+    auto blocker = folly::via(&pool, [&] {
+        started.set_value();
+        gate.wait();
+    });
+    auto unblock = folly::makeGuard([&] { release.set_value(); });
+    started.get_future().wait();
+    std::vector<int> order;
+    std::vector<folly::Future<folly::Unit>> work;
+    milvus::OpContext older({}, 10), newer({}, 20);
+    newer.runtime_load_priority = proto::common::LoadPriority::HIGH;
+    older.runtime_load_priority = proto::common::LoadPriority::HIGH;
+    auto add = [&](const OpContext* ctx,
+                   int id,
+                   proto::common::LoadPriority configured =
+                       proto::common::LoadPriority::HIGH) {
+        auto executor = ThreadPools::GetMiddleLoadExecutor(ctx, configured);
+        EXPECT_EQ(GetAsyncLoadSequence(executor.get()),
+                  ctx ? ctx->sequence_id : 0);
+        work.push_back(
+            folly::via(executor.get(), [&order, id] { order.push_back(id); }));
+    };
+    add(&newer, 20);  // New field work arrived before old JSON completion.
+    add(nullptr, 0);
+    add(&older, 10);
+    add(&older, 11);  // Equal sequence stays FIFO.
+    older.runtime_load_priority = proto::common::LoadPriority::LOW;
+    add(&older, 30);  // Explicit LOW must not be promoted by the sequence.
+    older.runtime_load_priority.reset();
+    add(&older, 31, proto::common::LoadPriority::LOW);
+    older.runtime_load_priority = proto::common::LoadPriority::HIGH;
+    add(&older, 12, proto::common::LoadPriority::LOW);
+    release.set_value();
+    unblock.dismiss();
+    std::move(blocker).get();
+    for (auto& f : work) std::move(f).get();
+    EXPECT_EQ(order, (std::vector<int>{10, 11, 12, 20, 0, 30, 31}));
+}
+
+TEST(AsyncLoadExecutorTest, MiddleUsesIndependentWeightedRoundsAndUpdates) {
+    auto& middle = ThreadPools::GetExecutor(MIDDLE);
+    auto ratio = MIDDLE_PRIORITY_THREAD_CORE_COEFFICIENT.load();
+    auto restore = folly::makeGuard([&] {
+        SetAsyncLoadSchedulingWeights(32, 8, 1);
+        ThreadPools::ResizeThreadPool(MIDDLE, ratio);
+    });
+    ThreadPools::ResizeThreadPool(MIDDLE, 1.0F / CPU_NUM);
+    for (auto weights :
+         {std::array<int, 3>{32, 8, 1}, std::array<int, 3>{2, 1, 1}}) {
+        std::promise<void> release, started;
+        auto gate = release.get_future().share();
+        auto blocker = folly::via(&middle, [&] {
+            started.set_value();
+            gate.wait();
+        });
+        auto unblock = folly::makeGuard([&] { release.set_value(); });
+        started.get_future().wait();
+        SetAsyncLoadSchedulingWeights(weights[0], weights[1], weights[2]);
+        std::vector<int> order;
+        std::vector<folly::Future<folly::Unit>> work;
+        for (int cls = 2; cls >= 0; --cls) {
+            auto priority = std::array{AsyncLoadPriority::Urgent,
+                                       AsyncLoadPriority::High,
+                                       AsyncLoadPriority::Low}[cls];
+            auto executor = ResolveAsyncLoadExecutor(
+                folly::getKeepAliveToken(&middle), priority, 7);
+            for (int i = 0; i < weights[cls] * 2; ++i) {
+                work.push_back(folly::via(
+                    executor.get(), [&order, cls] { order.push_back(cls); }));
+            }
+        }
+        // Consume the ASYNC_LOAD queue while MIDDLE is blocked. It must not
+        // consume MIDDLE's quotas, even for an identical priority/sequence key.
+        folly::via(
+            ResolveAsyncLoadExecutor({}, AsyncLoadPriority::Urgent, 7).get(),
+            [] {})
+            .get();
+        release.set_value();
+        unblock.dismiss();
+        std::move(blocker).get();
+        for (auto& f : work) std::move(f).get();
+        std::vector<int> expected;
+        for (int round = 0; round < 2; ++round)
+            for (int cls = 0; cls < 3; ++cls)
+                expected.insert(expected.end(), weights[cls], cls);
+        EXPECT_EQ(order, expected);
+    }
+}
+
+TEST(AsyncLoadExecutorTest, MiddleBindingSurvivesForeignThreadAndPoolSwitch) {
+    auto& middle = ThreadPools::GetExecutor(MIDDLE);
+    auto source = ResolveAsyncLoadExecutor({}, AsyncLoadPriority::Urgent, 123);
+    auto destination = ResolveAsyncLoadExecutor(
+        folly::getKeepAliveToken(&middle),
+        ResolveAsyncLoadPriority(source.get(),
+                                 proto::common::LoadPriority::HIGH),
+        GetAsyncLoadSequence(source.get()));
+    auto task =
+        []() -> folly::coro::Task<std::pair<uint64_t, AsyncLoadPriority>> {
+        auto* executor = co_await folly::coro::co_current_executor;
+        co_return std::make_pair(
+            GetAsyncLoadSequence(executor),
+            ResolveAsyncLoadPriority(executor,
+                                     proto::common::LoadPriority::HIGH));
+    };
+    auto result = std::async(std::launch::async, [&] {
+                      return folly::coro::blockingWait(
+                          task().scheduleOn(destination.copy()));
+                  }).get();
+    EXPECT_EQ(result.first, 123);
+    EXPECT_EQ(result.second, AsyncLoadPriority::Urgent);
+    auto back = ResolveAsyncLoadExecutor({}, result.second, result.first);
+    EXPECT_EQ(GetAsyncLoadSequence(back.get()), 123);
+    EXPECT_EQ(
+        ResolveAsyncLoadPriority(back.get(), proto::common::LoadPriority::LOW),
+        AsyncLoadPriority::Urgent);
+}
 
 #ifdef __linux__
 TEST(AsyncLoadExecutorTest, LocalPrioritySurvivesLegacyRebinding) {

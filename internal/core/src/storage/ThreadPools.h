@@ -18,6 +18,7 @@
 #define MILVUS_THREADPOOLS_H
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -118,6 +119,18 @@ class ThreadPools {
     // Process-wide executor; submit work with folly::via(...).semi().
     static folly::CPUThreadPoolExecutor&
     GetExecutor(ThreadPoolPriority priority);
+
+    // Copies the operation's sequence and wire priority before queueing; does
+    // not retain ctx. Null operations use sequence 0; the runtime override
+    // takes precedence over the configured field/index load priority.
+    static folly::Executor::KeepAlive<>
+    GetMiddleLoadExecutor(const milvus::OpContext* ctx,
+                          proto::common::LoadPriority configured_priority =
+                              proto::common::LoadPriority::HIGH);
+
+    // Updates only an existing MIDDLE pool, without initializing it.
+    static void
+    SetMiddleSchedulingWeights(std::array<size_t, 3> weights);
 
     // Each priority keeps its own coefficient, including before first use.
     static void

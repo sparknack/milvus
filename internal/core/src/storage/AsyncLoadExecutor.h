@@ -17,11 +17,25 @@
 #pragma once
 
 #include <cstdint>
+#include <array>
+#include <memory>
+#include <utility>
+#include "folly/executors/CPUThreadPoolExecutor.h"
 
 #include "folly/Executor.h"
 #include "pb/common.pb.h"
 
 namespace milvus::storage {
+
+// A separate queue with the same priority/sequence policy. The caller owns its
+// worker factory, sizing, metrics and lifetime (MIDDLE keeps its existing setup).
+[[nodiscard]] std::unique_ptr<folly::CPUThreadPoolExecutor>
+MakeLoadPriorityExecutor(std::pair<size_t, size_t> threads,
+                         std::shared_ptr<folly::ThreadFactory> thread_factory);
+
+void
+SetLoadPriorityExecutorWeights(folly::CPUThreadPoolExecutor& executor,
+                               std::array<size_t, 3> weights);
 
 // Configures workers without creating an unused executor. Positive values only.
 // Resizes the existing pool in place; call from a configuration thread because

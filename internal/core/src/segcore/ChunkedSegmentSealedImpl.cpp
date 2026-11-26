@@ -2865,13 +2865,14 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(
         tasks.size(),
         cg_field_ids.size());
 
-    auto& pool = ThreadPools::GetExecutor(milvus::ThreadPoolPriority::MIDDLE);
+    auto pool = ThreadPools::GetMiddleLoadExecutor(
+        op_ctx, segment_load_info.GetPriority());
     std::vector<folly::SemiFuture<folly::Unit>> load_group_futures;
     load_group_futures.reserve(tasks.size());
     for (auto& task : tasks) {
         auto future =
             folly::via(
-                &pool,
+                pool.get(),
                 [this,
                  column_groups,
                  properties,
@@ -6484,7 +6485,8 @@ ChunkedSegmentSealedImpl::LoadBatchJsonKeyIndexes(
     const SegmentLoadInfo& segment_load_info,
     const SealedFieldLayoutPtr& schema_snapshot,
     StagedStateCommitter& committer) {
-    auto& pool = ThreadPools::GetExecutor(milvus::ThreadPoolPriority::MIDDLE);
+    auto pool = ThreadPools::GetMiddleLoadExecutor(
+        op_ctx, segment_load_info.GetPriority());
     std::vector<folly::SemiFuture<folly::Unit>> load_index_futures;
     load_index_futures.reserve(infos.size());
     auto futures_guard = folly::makeGuard(
@@ -6496,7 +6498,7 @@ ChunkedSegmentSealedImpl::LoadBatchJsonKeyIndexes(
                    field_id.get());
         auto future =
             folly::via(
-                &pool,
+                pool.get(),
                 [this,
                  op_ctx,
                  field_id = field_id,
@@ -9504,13 +9506,14 @@ ChunkedSegmentSealedImpl::LoadColumnGroups(
         tasks.emplace_back(std::move(task));
     }
 
-    auto& pool = ThreadPools::GetExecutor(milvus::ThreadPoolPriority::MIDDLE);
+    auto pool = ThreadPools::GetMiddleLoadExecutor(
+        op_ctx, segment_load_info.GetPriority());
     std::vector<folly::SemiFuture<folly::Unit>> load_group_futures;
     load_group_futures.reserve(tasks.size());
     for (auto& task : tasks) {
         auto future =
             folly::via(
-                &pool,
+                pool.get(),
                 [this,
                  column_groups,
                  properties,
@@ -9935,11 +9938,11 @@ ChunkedSegmentSealedImpl::LoadColumnGroup(
 void
 ChunkedSegmentSealedImpl::ReloadColumns(const std::vector<FieldId>& field_ids,
                                         milvus::OpContext* op_ctx) {
-    auto& pool = ThreadPools::GetExecutor(milvus::ThreadPoolPriority::MIDDLE);
+    auto pool = ThreadPools::GetMiddleLoadExecutor(op_ctx);
     std::vector<folly::SemiFuture<folly::Unit>> reload_futures;
     for (auto& field_id : field_ids) {
         auto future =
-            folly::via(&pool, [this, field_id, op_ctx]() {
+            folly::via(pool.get(), [this, field_id, op_ctx]() {
                 auto column = get_column(field_id);
                 AssertInfo(column != nullptr,
                            "cannot reload non-existing field column {}",
@@ -9965,7 +9968,8 @@ ChunkedSegmentSealedImpl::LoadBatchTextIndexes(
     const SealedFieldLayoutPtr& schema_snapshot,
     const SegmentLoadInfo& segment_load_info,
     StagedStateCommitter& committer) {
-    auto& pool = ThreadPools::GetExecutor(milvus::ThreadPoolPriority::MIDDLE);
+    auto pool = ThreadPools::GetMiddleLoadExecutor(
+        op_ctx, segment_load_info.GetPriority());
     std::vector<folly::SemiFuture<folly::Unit>> load_index_futures;
     load_index_futures.reserve(text_indexes_to_load.size());
 
@@ -9975,7 +9979,7 @@ ChunkedSegmentSealedImpl::LoadBatchTextIndexes(
                    field_id.get());
         auto future =
             folly::via(
-                &pool,
+                pool.get(),
                 [this,
                  op_ctx,
                  field_id = field_id,
@@ -10022,7 +10026,6 @@ ChunkedSegmentSealedImpl::LoadBatchIndexes(
     milvus::OpContext* op_ctx,
     bool is_replace,
     StagedStateCommitter& committer) {
-    auto& pool = ThreadPools::GetExecutor(milvus::ThreadPoolPriority::MIDDLE);
     std::vector<folly::SemiFuture<folly::Unit>> load_index_futures;
     load_index_futures.reserve(field_id_to_index_info.size());
 
@@ -10034,9 +10037,16 @@ ChunkedSegmentSealedImpl::LoadBatchIndexes(
         auto& index_infos = pair.second;
         for (auto& load_index_info : index_infos) {
             auto* load_index_info_ptr = &load_index_info;
+            const auto priority_it =
+                load_index_info.index_params.find(LOAD_PRIORITY);
+            auto pool = ThreadPools::GetMiddleLoadExecutor(
+                op_ctx,
+                priority_it == load_index_info.index_params.end()
+                    ? proto::common::LoadPriority::HIGH
+                    : PriorityForLoad(priority_it->second));
             auto future =
                 folly::via(
-                    &pool,
+                    pool.get(),
                     [this,
                      trace_ctx,
                      field_id,
@@ -10217,7 +10227,8 @@ ChunkedSegmentSealedImpl::LoadBatchFieldData(
         field_data_to_load.emplace_back(group_id, load_field_data_info);
     }
 
-    auto& pool = ThreadPools::GetExecutor(milvus::ThreadPoolPriority::MIDDLE);
+    auto pool = ThreadPools::GetMiddleLoadExecutor(
+        op_ctx, segment_load_info.GetPriority());
     std::vector<folly::SemiFuture<folly::Unit>> load_field_futures;
     load_field_futures.reserve(field_data_to_load.size());
 
@@ -10226,7 +10237,7 @@ ChunkedSegmentSealedImpl::LoadBatchFieldData(
         const auto field_data = load_field_data_info;
         const auto captured_field_id = field_id;
         auto future =
-            folly::via(&pool,
+            folly::via(pool.get(),
                        [this,
                         field_data,
                         captured_field_id,

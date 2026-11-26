@@ -14,6 +14,7 @@
 //
 
 #include "ThreadPools.h"
+#include "storage/AsyncLoadExecutor.h"
 
 #include <math.h>
 #include <atomic>
@@ -235,10 +236,13 @@ ThreadPools::GetExecutor(milvus::ThreadPoolPriority priority) {
     LOG_INFO("Init thread pool:{}", name)
         << " with min worker num:" << 1
         << " and max worker num:" << max_threads;
+    const auto threads =
+        std::pair<size_t, size_t>{static_cast<size_t>(max_threads), 1};
+    auto factory = std::make_shared<folly::NamedThreadFactory>(name);
     ExecutorPtr pool(
-        new folly::CPUThreadPoolExecutor(
-            std::pair<size_t, size_t>{static_cast<size_t>(max_threads), 1},
-            std::make_shared<folly::NamedThreadFactory>(name)),
+        priority == MIDDLE
+            ? storage::MakeLoadPriorityExecutor(threads, factory).release()
+            : new folly::CPUThreadPoolExecutor(threads, factory),
         ExecutorDeleter{});
     pool->setThreadDeathTimeout(std::chrono::seconds(2));
     const auto metrics = MetricsFor(priority);
@@ -266,6 +270,25 @@ ThreadPools::GetExecutor(milvus::ThreadPoolPriority priority) {
     sampler->start();
     pool.get_deleter().metrics_sampler = std::move(sampler);
     return *thread_pool_map.emplace(priority, std::move(pool)).first->second;
+}
+
+folly::Executor::KeepAlive<>
+ThreadPools::GetMiddleLoadExecutor(
+    const milvus::OpContext* ctx,
+    proto::common::LoadPriority configured_priority) {
+    return storage::ResolveAsyncLoadExecutor(
+        folly::getKeepAliveToken(&GetExecutor(MIDDLE)),
+        ResolveLoadPriority(ctx, configured_priority),
+        ctx ? ctx->sequence_id : 0);
+}
+
+void
+ThreadPools::SetMiddleSchedulingWeights(std::array<size_t, 3> weights) {
+    std::unique_lock lock(mutex_);
+    auto it = thread_pool_map.find(MIDDLE);
+    if (it != thread_pool_map.end()) {
+        storage::SetLoadPriorityExecutorWeights(*it->second, weights);
+    }
 }
 
 void

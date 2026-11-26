@@ -422,7 +422,7 @@ MakeAsyncLoadThreadFactory() {
 #endif
 }
 
-// Owns the process-wide priority queues used by async-load CPU work.
+// Each pool owns an independent priority queue and group registry.
 class PriorityThreadPoolExecutor final : public folly::CPUThreadPoolExecutor {
  public:
     explicit PriorityThreadPoolExecutor(const int threads,
@@ -430,6 +430,14 @@ class PriorityThreadPoolExecutor final : public folly::CPUThreadPoolExecutor {
         : folly::CPUThreadPoolExecutor(threads,
                                        std::make_unique<LoadTaskQueue>(weights),
                                        MakeAsyncLoadThreadFactory()) {
+    }
+
+    PriorityThreadPoolExecutor(std::pair<size_t, size_t> threads,
+                               std::array<size_t, 3> weights,
+                               std::shared_ptr<folly::ThreadFactory> factory)
+        : folly::CPUThreadPoolExecutor(threads,
+                                       std::make_unique<LoadTaskQueue>(weights),
+                                       std::move(factory)) {
     }
 
     void
@@ -444,7 +452,7 @@ class PriorityThreadPoolExecutor final : public folly::CPUThreadPoolExecutor {
     }
 };
 
-// Bind the actual ASYNC_LOAD queue; custom executors keep only sequence metadata.
+// Bind the destination queue; unrelated executors retain only metadata.
 folly::Executor::KeepAlive<>
 LoadExecutor::Create(folly::Executor::KeepAlive<> executor,
                      int8_t priority,
@@ -511,6 +519,23 @@ GetDefaultAsyncLoadExecutor() {
 
 }  // namespace
 
+std::unique_ptr<folly::CPUThreadPoolExecutor>
+MakeLoadPriorityExecutor(std::pair<size_t, size_t> threads,
+                         std::shared_ptr<folly::ThreadFactory> thread_factory) {
+    auto& state = GetDefaultExecutorState();
+    std::lock_guard lock(state.executor_mutex);
+    return std::make_unique<PriorityThreadPoolExecutor>(
+        threads, state.weights, std::move(thread_factory));
+}
+
+void
+SetLoadPriorityExecutorWeights(folly::CPUThreadPoolExecutor& executor,
+                               std::array<size_t, 3> weights) {
+    if (auto* pool = dynamic_cast<PriorityThreadPoolExecutor*>(&executor)) {
+        pool->SetWeights(weights);
+    }
+}
+
 void
 SetAsyncLoadSchedulingWeights(int urgent, int high, int low) {
     const std::array<size_t, 3> weights =
@@ -530,6 +555,7 @@ SetAsyncLoadSchedulingWeights(int urgent, int high, int low) {
             }
             state.weights = weights;
         }
+        ThreadPools::SetMiddleSchedulingWeights(weights);
         admission.SetSchedulingWeights(weights);
     }
     // Promise completion may resume inline: hold no configuration lock here.

@@ -33,7 +33,7 @@ queueing and owns its new context, without retaining the caller's context.
 
 The adapter owns a Folly keep-alive, immutable priority/sequence values, and a
 shared queue-specific group for ASYNC_LOAD. Independent adapters with the same
-key share that group. Other executors retain their own queue discipline. Its
+key share that group. MIDDLE also uses this queue on the experimental branch described below; other executors retain their own queue discipline. Its
 `add()` installs the sequence in a shallow copy of RequestContext **before**
 calling the underlying executor. The queue reads the CPUTask's captured context,
 so a foreign I/O completion thread cannot change the coroutine's queue key.
@@ -134,7 +134,7 @@ remaining gaps, sanitizer coverage, and reproduction commands.
 wire enum. Existing Proto HIGH/LOW callers retain those classes; no Search caller
 is automatically promoted. On the default pool these map to Folly HI/MID/LO;
 `getNumPriorities()` returns 3. External executors retain the old HIGH-to-HI
-mapping, so three distinct classes are only guaranteed on ASYNC_LOAD.
+mapping, so three distinct classes are guaranteed on ASYNC_LOAD and, on the experimental branch below, MIDDLE.
 
 Executor adapters retain local Urgent/High/Low metadata separately from Folly's
 numeric priority (custom pools can collapse High and Urgent). Legacy executor
@@ -187,3 +187,46 @@ executions). Coverage includes three-class shares, sequence/FIFO, cancellation,
 resource-blocked heads, empty classes, concurrent arrivals, native weight updates
 and executor-to-metadata Urgent propagation. This is not a full `all_tests` build
 or cluster Urgent Search E2E; no production Urgent entry point is introduced.
+
+## MIDDLE queue experiment (test/middle-load-sequence)
+
+MIDDLE now uses the same grouped blocking queue as ASYNC_LOAD, with a separate
+registry, heaps and weighted rounds. The startup/native weight setter updates
+both existing pools without eagerly creating MIDDLE. MIDDLE retains its named
+thread factory (no nice-19 change), worker coefficient, min-one idle retirement,
+metrics observers and resize/drain ownership. The factory takes the current
+weights under the async executor configuration lock; updating MIDDLE happens
+after releasing that lock, avoiding registry/configuration lock inversion.
+
+Sealed segment column-group loading (both overloads), field loading, reload,
+index loading, text indexes and JSON stats copy the operation sequence and
+resolved HIGH/LOW priority into an immutable adapter before submitting to MIDDLE.
+Field/group batches use SegmentLoadInfo priority, normal indexes use their
+load_priority parameter, and OpContext runtime priority overrides these defaults.
+The original OpContext remains owned by the calling load, whose existing future
+wait/drain behavior is unchanged. Null contexts use sequence zero. Local Urgent
+adapters map to Folly HI, High to MID and Low to LO on both grouped executors;
+the wire OpContext still cannot express Urgent and no Search promotion is added.
+
+Other MIDDLE users (growing-segment load, index upload/encryption, legacy parquet
+visitation) retain their existing submissions. Unbound tasks have sequence zero
+unless they inherit a captured request context; zero-sequence tasks run after
+numbered tasks in the same class. Sustained numbered loads can therefore delay
+unbound work. This is an experimental branch, not a general fairness guarantee.
+The queue cannot preempt a field task already occupying a worker or accelerate
+its I/O. It prioritizes an older segment's JSON completion only once that task
+has actually been submitted and a worker becomes available.
+
+Verification must cover actual MIDDLE operation binding, configured LOW/runtime
+HIGH overrides, FIFO ties, independent 32:8:1 rounds, native weight updates,
+foreign-thread/executor switches, existing metrics/error propagation and resize
+behavior. Real CAP/Tiered P50/P95 improvement remains an experiment to run with
+the built image; queue tests alone do not establish the previous bottleneck.
+
+Local verification: the three changed implementation translation units compile
+against the Admission branch's generated protobufs and dependency headers. A
+standalone runner passes 75 tests: the 69 executor/admission cases plus five
+ThreadPool lifecycle/metrics cases and one runtime-priority override case.
+This runner does not link the full segcore graph; the separate
+RejectedBatchSubmissionReturnsAdmissionBytesAndSlots integration case and the
+full all_tests binary were not run. No cluster latency benefit is claimed.
